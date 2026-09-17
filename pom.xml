@@ -75,30 +75,47 @@
         </dependency>
 
         <!--
-          以下依赖在阶段 0 的 0.8（docker-compose 起中间件）之后才启用。
-          现在先注释掉，因为数据库和 Redis 还没跑起来，
-          一旦引入，HikariCP 连接池会在启动时尝试建立连接，
-          连不上就会导致整个应用启动失败，反而没法验证骨架是否正常。
+          以下依赖于阶段 0 的 0.8 启用（docker-compose 起中间件之后）
+          注：XML 注释内不能出现连续两个短横线，所以分隔线用的是等号
+        -->
+        <!-- ================================================== -->
 
-          等 docker compose up -d 成功之后再打开这些注释。
-
+        <!--
+          spring-boot-starter-data-redis
+          作用：Redis 客户端。Spring Boot 自动配置 Lettuce 连接池。
+          接入后 /actuator/health 会多出一个 redis 组件，
+          它的 UP/DOWN 就是「Spring Boot 能否连通 Redis」的直接证据。
+          用途：阶段 2 做缓存/限流，阶段 6 做分布式信号量与排队队列。
+        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
 
+        <!--
+          mybatis-plus-spring-boot3-starter
+          ★ 注意 artifactId 里的 spring-boot3 —— MyBatis-Plus 针对
+            Spring Boot 3 单独发了 starter，用错成 mybatis-plus-boot-starter
+            会因 jakarta 命名空间不兼容而起不来。
+          作用：免写 SQL 的 ORM。继承 BaseMapper 就自带增删改查。
+          版本 3.5.17 是查 Maven 中央仓库确认过的最新版，不是凭记忆写的。
+        -->
         <dependency>
             <groupId>com.baomidou</groupId>
             <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
             <version>3.5.17</version>
         </dependency>
 
+        <!--
+          postgresql 驱动
+          <scope>runtime</scope>：编译时用不到（代码里不直接 import 驱动类，
+          只通过 JDBC URL 让 DriverManager 去加载），只在运行时需要。
+        -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
-        -->
     </dependencies>
 
     <build>

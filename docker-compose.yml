@@ -1,0 +1,152 @@
+# ============================================================
+# 休伯利安（XBLA）RAG 平台 —— 本地开发中间件
+#
+# 用法：
+#   docker compose up -d      启动全部服务（后台）
+#   docker compose ps         查看状态和健康检查结果
+#   docker compose logs -f    看日志
+#   docker compose down       停止并删除容器（数据保留在命名卷里）
+#   docker compose down -v    停止并连数据一起删掉（慎用）
+#
+# 【为什么不用 version: '3.x'】
+#   Compose V2 起，version 字段已废弃，写了会报警告。直接省略即可。
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL + pgvector
+  #
+  # 【为什么镜像不是官方的 postgres？】
+  #   官方 postgres 镜像里没有 vector 扩展，向量检索用不了。
+  #   pgvector/pgvector 是社区维护的镜像 = 官方 PostgreSQL + 预编译好的 pgvector，
+  #   拉下来就能 CREATE EXTENSION vector。
+  #   项目文档约定向量列是 vector(1024)，对应 bge-m3 模型的输出维度。
+  # ----------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: xbla-postgres
+    restart: unless-stopped
+    environment:
+      # 这三个数据库名/用户名不是密钥，直接写死；
+      # 要和 CLAUDE.md 里记录的连接命令保持一致：
+      #   docker compose exec postgres psql -U xbla -d xbla_rag
+      POSTGRES_USER: xbla
+      POSTGRES_DB: xbla_rag
+      # 密码是密钥，从 .env 文件读（.env 已在 .gitignore 里，不会提交）
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 文件里设置 POSTGRES_PASSWORD}
+      # 时区，避免日志时间对不上
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      # 宿主机 5432 -> 容器 5432。Spring Boot 通过 localhost:5432 连
+      - "5432:5432"
+    volumes:
+      # 命名卷：容器删了数据还在。不挂的话每次 down 都要重新灌数据
+      - postgres_data:/var/lib/postgresql/data
+      # 初始化脚本目录：仅在「数据卷为空」的首次启动时执行一次
+      # （第二次 up 不会重复执行，所以脚本里要用 IF NOT EXISTS 保证幂等）
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 【为什么必须要 healthcheck】
+      #   容器「启动了」不等于「能用了」。PostgreSQL 起来后还要跑几十秒
+      #   初始化数据库、建用户、执行初始化脚本。
+      #   没有 healthcheck，docker compose ps 在启动瞬间就显示 running，
+      #   但实际上连不上，Spring Boot 会报连接失败。
+      #   healthcheck 让状态变成 healthy 时才代表「真的可用了」。
+      test: ["CMD-SHELL", "pg_isready -U xbla -d xbla_rag"]
+      interval: 10s      # 每 10 秒检查一次
+      timeout: 5s        # 单次检查超过 5 秒算失败
+      retries: 5         # 连续失败 5 次才判定为 unhealthy
+      start_period: 30s  # 启动后给 30 秒宽限期，此期间的失败不计入 retries
+    networks:
+      - xbla-net
+
+  # ----------------------------------------------------------
+  # Redis
+  #
+  # 用途（按阶段递进）：
+  #   阶段 2 —— 缓存、限流计数
+  #   阶段 6 —— 分布式信号量控制并发、ZSet 排队队列、Pub/Sub 通知队列变化
+  #
+  # 【关于密码】
+  #   本地开发不设密码（服务只监听本机）。生产环境必须设。
+  #   application-local.yml 里的 spring.data.redis.password 留空即可。
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: xbla-redis
+    restart: unless-stopped
+    # appendonly yes = 开启 AOF 持久化。
+    # 默认的 RDB 是定时快照，进程被强杀会丢最后一段数据；
+    # AOF 逐条记录写命令，最多丢 1 秒。阶段 6 要做分布式锁和队列，
+    # 丢了数据会直接影响「名额是否泄漏」的验收标准，所以这里开 AOF。
+    command: redis-server --appendonly yes
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - xbla-net
+
+  # ----------------------------------------------------------
+  # pgAdmin —— PostgreSQL 的网页版管理界面
+  #
+  # 用途：可视化查看表结构和数据。阶段 3/4 做向量检索时，
+  #       能直接在界面上看 kb_chunk 里的向量切片，比命令行舒服得多。
+  #
+  # 访问地址：http://localhost:5050
+  # 登录邮箱和密码见 .env 文件
+  #
+  # 【注意端口是 5050 不是 8080】
+  #   8080 留给 Spring Boot 应用，不能冲突。
+  # ----------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:9.18
+    container_name: xbla-pgadmin
+    restart: unless-stopped
+    environment:
+      # ⚠️ 邮箱域名不能用 .local —— 它是 RFC 6762 保留给 mDNS 的专用域名，
+      #    pgAdmin 9.x 的邮箱校验会直接判定非法，导致容器不断崩溃重启。
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@xbla.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:?请在 .env 文件里设置 PGADMIN_PASSWORD}
+      # 关闭 pgAdmin 的多用户模式，本地开发不需要登录管理
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+      TZ: Asia/Shanghai
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        # 等 postgres 真正 healthy 了再启动，否则 pgAdmin 界面里
+        # 预置的服务器连接会连不上
+        condition: service_healthy
+    networks:
+      - xbla-net
+
+# ------------------------------------------------------------
+# 命名卷：由 Docker 管理，存在 Docker 的数据目录里
+# 好处是不用关心宿主机路径、跨平台一致
+# ------------------------------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  pgadmin_data:
+
+# ------------------------------------------------------------
+# 自定义网络：三个容器在同一个网段里，可以互相用「服务名」访问
+# 比如 pgAdmin 里连数据库，主机名直接填 postgres 而不是 IP
+# ------------------------------------------------------------
+networks:
+  xbla-net:
+    driver: bridge
