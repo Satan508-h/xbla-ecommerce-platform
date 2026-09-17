@@ -1,0 +1,52 @@
+# ============================================================
+# Git 换行符策略
+#
+# 【不配这个会出什么事】
+# Windows 的换行符是 CRLF（\r\n），Linux 是 LF（\n）。
+# 默认情况下 Git 在 Windows 上检出文件会写成 CRLF。
+# 而 mvnw 是个 shell 脚本，一旦带上 \r，在 Linux / Docker 里执行会报：
+#     /bin/sh^M: bad interpreter: No such file or directory
+# 或者行尾多出一个奇怪的字符导致语法错误。
+#
+# 这个项目阶段 8 要在 Docker（Linux 容器）里跑 mvnw，
+# 所以必须现在就锁死，否则以后很难排查。
+# ============================================================
+
+# 默认策略：Git 自动识别文本文件，且仓库内统一存成 LF
+* text=auto eol=lf
+
+# ------------------------------------------------------------
+# 例外：Windows 批处理脚本必须是 CRLF
+# cmd.exe 对 LF 换行的处理不可靠，某些情况下会把整行当成命令名
+# ------------------------------------------------------------
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# ------------------------------------------------------------
+# 明确标记为二进制，Git 不做任何换行符转换
+# 否则可能破坏文件内容
+# ------------------------------------------------------------
+*.jar    binary
+*.war    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.xlsx   binary
+*.docx   binary
+*.ttf    binary
+*.woff   binary
+*.woff2  binary
+
+# ------------------------------------------------------------
+# 语言层面
+# ------------------------------------------------------------
+# Windows 下用 PowerShell 打开的 .ps1 需要带 BOM 才不乱码（可选，先不加）
+# *.ps1  text eol=crlf
+
+# 文档里的 Markdown 在各平台都按 LF 处理即可
+*.md     text eol=lf

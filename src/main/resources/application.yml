@@ -1,0 +1,56 @@
+# ============================================================
+# 主配置文件 —— 只放「不敏感」的通用配置，会提交到 git
+#
+# 敏感信息（API Key、数据库密码）一律放 application-local.yml，
+# 那个文件已在 .gitignore 里，永远不会被提交。
+# 需要时把同目录下的 application-local.yml.example 复制一份改名即可。
+# ============================================================
+
+server:
+  # 后端服务端口
+  port: 8080
+
+spring:
+  application:
+    name: xbla-rag
+
+  # 激活 local 配置分支。
+  # Spring Boot 会自动去找 application-local.yml 并加载，
+  # 同名配置项以 local 文件为准（覆盖下面的默认值）。
+  # 如果该文件不存在，Spring Boot 不会报错，只是跳过。
+  profiles:
+    active: local
+
+  # 统一 JSON 序列化行为
+  jackson:
+    # 日期统一用 ISO-8601 格式，避免前端拿到一堆时间戳数字
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    # 反序列化时忽略 JSON 里多余的字段，防止前端多传一个字段就报错
+    deserialization:
+      fail-on-unknown-properties: false
+
+# ------------------------------------------------------------
+# actuator：运维监控接口
+# ------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露 health 和 info。★ 千万别写 "*"，那会把 /actuator/env 之类
+        # 可能泄露配置的接口也暴露出去。
+        include: health,info
+  endpoint:
+    health:
+      # always = 健康检查详情里显示每个组件（数据库、Redis、磁盘）的具体状态。
+      # 阶段 0 验收标准「Spring Boot 能连通 PostgreSQL 和 Redis」就靠这个看。
+      show-details: always
+
+# ------------------------------------------------------------
+# 日志
+# ------------------------------------------------------------
+logging:
+  level:
+    root: info
+    # 本项目自己的包开到 debug，方便开发时看清链路；第三方包保持 info 免得刷屏
+    com.xbla.rag: debug

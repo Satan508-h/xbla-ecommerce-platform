@@ -1,0 +1,64 @@
+# ============================================================
+# 本地私有配置 —— 模板文件
+#
+# 【怎么用】
+#   把这个文件复制一份，改名为 application-local.yml（去掉 .example），
+#   然后把里面的占位符换成你自己的真实值。
+#
+#   application-local.yml 已经在 .gitignore 里，不会被提交到 git。
+#   而当前这个 .example 模板会被提交，作为「需要配哪些项」的说明。
+#
+# 【为什么这么做】
+#   CLAUDE.md 第 5 条硬性约定：API Key 绝不写进代码、绝不提交到 git。
+#   一旦密钥进了 git 历史，即使后来删掉文件也清不干净 —— 历史里还在，
+#   GitHub 上还能搜到。所以只能靠「密钥放本地文件 + 文件被忽略」这个组合。
+# ============================================================
+
+# ------------------------------------------------------------
+# 数据库（阶段 0 的 0.8 之后启用）
+# ------------------------------------------------------------
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/xbla_rag
+    username: xbla
+    password: 这里填你的数据库密码
+    driver-class-name: org.postgresql.Driver
+
+  # ------------------------------------------------------------
+  # Redis（阶段 0 的 0.8 之后启用）
+  # ------------------------------------------------------------
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # 如果 docker-compose 里给 Redis 配了密码，这里要对应填上
+      password:
+      database: 0
+      timeout: 3000ms
+
+# ------------------------------------------------------------
+# 模型供应商配置（阶段 2 才用，先把位置占好）
+#
+# ⚠️ CLAUDE.md 提醒：模型 ID 会变动。
+#    每次动工涉及模型的代码前，先用 GET /v1/models 拉真实列表核实，
+#    不要凭记忆硬编码。
+# ------------------------------------------------------------
+xbla:
+  llm:
+    # P0：DeepSeek 官方，主力对话生成
+    deepseek:
+      base-url: https://api.deepseek.com
+      api-key: sk-这里填 DeepSeek 官方的 Key
+      model: 用 GET /v1/models 核实后再填
+
+    # P1/P2：硅基流动，同模型换源 + 兜底降级
+    # ★ 向量化和重排序只有硅基流动提供，DeepSeek 官方没有这两项能力
+    siliconflow:
+      base-url: https://api.siliconflow.cn
+      api-key: sk-这里填硅基流动的 Key
+      model: 用 GET /v1/models 核实后再填
+      # bge-m3，1024 维，这是全项目的向量维度基准
+      embedding-model: BAAI/bge-m3
+      embedding-dimension: 1024
+      # 重排序模型
+      rerank-model: BAAI/bge-reranker-v2-m3

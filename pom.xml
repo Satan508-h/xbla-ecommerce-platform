@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      parent：继承 Spring Boot 的父 POM。
+      它的作用是「统一版本管理」——父 POM 里预先定义了几百个常用依赖的版本号，
+      这样下面 <dependencies> 里大部分依赖都不用写 <version>，避免版本打架。
+      这是 Spring Boot 项目最核心的一个约定。
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/> <!-- 留空表示去仓库找，而不是找本地相对路径 -->
+    </parent>
+
+    <groupId>com.xbla</groupId>
+    <artifactId>xbla-rag</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>xbla-rag</name>
+    <description>休伯利安（XBLA）电商导购与售后 RAG 平台</description>
+
+    <properties>
+        <!-- JDK 21 LTS。CLAUDE.md 里固定这个版本，不随 Spring Boot 默认值走 -->
+        <java.version>21</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    </properties>
+
+    <dependencies>
+        <!--
+          spring-boot-starter-web
+          作用：引入 Spring MVC + 内嵌 Tomcat + Jackson(JSON 序列化)。
+          没有它，项目就只是个普通 Java 程序，起不了 HTTP 服务。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-starter-validation
+          作用：参数校验。让 @NotBlank / @NotNull 这类注解真正生效。
+          controller 层做参数校验要用（CLAUDE.md 约定 controller 只做参数校验和响应封装）。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-starter-actuator
+          作用：暴露运维接口，最常用的是 /actuator/health。
+          阶段 0 的验收标准「访问健康检查接口返回正常」就是靠它。
+          后面接入 PostgreSQL 和 Redis 后，它会自动把这两个组件的连通状态
+          也汇总到 /actuator/health 里，一眼就能看出谁挂了。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-starter-test
+          作用：测试框架（JUnit 5 + Mockito + AssertJ）。
+          <scope>test</scope> 表示只在测试时引入，不会打进最终的可运行 jar。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+          以下依赖在阶段 0 的 0.8（docker-compose 起中间件）之后才启用。
+          现在先注释掉，因为数据库和 Redis 还没跑起来，
+          一旦引入，HikariCP 连接池会在启动时尝试建立连接，
+          连不上就会导致整个应用启动失败，反而没法验证骨架是否正常。
+
+          等 docker compose up -d 成功之后再打开这些注释。
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+            <version>3.5.17</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        -->
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              spring-boot-maven-plugin
+              作用：把项目打成一个「可执行的 fat jar」——里面连 Tomcat 一起打包，
+              用 java -jar 就能直接跑，不需要额外装 Tomcat。
+              同时它提供 mvn spring-boot:run 命令，开发时用这个启动最方便。
+            -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
