@@ -28,6 +28,15 @@
         <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!--
+          Apache Tika 版本。抽成属性是因为下面有两个 artifact 必须版本一致
+          （tika-parsers-standard-package 和 tika-core），
+          分开写两遍迟早会出现「改了一个忘了另一个」。
+
+          ★ 为什么是 3.3.2 而不是最新的 4.0.0：见下面 dependency 里的详细说明
+        -->
+        <tika.version>3.3.2</tika.version>
     </properties>
 
     <!--
@@ -233,6 +242,64 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-configuration-processor</artifactId>
             <optional>true</optional>
+        </dependency>
+
+        <!--
+          以下依赖于阶段 3 启用（RAG 核心 —— 文档入库）
+        -->
+        <!-- ================================================== -->
+
+        <!--
+          Apache Tika —— 多格式文档解析
+          作用：喂给它一个 InputStream，它自动识别是 PDF / Word / Excel / Markdown
+                还是纯文本，统一吐出正文。没有它就得自己写四个解析器
+                （PDFBox 一套、POI 两套、Markdown 一套），还要处理编码探测。
+
+          ★ 版本 3.3.2 必须显式写：
+            Spring Boot 3.5.16 的 BOM 里【没有】托管 Tika（查本地
+            spring-boot-dependencies-3.5.16.pom 确认，grep 命中数为 0），
+            不写版本号 Maven 会直接报 "version is missing"。
+
+          ★ 为什么不用 4.0.0（Maven Central 上的最新版）：
+            4.x 是一次破坏性大版本升级，改动包括
+              - SPI 签名变更：Parser.parse 的参数从 InputStream 改成 TikaInputStream
+              - 配置格式从 XML 改成 JSON，旧的 TikaConfig XML API 整个删除
+              - Metadata 的键全部加 tk: 前缀，且 set 保留键会抛异常
+              - 默认开启 fork 解析（子进程隔离）
+            这些都是「查不到现成答案」的坑。3.x 线仍在维护（3.3.2 是目前最新），
+            本项目要的是链路可逐行解释，不是版本号最新。详见 docs/08 ADR-012。
+
+          ★ tika-parsers-standard-package 而不是单独的解析器：
+            tika-core 只有引擎，不含任何具体格式的解析器。
+            standard-package 把 PDF / Office / HTML / 纯文本等常用解析器打成一包，
+            代价是传递依赖较多（pdfbox、poi、commons-compress 等）。
+            阶段 3 要覆盖 PDF/Word/Excel/MD 四种格式，用整包最省事。
+        -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parsers-standard-package</artifactId>
+            <version>${tika.version}</version>
+        </dependency>
+
+        <!--
+          ★★ tika-core 必须【显式】再引一次，否则编译直接报「程序包 org.apache.tika.parser 不存在」。
+
+          原因（实测，不是推测）：查 tika-parsers-standard-package-3.3.2.pom 发现
+          tika-core 被声明成 <scope>provided</scope>，而 provided 作用域
+          **不具备传递性** —— 上游依赖 provided 的包，下游拿不到。
+          于是整包里只有一堆 tika-parser-*-module，唯独缺了核心引擎。
+
+          实测证据：mvn dependency:tree 输出里 tika-parser-*-module 有 22 个，
+          但 tika-core 一条都没有。
+
+          ⚠️ tika-core 和上面整包的版本号必须严格一致。
+             两个版本号不一样会出现「接口签名对不上」的诡异编译错误。
+             这里靠 ${tika.version} 属性统一，改一处即可。
+        -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-core</artifactId>
+            <version>${tika.version}</version>
         </dependency>
     </dependencies>
 

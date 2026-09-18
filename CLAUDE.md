@@ -11,7 +11,7 @@
 
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**：有意图路由、多路召回、重排序、会话记忆、MCP 工具调用，以及一套端到端评测体系。
 
-**当前阶段**：阶段 2（模型接入层 + 最小可用闭环）
+**当前阶段**：阶段 3（RAG 核心 —— 文档入库）
 **详细路线图**：`docs/10-开发路线图.md`
 
 ---
@@ -144,7 +144,7 @@ docker compose exec postgres psql -U xbla -d xbla_rag
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（含 EntityMappingTest 回归 + client 层单测）
+# 跑测试（128 个：EntityMappingTest 回归 + 解析/切分/向量转换的单测）
 ./mvnw test
 ```
 
@@ -192,6 +192,51 @@ curl -N -G localhost:8080/api/chat/stream --data-urlencode "question=你好"
 # 熔断器状态
 curl -s localhost:8080/actuator/circuitbreakers | python -m json.tool
 ```
+
+### 阶段 3 新增：知识库文档入库
+
+```bash
+# ① 生成仿真语料（6 份：PDF / Word / Markdown / Excel），输出到 data/corpus/
+python scripts/generate_corpus.py
+#    依赖：pip install reportlab python-docx openpyxl
+
+# ② 批量灌语料（异步，立刻返回 docId 列表）
+curl -s -X POST "localhost:8080/api/kb/documents/scan?docType=2"
+
+# ③ 数据库同步：把 after_sale_policy + product 表渲染成知识库文档
+curl -s -X POST localhost:8080/api/kb/documents/sync
+
+# ④ 上传单个文件（multipart）
+curl -s -X POST localhost:8080/api/kb/documents \
+  -F "file=@data/corpus/售后政策汇编.docx" -F "docType=2"
+
+# ⑤ 查入库状态（前端轮询的就是这个；finished=true 表示可以停止轮询）
+curl -s localhost:8080/api/kb/documents/1 | python -m json.tool
+```
+
+### 阶段 3 新增：知识库检索探针（同样 @Profile("local")）
+
+> ⚠️ **中文请用 `scripts/probe_kb.py`，不要直接用 curl。**
+> Windows + Git Bash 下有**两层**编码陷阱（shell 破坏命令行参数、
+> Python 按 GBK 读 UTF-8 响应），直接用 curl 会得到「像乱码又像 bug」的结果。
+
+```bash
+# 向量检索，看最相关的切片
+python scripts/probe_kb.py search 退货要几天
+python scripts/probe_kb.py search 这个适合送长辈吗 --topk 5
+
+# ★ 稳定性自检：同一问题查 N 次，比对 ID 序列是否逐位一致
+python scripts/probe_kb.py stability 退货要几天 --repeat 5
+
+# 查某份文档的入库状态
+python scripts/probe_kb.py status 1
+```
+
+> **关于「结果稳定」的正确预期**：
+> 命中的 **ID 序列**是完全稳定的（靠 SQL 里 `ORDER BY ..., id` 的兜底键）；
+> 但**分值不会逐位相同** —— 实测向量化接口本身有约 **3e-4** 的漂移
+> （同一问题连续调 6 次出现 2 种结果），这是 GPU 浮点并行归约的固有性质。
+> **别把「检索结果不稳定」当成 bug 去查**，先看 ID 序列是否一致。
 
 ### ⚠️ Windows 环境下的两个坑
 

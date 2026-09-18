@@ -80,4 +80,61 @@ public class AsyncConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * 文档入库专用线程池（阶段 3 新增）。
+     *
+     * <p><b>为什么入库要异步</b>：一份文档入库要经过
+     * 「解析 → 切分 → 批量向量化 → 写库」四步。其中向量化是<b>串行调外部 API</b>，
+     * 一份几十页的文档可能要几百次调用，耗时从几十秒到几分钟。
+     * 放在 HTTP 请求里同步跑，浏览器早就超时了。
+     * 所以上传接口立刻返回 {@code docId}，真正的活在后台线程里跑，
+     * 前端轮询 {@code kb_document.status} 看进度。
+     *
+     * <p><b>参数和 sseExecutor 完全不同，这是有意的</b>：
+     * <ul>
+     *   <li>{@code corePoolSize = 2} / {@code maxPoolSize = 4} —— <b>故意开得很少</b>。
+     *       入库的瓶颈不在我们的 CPU，而在<b>对方的限流阈值</b>。
+     *       向量化接口有 QPS 限制，开 32 个线程不会让总吞吐变高，
+     *       只会更快撞上限流（429），然后整批任务一起失败重试。
+     *       并发度应该匹配下游能承受的量，而不是我们想要的量。</li>
+     *   <li>{@code queueCapacity = 200} —— <b>故意设得很大</b>。
+     *       和 SSE 的理由正好相反：SSE 让用户干等是坏事，
+     *       但入库是后台任务，用户看不到队列，任务在队列里等着完全没问题。
+     *       一个批量灌语料的任务可能有几十上百份文档排队，
+     *       队列太小会导致后来的直接被拒绝 —— 而它们本来只需要多等一会儿。</li>
+     *   <li>{@code CallerRunsPolicy} —— 队列也满了之后，让提交任务的线程自己跑。
+     *       这是<b>背压</b>：提交方会因此变慢，从而自然地降低提交速度。
+     *       对后台任务来说，「变慢」远好于 {@code AbortPolicy} 的「丢失任务」。</li>
+     * </ul>
+     *
+     * <p><b>为什么不能复用 sseExecutor</b>：两者的取值逻辑是相反的
+     * （一个要队列小、要快速拒绝；一个要队列大、要慢慢排队）。
+     * 混用会让任何一边的行为变得无法解释 —— 而且入库任务把 SSE 的
+     * 16 格队列占满，用户就能明显感觉到「聊天变卡了」。
+     *
+     * @see KbProperties.Ingest 参数在 {@code xbla.kb.ingest} 下可调
+     */
+    @Bean("ingestExecutor")
+    public ThreadPoolTaskExecutor ingestExecutor(KbProperties kbProperties) {
+        KbProperties.Ingest props = kbProperties.getIngest();
+
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(props.getCorePoolSize());
+        executor.setMaxPoolSize(props.getMaxPoolSize());
+        executor.setQueueCapacity(props.getQueueCapacity());
+        executor.setThreadNamePrefix("ingest-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+
+        // ★ 关闭时一定要等入库任务跑完。
+        //   入库是【非幂等】的：跑到一半被杀，数据库里会留下
+        //   status=2（处理中）的僵尸文档，而且已经写进去的切片是有向量的 ——
+        //   重跑会重复写入，不重跑那条文档就永远卡在「处理中」。
+        //   所以宁可让关闭慢 60 秒，也不要把任务腰斩
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+
+        executor.initialize();
+        return executor;
+    }
 }

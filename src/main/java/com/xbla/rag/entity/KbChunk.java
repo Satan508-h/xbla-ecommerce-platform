@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.xbla.rag.common.handler.VectorTypeHandler;
 import lombok.Data;
 
 import java.time.OffsetDateTime;
@@ -14,9 +15,20 @@ import java.time.OffsetDateTime;
  *
  * <p><b>这是整个项目最核心的表</b>——RAG 检索的最小单位，
  * 阶段 4 的向量召回、阶段 5 的意图定向检索都直接查它。
+ *
+ * <p><b>★ 为什么类上有 {@code autoResultMap = true}</b>
+ *
+ * <p>因为 {@link #embedding} 用了自定义 TypeHandler。MyBatis-Plus 默认的查询
+ * 走「自动生成的 ResultMap」，它<b>不认识</b>字段上标注的 typeHandler；
+ * 只有开启 {@code autoResultMap} 才会把 typeHandler 注册进查询用的 ResultMap。
+ *
+ * <p>漏掉的症状极具迷惑性：<b>写入正常、查询也正常，就是查出来永远是 null</b>。
+ * 插入不报错、SELECT 不报错，数据也在库里，只有映射那一步悄悄失败了。
+ * 同类问题在 {@code EvalQuestion} 的 {@code Long[]} 字段上已经踩过一次
+ * （见 docs/10 环境排障记录 坑 8）。
  */
 @Data
-@TableName("kb_chunk")
+@TableName(value = "kb_chunk", autoResultMap = true)
 public class KbChunk {
 
     @TableId(type = IdType.AUTO)
@@ -46,21 +58,24 @@ public class KbChunk {
     /**
      * ★ 向量列，1024 维（对应 bge-m3 的输出维度）。数据库类型是 {@code vector(1024)}。
      *
-     * <p><b>为什么这里声明成 {@code String} 而不是 {@code float[]}？</b>
+     * <p><b>为什么是 {@code float[]} 而不是 {@code String} 或 {@code double[]}？</b>
      *
-     * <p>因为 {@code vector} 不是 PostgreSQL 内置类型，而是 pgvector 扩展定义的，
-     * JDBC 驱动不认识它。MyBatis 默认的类型处理器也没有 float[] ↔ vector 的转换规则，
-     * 直接用 float[] 会报「无法转换类型」。
+     * <p><b>不用 String</b>：阶段 1 建表时这里确实用 String 占位过，因为当时只建表、
+     * 不读写向量。但 String 有个致命问题 —— <b>编译器拦不住任何错误</b>。
+     * 传进去一个 512 维的文本、一段 JSON、甚至一句「待填」，都要等到运行时
+     * 被 PostgreSQL 拒绝才知道。换成 float[] 之后，维度不匹配能在代码层面就约束住，
+     * 而 {@link VectorTypeHandler} 负责与数据库文本格式的转换。
      *
-     * <p>正确的做法是<b>自定义 TypeHandler</b>：写入时把 float[] 拼成
-     * {@code [0.1,0.2,...]} 形式的字符串，再用 {@code ?::vector} 显式转换；
-     * 读取时把数据库返回的字符串解析回 float[]。
+     * <p><b>不用 double[]</b>：bge-m3 输出的本来就是 32 位单精度浮点，
+     * 1024 维用 double 存会白白多占一倍空间和网络带宽。
+     * 而检索用的是余弦相似度，单精度约 1e-7 的表示误差
+     * 远小于模型本身的语义噪声，不影响排序结果。
      *
-     * <p>阶段 1 只是建表和灌种子数据，<b>不涉及向量读写</b>，所以先用 String 占位，
-     * 读写能力在阶段 3（文档入库、批量向量化）再实现。
-     * 用 String 读也能工作——pgjdbc 会把 vector 值以 {@code [0.1,0.2,...]} 文本形式返回。
+     * <p>⚠️ <b>改这个字段的类型时，别忘了类上的 {@code autoResultMap = true}</b>，
+     * 否则写入正常但读取静默返回 null。
      */
-    private String embedding;
+    @TableField(typeHandler = VectorTypeHandler.class)
+    private float[] embedding;
 
     /** 灵活扩展字段，避免为偶然需求频繁改表 */
     private String metadata;

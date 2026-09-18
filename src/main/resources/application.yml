@@ -410,3 +410,48 @@ xbla:
     rerank:
       provider: siliconflow
       model-id: BAAI/bge-reranker-v2-m3
+
+  # ============================================================
+  # 知识库：文档入库（阶段 3）
+  #
+  # 这些参数里，切分那几项是【阶段 7 做 A/B 调优的主要抓手】。
+  # 切片太长会引入无关噪声，太短会丢上下文 —— 用真实指标说话，
+  # 所以它们全放在配置里，改一行 YAML 重启即可，不用改代码重新打包。
+  # ============================================================
+  kb:
+    # 上传文件落盘目录。已在 .gitignore 里，不会进 git
+    storage-dir: data/uploads
+    # 仿真语料目录（scripts/generate_corpus.py 的输出位置）
+    corpus-dir: data/corpus
+
+    chunking:
+      # 单个切片目标最大字符数。中文 1 字约 0.7~1 token，500 字约 400 token。
+      # ⚠️ 这是初始假设，不是标准答案，阶段 7 要用指标验证
+      max-chars: 500
+      # 相邻切片的重叠窗口。答案横跨切分点时靠它救回来
+      overlap-chars: 80
+      # 低于这个长度尝试并入同一章节的上一篇（避免噪声切片）
+      min-chars: 80
+      # 整个章节短于这个值时不再切分，整段作为一片（避免切出小尾巴）
+      merge-threshold-chars: 700
+      # 优先断在这些标点之后，尽量不把句子拦腰截断
+      break-chars: "。！？；!?;\n"
+      # 把标题路径拼进切片正文最前面。
+      # ★ 默认开：用户问「退货政策是什么」时，「退货」二字可能只出现在标题里，
+      #   正文写的是「签收后 7 天内可申请」。标题不参与向量化就丢了关键语义线索。
+      include-heading-in-content: true
+
+    embedding:
+      # 单次提交向量化的条数。和 OpenAiCompatibleEmbeddingClient 内部的分批大小对齐
+      batch-size: 32
+      # 单条文本送入接口前的字符上限（兜底，正常切分不会触发）
+      max-chars-per-text: 4000
+
+    ingest:
+      # ★ 线程数故意开得很少：瓶颈在对方的限流阈值，不在我们的 CPU。
+      #   开太多只会更快撞上 429，然后整批一起失败
+      core-pool-size: 2
+      max-pool-size: 4
+      # 队列故意设得很大：入库是后台任务，排队对用户不可见。
+      # 和 sseExecutor 的「队列故意设小」正好相反，理由见 AsyncConfig 的注释
+      queue-capacity: 200

@@ -136,6 +136,12 @@ storage/
 uploads/
 data/uploads/
 
+# ⚠️ 注意 data/corpus/ 是【故意不忽略】的：
+#   那是 scripts/generate_corpus.py 生成的仿真语料，一共 6 份约 60KB。
+#   提交它是有意为之——别人克隆仓库后不装 Python 依赖也能直接
+#   POST /api/kb/documents/scan 把语料灌进去，看到完整链路跑通。
+#   而 data/uploads/ 装的是运行时上传的文件，可能含隐私数据且体积不可控，必须忽略。
+
 # Python 评测中间结果
 eval_results/
 *.eval.tmp

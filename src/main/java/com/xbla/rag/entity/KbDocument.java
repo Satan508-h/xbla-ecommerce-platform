@@ -18,6 +18,41 @@ import java.time.OffsetDateTime;
 @TableName("kb_document")
 public class KbDocument {
 
+    // ================================================================
+    // 常量：状态机取值
+    //
+    // ★ 为什么把「魔法数字」提成常量，而且放在实体类上
+    //
+    //   status 的四个取值要在【三个地方】使用：入库服务（登记新文档）、
+    //   入库流水线（推进状态）、状态查询接口（翻译成中文）。
+    //   散落成三处的字面量 1/2/3/4 有个致命问题：
+    //   它们没有名字，读代码的人看到 setStatus(3) 得回去翻数据库文档
+    //   才知道 3 是什么意思，而且写错了编译器也不会拦。
+    //
+    //   放在实体类上而不是单独建一个常量类，是因为 status 是这张表的属性，
+    //   就近定义让「谁定义了这些值」一目了然。
+    // ================================================================
+
+    /** 待处理：记录已登记，还没开始跑流水线 */
+    public static final int STATUS_PENDING = 1;
+    /** 处理中：流水线正在跑（解析/切分/向量化/写库） */
+    public static final int STATUS_PROCESSING = 2;
+    /** 已入库：切片和向量都已写入，可以被检索到 */
+    public static final int STATUS_DONE = 3;
+    /** 处理失败：详见 {@code errorMsg} */
+    public static final int STATUS_FAILED = 4;
+
+    // ---- 文档类型 docType ----
+    public static final int TYPE_PRODUCT = 1;
+    public static final int TYPE_AFTER_SALE = 2;
+    public static final int TYPE_PROMOTION = 3;
+    public static final int TYPE_FAQ = 4;
+    public static final int TYPE_MANUAL = 5;
+
+    // ---- 来源 sourceType ----
+    public static final int SOURCE_FILE = 1;
+    public static final int SOURCE_DATABASE = 2;
+
     @TableId(type = IdType.AUTO)
     private Long id;
 
