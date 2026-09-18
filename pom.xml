@@ -116,6 +116,25 @@
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
+
+        <!--
+          Flyway 数据库迁移
+          作用：把建表/改表写成带版本号的 SQL 文件，应用启动时自动执行没跑过的那些，
+                并在数据库里留下执行记录（flyway_schema_history 表）。
+          为什么需要：手工执行 SQL 没有状态，换台机器或过两周就不知道跑到哪了。
+
+          flyway-core 是引擎，flyway-database-postgresql 是 PostgreSQL 方言支持。
+          Flyway 10 起把各数据库的支持拆成了独立模块，两个都要引。
+          ⚠️ 只引 flyway-core 会报 "Unsupported Database: PostgreSQL"。
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

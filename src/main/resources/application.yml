@@ -21,6 +21,36 @@ spring:
   profiles:
     active: local
 
+  # ------------------------------------------------------------
+  # Flyway 数据库迁移
+  #
+  # 应用启动时自动执行 db/migration 下「还没跑过」的迁移脚本，
+  # 执行记录写在数据库的 flyway_schema_history 表里。
+  # ------------------------------------------------------------
+  flyway:
+    enabled: true
+    # 迁移脚本位置（classpath 下）
+    locations: classpath:db/migration
+
+    # ★ 允许在「已有内容的数据库」上首次运行。
+    #   本项目数据库里有 sql/01-init.sql 建的 vector 扩展，
+    #   Flyway 会认为这个库非空而拒绝迁移，加这个开关后
+    #   它会先打一个版本 0 的基线，再从 V1 开始跑。
+    #   （空库不需要这个，但设了也无害）
+    baseline-on-migrate: true
+    baseline-version: 0
+
+    # 校验已执行脚本的 checksum。
+    # 如果改了已执行过的迁移文件，启动会直接失败并告诉你哪个文件被改过。
+    # ★ 这是保护机制，不要关掉——出问题时应该新增 V6 而不是改 V1。
+    validate-on-migrate: true
+
+    # 禁止 flyway clean（会清空整个库）。双重保险，防止误操作。
+    clean-disabled: true
+
+    # 迁移脚本的编码，中文注释必须靠它才能正确执行
+    encoding: UTF-8
+
   # 统一 JSON 序列化行为
   jackson:
     # 日期统一用 ISO-8601 格式，避免前端拿到一堆时间戳数字
