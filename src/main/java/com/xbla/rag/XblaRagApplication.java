@@ -1,5 +1,6 @@
 package com.xbla.rag;
 
+import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
@@ -26,6 +27,24 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * 就扫不到了，接口会全部 404 —— 这是新手最常踩的坑之一。
  */
 @SpringBootApplication
+/*
+ * @MapperScan 告诉 MyBatis：这个包下的接口都是 Mapper，启动时为它们生成代理实现。
+ *
+ * 【为什么需要它】
+ * @ComponentScan 只认 @Component / @Service / @RestController 这些注解，
+ * 而 Mapper 是「接口」——接口没法被实例化，也不会被注册成 Bean。
+ * MyBatis 的做法是在启动时为每个 Mapper 接口动态生成一个代理类，
+ * 由代理去执行 SQL。@MapperScan 就是触发这个动作的开关。
+ *
+ * 【不加会怎样】
+ * 报错：Consider defining a bean of type 'com.xbla.rag.mapper.ProductMapper'
+ *      in your configuration.
+ *
+ * 【另一种写法】
+ * 也可以在每个 Mapper 接口上单独加 @Mapper 注解。
+ * 但 17 个接口就要写 17 次，用 @MapperScan 一次搞定，改包名时也只改一处。
+ */
+@MapperScan("com.xbla.rag.mapper")
 public class XblaRagApplication {
 
     public static void main(String[] args) {

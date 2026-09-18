@@ -14,6 +14,45 @@ spring:
   application:
     name: xbla-rag
 
+  # ------------------------------------------------------------
+  # 数据库连接
+  #
+  # 这里只放「非密钥」的部分（URL、驱动、连接池参数），
+  # 用户名密码在 application-local.yml 里（已被 gitignore）。
+  # Spring Boot 会把两个文件的配置合并，profile 文件优先级更高。
+  # ------------------------------------------------------------
+  datasource:
+    # ★ URL 末尾的 stringtype=unspecified 不能省，原因如下：
+    #
+    #   pgjdbc 默认把 Java String 当作 varchar 类型发送给 PostgreSQL。
+    #   而本项目有几个列不是 varchar：
+    #     - kb_chunk.embedding    类型 vector(1024)
+    #     - chat_message."references"  类型 jsonb
+    #     - qa_log."references"        类型 jsonb
+    #   PostgreSQL 不会把 varchar 隐式转换成这些类型，会直接报错：
+    #     column "references" is of type jsonb but expression is of type character varying
+    #
+    #   加上 stringtype=unspecified 后，驱动把字符串以「未指定类型」发送，
+    #   由 PostgreSQL 根据目标列的类型自行推断 —— 这是 pgjdbc 官方推荐的
+    #   处理 jsonb / 自定义类型（如 pgvector 的 vector）的标准做法。
+    url: jdbc:postgresql://localhost:5432/xbla_rag?stringtype=unspecified
+    driver-class-name: org.postgresql.Driver
+
+    # HikariCP 连接池参数（非密钥，放这里）
+    hikari:
+      # 最大连接数。本地开发用不了那么多，设小一点省资源
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+      idle-timeout: 600000
+      # 连接最长存活时间，防止数据库端主动断开后拿到死连接
+      max-lifetime: 1800000
+      # ★ 启动时若连不上数据库，是否让应用启动失败。
+      #   -1 表示不检查 —— 数据库没起来应用也能启动，
+      #   /actuator/health 会显示 db 为 DOWN。
+      #   这样调试时不会因为忘了开 Docker 就整个应用起不来。
+      initialization-fail-timeout: -1
+
   # 激活 local 配置分支。
   # Spring Boot 会自动去找 application-local.yml 并加载，
   # 同名配置项以 local 文件为准（覆盖下面的默认值）。
@@ -59,6 +98,44 @@ spring:
     # 反序列化时忽略 JSON 里多余的字段，防止前端多传一个字段就报错
     deserialization:
       fail-on-unknown-properties: false
+
+# ------------------------------------------------------------
+# MyBatis-Plus
+# ------------------------------------------------------------
+mybatis-plus:
+  # Mapper XML 文件位置。阶段 1 用 BaseMapper 自带的 CRUD 就够，
+  # 阶段 4 写复杂的检索 SQL 时才会往这里放 XML
+  mapper-locations: classpath*:/mapper/**/*.xml
+
+  # 实体类所在包。配了之后 XML 里写 resultType 可以用短类名（Product）
+  # 而不是全限定名（com.xbla.rag.entity.Product）
+  type-aliases-package: com.xbla.rag.entity
+
+  configuration:
+    # ★ 数据库下划线字段 -> Java 驼峰属性 的自动映射
+    #   开了这个，product_name 自动映射到 productName，不用写 @TableField 或 @Results
+    map-underscore-to-camel-case: true
+
+    # 把执行的 SQL 打到控制台。
+    # 开发阶段强烈建议开着 —— 它是发现「N+1 查询」「忘了加索引导致全表扫描」
+    # 这类问题最直接的手段。上线前要关掉（日志量大且可能泄露数据）。
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+  global-config:
+    # 关掉启动时那个 MyBatis-Plus 的 ASCII logo，日志清爽一点
+    banner: false
+    db-config:
+      # ★★ 主键策略必须改成 auto ★★
+      #   MyBatis-Plus 默认是 ASSIGN_ID（雪花算法），会自己生成一个 19 位 ID。
+      #   而我们的表用的是 BIGSERIAL 自增，必须让它交给数据库生成，
+      #   否则自增序列会被架空 —— 之后手工 INSERT 不指定 id 时就会主键冲突。
+      id-type: auto
+
+      # 逻辑删除：查询时 MP 自动拼上 WHERE deleted = 0
+      # 这里的 deleted 是全局默认字段名，实体类里不用再加 @TableLogic
+      logic-delete-field: deleted
+      logic-delete-value: 1      # 已删除
+      logic-not-delete-value: 0  # 未删除
 
 # ------------------------------------------------------------
 # actuator：运维监控接口

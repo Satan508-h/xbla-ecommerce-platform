@@ -64,6 +64,25 @@
         </dependency>
 
         <!--
+          Lombok
+          作用：编译期生成 getter/setter/toString/构造器，让实体类只保留字段声明。
+          没有它，17 个实体要多写 5000+ 行样板代码，真正重要的字段定义反而被淹没。
+
+          <optional>true</optional>：表示「这个依赖不传递给引用本项目的其他项目」。
+          Spring Boot 官方脚手架生成的项目都是这么配的。
+
+          ⚠️ IDE 必须装 Lombok 插件才能识别生成的 getter/setter：
+             - IntelliJ IDEA：2020.3+ 版本已内置，无需额外安装
+             - VS Code：需要装 "Lombok Annotations Support for VS Code" 扩展
+             不装的话 IDE 会飘红提示「找不到 getXxx()」，但 Maven 编译是正常的。
+        -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!--
           spring-boot-starter-test
           作用：测试框架（JUnit 5 + Mockito + AssertJ）。
           <scope>test</scope> 表示只在测试时引入，不会打进最终的可运行 jar。
