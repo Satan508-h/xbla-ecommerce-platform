@@ -3,6 +3,7 @@ package com.xbla.rag;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 
 /**
  * 休伯利安（XBLA）电商导购与售后 RAG 平台 —— 启动类。
@@ -45,6 +46,25 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * 但 17 个接口就要写 17 次，用 @MapperScan 一次搞定，改包名时也只改一处。
  */
 @MapperScan("com.xbla.rag.mapper")
+/*
+ * @ConfigurationPropertiesScan —— 扫描并注册 @ConfigurationProperties 类（阶段 2 新增）。
+ *
+ * 【为什么需要它】
+ * @ComponentScan 不认 @ConfigurationProperties —— 这个注解本身只是「声明配置前缀」，
+ * 不带任何 Bean 注册语义。所以在它被发现之前，配置类必须先带 @Component。
+ *
+ * 有两种解法：
+ *   A. 每个配置类上写 @Component
+ *   B. 启动类上写一次 @ConfigurationPropertiesScan
+ *
+ * 选 B 的理由：配置类不用带任何 Spring 注解，职责更单纯 ——
+ * 它就是个「装着配置字段的普通 POJO」，不该关心自己怎么被注册。
+ *
+ * 【扫描范围】
+ * 扫的是启动类所在包（com.xbla.rag）及子包，所以 config/ 下的
+ * LlmProperties 会被扫到。将来配置类变多了也不用回来改这里。
+ */
+@ConfigurationPropertiesScan
 public class XblaRagApplication {
 
     public static void main(String[] args) {

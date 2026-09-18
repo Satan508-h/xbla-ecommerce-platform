@@ -129,7 +129,7 @@ com.xbla.rag
 
 ---
 
-## 六、常用命令（环境搭好后补充）
+## 六、常用命令
 
 ```bash
 # 启动中间件
@@ -141,9 +141,64 @@ docker compose ps
 # 连接数据库
 docker compose exec postgres psql -U xbla -d xbla_rag
 
-# 后端启动
+# 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 前端启动
-cd web && npm run dev
+# 跑测试（含 EntityMappingTest 回归 + client 层单测）
+./mvnw test
 ```
+
+### 阶段 2 新增：模型接入层的调试探针
+
+> ⚠️ 这些接口标了 `@Profile("local")`，只在本地开发时存在 ——
+> 它们可以无条件消耗 API 额度，**绝不能暴露到生产**。
+
+```bash
+# 降级链与熔断器实时状态
+curl -s localhost:8080/api/debug/llm/chain | python -m json.tool
+
+# 直连某一档（绕过熔断和降级），用于单独验证每个模型
+curl -s -G localhost:8080/api/debug/llm/chat \
+  --data-urlencode "q=你好" --data-urlencode "model=deepseek-flash"
+# model 传 auto 或不传 = 走完整降级链
+
+# 向量化（看 dimension 是不是 1024）
+curl -s -G localhost:8080/api/debug/embedding --data-urlencode "q=退货政策"
+
+# 语义相似度对比
+curl -s -G localhost:8080/api/debug/similarity \
+  --data-urlencode "a=退货政策怎么规定" --data-urlencode "b=我想退货"
+
+# 重排序（相关文档得分应显著高于不相关的）
+curl -s -G localhost:8080/api/debug/rerank \
+  --data-urlencode "q=怎么退货" --data-urlencode "docs=七天无理由退货,发货时效,优惠券规则"
+
+# 流式打字机（逐行 event: delta 陆续到达）
+curl -N -G localhost:8080/api/debug/llm/stream --data-urlencode "q=你好"
+```
+
+### 业务接口
+
+```bash
+# 非流式问答
+curl -s -X POST localhost:8080/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"商品支持七天无理由退货吗"}'
+
+# 流式问答（打字机效果）
+curl -N -G localhost:8080/api/chat/stream --data-urlencode "question=你好"
+# 浏览器演示页：http://localhost:8080/chat.html
+
+# 熔断器状态
+curl -s localhost:8080/actuator/circuitbreakers | python -m json.tool
+```
+
+### ⚠️ Windows 环境下的两个坑
+
+1. **命令行里的中文会被 shell 破坏。** Git Bash 传中文给 `curl -d` 会变成
+   `U+FFFD` 替换字符（`efbfbd`），服务端收到乱码。
+   **测试中文请用文件传输**：`curl --data-binary @payload.json`，
+   或者用 Python 做百分号编码（`urllib.parse.quote`）。
+   *浏览器不受影响 —— 它会正确地做百分号编码。*
+2. **Maven 输出的中文会乱码。** 加环境变量：
+   `export MAVEN_OPTS="-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"`

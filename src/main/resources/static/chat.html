@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>休伯利安 · RAG 问答（阶段 2 最小闭环）</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1f2329; display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    background: #fff; border-bottom: 1px solid #e5e6eb; padding: 12px 20px;
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { font-size: 12px; color: #86909c; }
+  #status {
+    margin-left: auto; font-size: 12px; color: #86909c;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  #messages { flex: 1; overflow-y: auto; padding: 20px; }
+  .msg { max-width: 760px; margin: 0 auto 16px; display: flex; gap: 10px; }
+  .msg .who {
+    flex: 0 0 34px; height: 34px; border-radius: 50%; display: flex;
+    align-items: center; justify-content: center; font-size: 13px; color: #fff;
+  }
+  .msg.user .who { background: #165dff; }
+  .msg.bot  .who { background: #00b42a; }
+  .bubble {
+    background: #fff; border-radius: 8px; padding: 10px 14px; line-height: 1.7;
+    white-space: pre-wrap; word-break: break-word; font-size: 14px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  }
+  .msg.user .bubble { background: #e8f3ff; }
+  .meta {
+    max-width: 760px; margin: -8px auto 16px; font-size: 12px; color: #86909c;
+    padding-left: 44px; font-family: ui-monospace, Consolas, monospace;
+  }
+  .degrade {
+    max-width: 760px; margin: -8px auto 16px; font-size: 12px;
+    color: #d25f00; background: #fff7e8; border: 1px solid #ffe4ba;
+    border-radius: 6px; padding: 8px 12px; margin-left: 44px; margin-right: auto;
+  }
+  footer { background: #fff; border-top: 1px solid #e5e6eb; padding: 12px 20px; }
+  .inputrow { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; }
+  input[type=text] {
+    flex: 1; padding: 10px 14px; border: 1px solid #dcdfe6; border-radius: 6px;
+    font-size: 14px; outline: none; font-family: inherit;
+  }
+  input[type=text]:focus { border-color: #165dff; }
+  button {
+    padding: 10px 22px; border: 0; border-radius: 6px; background: #165dff;
+    color: #fff; font-size: 14px; cursor: pointer; font-family: inherit;
+  }
+  button:disabled { background: #c9cdd4; cursor: not-allowed; }
+  .cursor::after {
+    content: "▋"; color: #165dff; animation: blink 1s steps(2) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>休伯利安 · 智能客服</h1>
+  <span class="sub">阶段 2 最小闭环（尚未接入知识库检索）</span>
+  <span id="status">就绪</span>
+</header>
+
+<div id="messages">
+  <div class="msg bot">
+    <div class="who">AI</div>
+    <div class="bubble">你好，我是休伯利安的智能客服助手。可以问我商品咨询、促销政策、售后服务相关的问题。</div>
+  </div>
+</div>
+
+<footer>
+  <div class="inputrow">
+    <input type="text" id="q" placeholder="例如：商品支持七天无理由退货吗？" autocomplete="off">
+    <button id="send">发送</button>
+  </div>
+</footer>
+
+<script>
+const messagesEl = document.getElementById('messages');
+const statusEl   = document.getElementById('status');
+const inputEl    = document.getElementById('q');
+const sendBtn    = document.getElementById('send');
+
+let currentSessionNo = null;
+
+function addMessage(role, text) {
+  const row = document.createElement('div');
+  row.className = 'msg ' + role;
+  const who = document.createElement('div');
+  who.className = 'who';
+  who.textContent = role === 'user' ? '我' : 'AI';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+  row.appendChild(who); row.appendChild(bubble);
+  messagesEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
+}
+
+function addMeta(text) {
+  const el = document.createElement('div');
+  el.className = 'meta';
+  el.textContent = text;
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function addNotice(text) {
+  const el = document.createElement('div');
+  el.className = 'degrade';
+  el.textContent = text;
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function setBusy(busy) {
+  sendBtn.disabled = busy;
+  inputEl.disabled  = busy;
+  if (!busy) inputEl.focus();
+}
+
+function send() {
+  const question = inputEl.value.trim();
+  if (!question) return;
+
+  addMessage('user', question);
+  inputEl.value = '';
+  setBusy(true);
+  statusEl.textContent = '连接中…';
+
+  const bubble = addMessage('bot', '');
+  bubble.classList.add('cursor');
+
+  // ★ 必须用 GET —— EventSource 不支持 POST
+  let url = '/api/chat/stream?question=' + encodeURIComponent(question);
+  if (currentSessionNo) url += '&sessionNo=' + encodeURIComponent(currentSessionNo);
+
+  const es = new EventSource(url);
+
+  // ★★★ 每个终止分支都必须 es.close()，一处都不能漏 ★★★
+  //     EventSource 在服务端关闭连接后会【自动重连】。
+  //     不 close 的话，同一个问题会被反复提问、反复计费 ——
+  //     而且前端看起来只是「回答重复了」，很难联想到是重连导致的。
+  function finish() {
+    es.close();
+    bubble.classList.remove('cursor');
+    setBusy(false);
+    statusEl.textContent = '就绪';
+  }
+
+  es.addEventListener('meta', e => {
+    const d = JSON.parse(e.data);
+    currentSessionNo = d.sessionNo;
+    statusEl.textContent = 'trace ' + d.traceId.slice(0, 8) + '…';
+  });
+
+  es.addEventListener('delta', e => {
+    // ★ payload 是 JSON 而不是纯文本：纯文本走 StringHttpMessageConverter，
+    //   默认字符集不是 UTF-8，中文会变问号；而且正文里的换行会破坏 SSE 分帧。
+    bubble.textContent += JSON.parse(e.data).v;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+
+  es.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    const u = d.usage || {};
+    addMeta(
+      `${d.provider} / ${d.model}` +
+      ` · tokens ${u.promptTokens ?? '-'}→${u.completionTokens ?? '-'}` +
+      (u.reasoningTokens ? `（推理 ${u.reasoningTokens}）` : '') +
+      ` · ${d.llmLatencyMs}ms · ¥${d.cost ?? '未知'}`
+    );
+    if (d.degraded) {
+      addNotice('⚠ 本次发生了降级：' +
+        d.degradationEvents.map(x => `${x.from}→${x.to ?? '无'}(${x.reason})`).join('，'));
+    }
+    finish();
+  });
+
+  // ★ 事件名用 'failed' 而不是 'error' ——
+  //   EventSource 有内置的 error 事件（连接层错误），同名会让
+  //   我们的业务错误和网络错误混在一起，无法区分。
+  es.addEventListener('failed', e => {
+    const d = JSON.parse(e.data);
+    bubble.textContent = '【出错了】' + d.message;
+    addMeta('traceId: ' + (d.traceId || '-'));
+    finish();
+  });
+
+  // 连接层错误（服务端没起来、被网关断开等）
+  es.onerror = () => {
+    if (bubble.textContent === '') {
+      bubble.textContent = '【连接中断】无法连接到服务端，请确认后端已启动。';
+    }
+    finish();
+  };
+}
+
+sendBtn.addEventListener('click', send);
+inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+inputEl.focus();
+</script>
+
+</body>
+</html>

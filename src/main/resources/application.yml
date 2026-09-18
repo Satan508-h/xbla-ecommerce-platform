@@ -96,8 +96,31 @@ spring:
     date-format: yyyy-MM-dd HH:mm:ss
     time-zone: Asia/Shanghai
     # 反序列化时忽略 JSON 里多余的字段，防止前端多传一个字段就报错
+    #
+    # ★ 这一条在阶段 2 变得非常重要：
+    #   deepseek-flash 是「推理模型」，响应里多一个非标准字段 reasoning_content。
+    #   本项目决策是【丢弃它】，而实现方式就是靠这一行 ——
+    #   DTO 里不声明这个字段，Jackson 会自动忽略，不需要写任何过滤代码。
     deserialization:
       fail-on-unknown-properties: false
+
+  # ------------------------------------------------------------
+  # Spring MVC 异步请求超时
+  #
+  # ★ 这一行不能省，否则流式问答会在 30 秒时被无声掐断。
+  #
+  #   原因：Tomcat 的异步请求超时（asyncTimeout）默认是 30 秒。
+  #   SSE 流式响应走的是 Servlet 异步机制，一旦超过这个时间，
+  #   Tomcat 会直接关闭连接，日志里只有一句
+  #       "Async request timed out"
+  #   前端表现为「答到一半突然没了」，而且没有任何异常栈，极难排查。
+  #
+  #   这里设 180 秒作为全局兜底；SseEmitter 构造器上还会再单独指定一次。
+  #   两处都设是刻意的冗余 —— 只设一处时，很容易因为改了其中一个而失效。
+  # ------------------------------------------------------------
+  mvc:
+    async:
+      request-timeout: 180s
 
 # ------------------------------------------------------------
 # MyBatis-Plus
@@ -146,7 +169,12 @@ management:
       exposure:
         # 只暴露 health 和 info。★ 千万别写 "*"，那会把 /actuator/env 之类
         # 可能泄露配置的接口也暴露出去。
-        include: health,info
+        #
+        # 阶段 2 追加 circuitbreakers：这是验证「降级链」最直接的窗口 ——
+        #   curl localhost:8080/actuator/circuitbreakers
+        # 能实时看到每个熔断器是 CLOSED / OPEN / HALF_OPEN，
+        # 以及失败率、慢调用率等状态机指标。验收标准 2 就靠它。
+        include: health,info,circuitbreakers,circuitbreakerevents
   endpoint:
     health:
       # always = 健康检查详情里显示每个组件（数据库、Redis、磁盘）的具体状态。
@@ -161,3 +189,224 @@ logging:
     root: info
     # 本项目自己的包开到 debug，方便开发时看清链路；第三方包保持 info 免得刷屏
     com.xbla.rag: debug
+  charset:
+    # ★ Windows 上必须显式指定，否则控制台里的中文日志是乱码。
+    #   原因：Windows 控制台默认代码页是 GBK(936)，而 JVM 默认按平台编码输出，
+    #   UTF-8 的字节被按 GBK 解码就变成了「鏂囦欢」这样的乱码。
+    #   也可以在启动前执行 chcp 65001 切到 UTF-8，但那是环境依赖，
+    #   写在这里才是「跟着项目走」的解法。
+    console: UTF-8
+
+# ============================================================
+# 模型供应商与对话链路（阶段 2）
+#
+# 【为什么分三层？】
+#   ① providers = 「连接」：域名 + 密钥。换供应商不用动模型定义。
+#   ② models    = 「模型」：真实模型 ID + 单价。同一个连接上可以挂多个模型。
+#   ③ chatChain = 「策略」：降级顺序。改顺序、加兜底模型都只动这一处。
+#
+#   这样分层的直接好处：P1 和 P2 用的是【同一个硅基流动连接、同一个 Key】，
+#   但模型不同（V4-Flash / Qwen3-8B）。如果连接信息和模型混在一起写，
+#   密钥就要重复两份；将来给 P2 换一家供应商，也只改 models 里的一行。
+#
+# 【密钥在哪？】
+#   本文件只写 ${环境变量:} 形式的占位。真实密钥填在 application-local.yml
+#   （已 gitignore），格式：
+#       xbla:
+#         llm:
+#           providers:
+#             deepseek:    { api-key: sk-xxx }
+#             siliconflow: { api-key: sk-xxx }
+#
+# ⚠️ CLAUDE.md 第 5 条：API Key 绝不写进代码、绝不提交到 git。
+# ============================================================
+xbla:
+  llm:
+
+    # ----------------------------------------------------------
+    # ① 连接层：域名 + 密钥
+    #
+    # ★ 两家的 base-url 都【不带 /v1】。
+    #   代码里会统一拼成 {base-url}/v1/chat/completions。
+    #   把版本号放在代码里而不是配置里，是为了让「配错域名」和
+    #   「配错协议版本」这两类问题能在日志里一眼分开。
+    # ----------------------------------------------------------
+    providers:
+      deepseek:
+        base-url: https://api.deepseek.com
+        api-key: ${DEEPSEEK_API_KEY:}
+        # 流式请求是否带 stream_options.include_usage
+        # ★ 已实测（2026-09-18）：DeepSeek 官方支持，能拿到 usage
+        stream-include-usage: true
+
+      siliconflow:
+        base-url: https://api.siliconflow.cn
+        api-key: ${SILICONFLOW_API_KEY:}
+        # ★ 已实测（2026-09-18）：硅基流动也支持。
+        #   注意它返回的 usage chunk 里 choices 是【空数组】，
+        #   解析时必须先判空，否则 ArrayIndexOutOfBounds。
+        stream-include-usage: true
+
+    # ----------------------------------------------------------
+    # ② 模型层：真实模型 ID + 单价
+    #
+    # ★ 所有 model-id 都是 2026-09-18 经 GET /v1/models + 真实调用核实过的，
+    #   不是凭记忆写的。CLAUDE.md 明确要求每次动工前重新核实。
+    #
+    # 【单价口径】元 / 百万 token，三档：
+    #   input            缓存【未命中】的输入
+    #   cache-hit-input  缓存【命中】的输入（便宜很多，因为省了计算）
+    #   output           输出（★ 已包含推理 token，不要重复计）
+    #
+    # ⚠️ DeepSeek 官方采用【峰谷分时计价】（周一至周五 9:00-12:00、14:00-18:00
+    #    为高峰，价格翻倍）。本项目按【空闲时段】单价计算，属于已知简化 ——
+    #    在高峰时段跑批会把成本低估约一半。详见 docs/08-技术决策记录(ADR).md。
+    #
+    # ⚠️ 价格数据源之间存在矛盾（DeepSeek 输出价：官方文档页标 2 元，
+    #    而 2026-09-10 的降价公告写 4 元）。这里取降价公告口径。
+    #    **请以你自己账号的账单页为准**，首次真实调用后核对 qa_log.cost 是否吻合。
+    # ----------------------------------------------------------
+    models:
+
+      # P0 —— DeepSeek 官方主力
+      # ★ 它是「推理模型」：响应含非标准字段 reasoning_content，
+      #   实测推理 token 占总输出的 87%。因此 max-tokens 必须给足，
+      #   给太小会导致推理把额度吃光、content 返回空字符串。
+      deepseek-flash:
+        provider: deepseek
+        model-id: deepseek-flash
+        pricing:
+          input: 1.0              # 缓存未命中
+          cache-hit-input: 0.02   # 缓存命中
+          output: 4.0
+
+      # P1 —— 硅基流动上的 DeepSeek-V3.2
+      #
+      # ★ 实测（2026-09-18）：它【不是】推理模型（reasoning 长度为 0），
+      #   问「用一个词回答」只用了 9 输入 / 1 输出 token、1.45 秒 ——
+      #   比推理模型快一个数量级，也更便宜。
+      #
+      # ⚠️ 设计影响：它和 P0 的 deepseek-flash 不是同一个模型，
+      #    所以 P0→P1 这一步从「同模型换源（质量不变）」变成了
+      #    「真正的模型切换」。docs/02 里原先的设计描述已同步修正。
+      deepseek-v3-2:
+        provider: siliconflow
+        model-id: deepseek-ai/DeepSeek-V3.2
+        pricing:
+          input: 2.0
+          # 硅基流动未公布这两个模型的独立缓存价，按与 input 同价填 ——
+          # 保守（可能高估成本），但绝不会低估。若账单显示有缓存折扣再调。
+          cache-hit-input: 2.0
+          output: 3.0
+
+      # P2 —— 兜底模型
+      #
+      # ★ 实测（2026-09-18）：它【是】推理模型，但比之前的 Qwen3-8B 好得多 ——
+      #   同一个问题：Qwen3-8B 推理 672 token / 耗时 111 秒，
+      #   Qwen3.5-9B 推理 379 token / 耗时 10.8 秒。
+      #
+      # 价格按国内站 ≤128k 上下文档填写（本项目上下文远小于 128k）。
+      qwen3-5-9b:
+        provider: siliconflow
+        model-id: Qwen/Qwen3.5-9B
+        pricing:
+          input: 0.5
+          cache-hit-input: 0.5
+          output: 4.0
+
+    # ----------------------------------------------------------
+    # ③ 策略层：降级顺序（P0 → P1 → P2）
+    #
+    # 每个条目对应一个独立的熔断器（名字 = 这里的 key）。
+    # ★ 粒度是「每个模型一个」而不是「每个供应商一个」：
+    #   硅基流动上 P1 被限流(429)时，P2 可能还是健康的，
+    #   按供应商做熔断会把健康的 P2 一起拖下水。
+    #
+    # ⚠️ 注意 key 的命名限制：Spring Boot 对 Map 的 key 只允许
+    #    【小写字母 + 数字 + 短横线】。所以模型版本里的点要写成短横线 ——
+    #    deepseek-v3.2 要写成 deepseek-v3-2，否则必须用 [key] 括号语法。
+    # ----------------------------------------------------------
+    chat-chain:
+      - deepseek-flash
+      - deepseek-v3-2
+      - qwen3-5-9b
+
+    # ----------------------------------------------------------
+    # 全局默认参数
+    # ----------------------------------------------------------
+    defaults:
+      # ★★ 这个值不能改小！★★
+      #   deepseek-flash 是推理模型，实测 124 个输出 token 里 108 个是推理。
+      #   max-tokens 给 20 时，推理把额度吃光，content 返回【空字符串】——
+      #   现象是「AI 不说话」，日志里却没有任何异常。这是本项目最难排查的坑之一。
+      max-tokens: 2048
+
+      # 不设 temperature 时请求体里不带这个字段，用服务端默认值。
+      # 显式写成 null 而不是删掉，是为了让「可配置但默认不启用」这件事在配置里可见。
+      temperature: null
+
+      # 连接层超时：只管 TCP 建连（目标挂了 / DNS 解析不出来）
+      connect-timeout: 5s
+
+      # 请求层超时：从发出到【收到响应头】（TTFB）。
+      # ★ 对流式请求（BodyHandlers.ofLines），这个超时只覆盖到响应头，
+      #   之后边读边推的过程它不管 —— 所以还需要 SseEmitter 那层超时兜底，
+      #   见 spring.mvc.async.request-timeout。
+      request-timeout: 15s
+
+      # ★ 非流式请求（BodyHandlers.ofString）的完整响应超时。
+      #
+      #   为什么必须和上面分开？因为两者的语义完全不同：
+      #     ofLines  → 超时只到「响应头到达」为止，之后是流式读取
+      #     ofString → 超时要覆盖【整个响应体接收完毕】
+      #
+      #   如果非流式也用 15 秒，那么生成一篇长回答（几千 token）必然超时。
+      #   实测推理模型 124 个输出 token 里 108 个是推理，
+      #   2048 的 max-tokens 在慢的时候要跑一分多钟。
+      #
+      #   180 秒是按「2048 输出 token ÷ 约 20 token/秒 ≈ 100 秒」留的余量。
+      complete-timeout: 180s
+
+      # 单次流式响应允许的最长持续时间，防止超长回答一直占着连接
+      max-stream-duration: 5m
+
+      # --------------------------------------------------------
+      # 熔断器参数
+      #
+      # ★ 关键设计：熔断器观测的「耗时」用的是 TTFB（建连 + 首字延迟），
+      #   【不是】整个流的持续时间。
+      #
+      #   为什么？一次 60 秒的正常长回答，如果按整个流耗时喂给熔断器，
+      #   会触发下面的 slow-call-rate-threshold，导致熔断器在
+      #   「系统最健康、正在正常干重活」的时候跳闸 —— 这是最坏的反向优化。
+      #
+      #   所以 slow-call-duration-threshold 设 15 秒：
+      #   正常情况下 TTFB 只有 1-3 秒，15 秒确实说明这家有问题。
+      # --------------------------------------------------------
+      circuit-breaker:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10          # 统计最近 10 次调用
+        minimum-number-of-calls: 5       # 攒够 5 次才开始判定（样本太少不算数）
+        failure-rate-threshold: 50       # 失败率 > 50% 就跳闸
+        slow-call-duration-threshold: 15s
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 30s # 跳闸后 30 秒进入「半开」试探
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+
+    # ----------------------------------------------------------
+    # 向量化与重排序
+    #
+    # ★ 只有硅基流动提供这两项能力，DeepSeek 官方没有。
+    #   这是本项目采用双供应商架构的根本原因。
+    # ----------------------------------------------------------
+    embedding:
+      provider: siliconflow
+      model-id: BAAI/bge-m3
+      # ★ 1024 维已实测确认，与 kb_chunk.embedding 的 vector(1024) 建表一致。
+      #   改这个值必须同时改表结构（全项目向量维度基准，见 CLAUDE.md 第 8 条）。
+      dimension: 1024
+
+    rerank:
+      provider: siliconflow
+      model-id: BAAI/bge-reranker-v2-m3

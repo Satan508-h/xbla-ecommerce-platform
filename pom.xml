@@ -30,6 +30,31 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     </properties>
 
+    <!--
+      dependencyManagement：这里只「声明版本」，不真正引入依赖。
+      真正引入靠下面 <dependencies> 里写 groupId + artifactId（不写 version）。
+
+      这里 import 了 resilience4j 的 BOM（Bill of Materials，物料清单），
+      作用是让下面所有 resilience4j-* 依赖版本天然一致，且都不用再写版本号。
+
+      ★ 为什么必须自己 import？
+        Spring Boot 3.5.16 的父 POM 里【没有】托管 resilience4j。
+        这一点是查本地 ~/.m2 里的 spring-boot-dependencies-3.5.16.pom 逐行确认的，
+        不是凭记忆。不写这个 BOM 又不写版本号的话，Maven 会直接报
+        "'dependencies.dependency.version' for io.github.resilience4j:xxx:jar is missing"。
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.github.resilience4j</groupId>
+                <artifactId>resilience4j-bom</artifactId>
+                <version>2.4.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!--
           spring-boot-starter-web
@@ -153,6 +178,61 @@
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <!--
+          以下依赖于阶段 2 启用（模型接入层 + 降级链）
+        -->
+        <!-- ================================================== -->
+
+        <!--
+          resilience4j-spring-boot3 —— 熔断器
+          ★ artifactId 里的 spring-boot3 不能写成 spring-boot2，
+            后者是给 Spring Boot 2 用的，引进来会因 jakarta 命名空间不兼容起不来。
+          版本由上面的 resilience4j-bom 统一管理（2.4.0）。
+
+          本项目【只用编程式 API】，不用 @CircuitBreaker 注解：
+          - 注解的 fallback 链表达不了「流式已吐字就不能降级」这个边界
+          - 注解把状态机藏在切面里，不符合项目「链路可逐行解释」的要求
+        -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-starter-aop —— AOP 支持
+
+          ★ 表面看熔断器不需要它，但 resilience4j-spring-boot3 的自动配置类
+            AbstractCircuitBreakerConfigurationOnMissingBean 上挂着
+            @Condition(AspectJOnClasspathCondition.class)：类路径上没有 AspectJ 时，
+            它可能干脆不装配，而日志里只有一行 WARN。
+            这种「静默不装配」的坑排查成本极高（配置全都对，Bean 就是没有），
+            所以直接把 AOP 引上，消除这份不确定性。
+
+          另外我们还会自己 @Bean 一个 CircuitBreakerRegistry（见 ChatChainConfig）
+          做双重保险；AOP 的另一个作用是让 /actuator/circuitbreakers 能列出熔断器实例。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <!--
+          spring-boot-configuration-processor —— 配置元数据生成器
+          作用：编译期扫描 @ConfigurationProperties 类，生成
+                META-INF/spring-configuration-metadata.json，
+                让 IDE 在 application.yml 里对 xbla.llm.* 有自动补全和文档提示。
+
+          <optional>true</optional>：只在编译期用，不传递给下游项目。
+
+          ⚠️ 本项目配置是三层结构（providers / models / chat-chain），
+             没有它就得对着代码手敲配置键，很容易拼错。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
         </dependency>
     </dependencies>
 

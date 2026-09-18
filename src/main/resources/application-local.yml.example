@@ -12,53 +12,53 @@
 #   CLAUDE.md 第 5 条硬性约定：API Key 绝不写进代码、绝不提交到 git。
 #   一旦密钥进了 git 历史，即使后来删掉文件也清不干净 —— 历史里还在，
 #   GitHub 上还能搜到。所以只能靠「密钥放本地文件 + 文件被忽略」这个组合。
+#
+# ★ 阶段 2 变更：模型配置改成了三层结构（providers / models / chat-chain）。
+#   完整的非敏感部分（域名、模型 ID、单价、超时、熔断参数）都在
+#   application.yml 里，这个私有文件【只需要填两个 API Key】。
 # ============================================================
 
 # ------------------------------------------------------------
-# 数据库（阶段 0 的 0.8 之后启用）
+# 数据库
+#
+# 注意：URL、驱动、连接池参数都在 application.yml 里（那些不是密钥）。
+# 这里只覆盖用户名和密码。
 # ------------------------------------------------------------
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/xbla_rag
     username: xbla
     password: 这里填你的数据库密码
-    driver-class-name: org.postgresql.Driver
 
   # ------------------------------------------------------------
-  # Redis（阶段 0 的 0.8 之后启用）
+  # Redis
   # ------------------------------------------------------------
   data:
     redis:
       host: localhost
       port: 6379
-      # 如果 docker-compose 里给 Redis 配了密码，这里要对应填上
+      # 如果 docker-compose 里给 Redis 配了密码，这里要对应填上；
+      # 没配密码就留空
       password:
       database: 0
       timeout: 3000ms
 
 # ------------------------------------------------------------
-# 模型供应商配置（阶段 2 才用，先把位置占好）
+# 模型供应商密钥（阶段 2）
 #
-# ⚠️ CLAUDE.md 提醒：模型 ID 会变动。
-#    每次动工涉及模型的代码前，先用 GET /v1/models 拉真实列表核实，
-#    不要凭记忆硬编码。
+# ★ 只需要填 api-key 两项，其余都在 application.yml 里。
+#
+#   Spring Boot 会把 application.yml 和 application-local.yml 合并，
+#   local 文件优先级更高 —— 所以这里的配置是「覆盖」而不是「替代」。
+#
+# ⚠️ 也可以用环境变量代替这个文件（优先级更高）：
+#       DEEPSEEK_API_KEY / SILICONFLOW_API_KEY
+#   在 application.yml 里已经写成了 ${DEEPSEEK_API_KEY:} 的形式，
+#   留空时会退化成空字符串（启动不报错，调用时报 401）。
 # ------------------------------------------------------------
 xbla:
   llm:
-    # P0：DeepSeek 官方，主力对话生成
-    deepseek:
-      base-url: https://api.deepseek.com
-      api-key: sk-这里填 DeepSeek 官方的 Key
-      model: 用 GET /v1/models 核实后再填
-
-    # P1/P2：硅基流动，同模型换源 + 兜底降级
-    # ★ 向量化和重排序只有硅基流动提供，DeepSeek 官方没有这两项能力
-    siliconflow:
-      base-url: https://api.siliconflow.cn
-      api-key: sk-这里填硅基流动的 Key
-      model: 用 GET /v1/models 核实后再填
-      # bge-m3，1024 维，这是全项目的向量维度基准
-      embedding-model: BAAI/bge-m3
-      embedding-dimension: 1024
-      # 重排序模型
-      rerank-model: BAAI/bge-reranker-v2-m3
+    providers:
+      deepseek:
+        api-key: sk-这里填 DeepSeek 官方的 Key
+      siliconflow:
+        api-key: sk-这里填硅基流动的 Key
