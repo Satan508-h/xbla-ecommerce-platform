@@ -8,9 +8,11 @@ import com.xbla.rag.entity.KbDocument;
 import com.xbla.rag.entity.Product;
 import com.xbla.rag.entity.ProductAttribute;
 import com.xbla.rag.mapper.AfterSalePolicyMapper;
+import com.xbla.rag.mapper.KbChunkMapper;
 import com.xbla.rag.mapper.KbDocumentMapper;
 import com.xbla.rag.mapper.ProductAttributeMapper;
 import com.xbla.rag.mapper.ProductMapper;
+import com.xbla.rag.rag.ingest.CorpusManifest;
 import com.xbla.rag.rag.ingest.DbContentRenderer;
 import com.xbla.rag.rag.ingest.DocumentIngestWorker;
 import com.xbla.rag.rag.ingest.DocumentStore;
@@ -29,7 +31,9 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -63,9 +67,11 @@ public class KbIngestServiceImpl implements KbIngestService {
     private final DocumentIngestWorker ingestWorker;
     private final DbContentRenderer renderer;
     private final KbDocumentMapper documentMapper;
+    private final KbChunkMapper chunkMapper;
     private final AfterSalePolicyMapper policyMapper;
     private final ProductMapper productMapper;
     private final ProductAttributeMapper attributeMapper;
+    private final CorpusManifest corpusManifest;
     private final KbProperties kbProperties;
     private final ThreadPoolTaskExecutor ingestExecutor;
 
@@ -73,18 +79,22 @@ public class KbIngestServiceImpl implements KbIngestService {
                                DocumentIngestWorker ingestWorker,
                                DbContentRenderer renderer,
                                KbDocumentMapper documentMapper,
+                               KbChunkMapper chunkMapper,
                                AfterSalePolicyMapper policyMapper,
                                ProductMapper productMapper,
                                ProductAttributeMapper attributeMapper,
+                               CorpusManifest corpusManifest,
                                KbProperties kbProperties,
                                @Qualifier("ingestExecutor") ThreadPoolTaskExecutor ingestExecutor) {
         this.documentStore = documentStore;
         this.ingestWorker = ingestWorker;
         this.renderer = renderer;
         this.documentMapper = documentMapper;
+        this.chunkMapper = chunkMapper;
         this.policyMapper = policyMapper;
         this.productMapper = productMapper;
         this.attributeMapper = attributeMapper;
+        this.corpusManifest = corpusManifest;
         this.kbProperties = kbProperties;
         this.ingestExecutor = ingestExecutor;
     }
@@ -155,16 +165,38 @@ public class KbIngestServiceImpl implements KbIngestService {
             return KbBatchSubmitResponse.of(0, List.of(), 0);
         }
 
+        // ★ 读语料清单：每份文件的 doc_type 由清单声明，而不是整个目录共用一个值。
+        //   见 CorpusManifest 的类注释 —— 统一传 ?docType=2 会把促销规则、
+        //   FAQ、说明书、导购指南全部标成「售后政策」，而且错得毫无症状
+        CorpusManifest.Manifest manifest = corpusManifest.load();
+        warnAboutStaleManifestEntries(manifest, files);
+
         List<Long> submitted = new ArrayList<>();
         int skipped = 0;
+        int reconciled = 0;
 
         for (Path file : files) {
+            String fileName = file.getFileName().toString();
+
+            // 清单优先；清单没声明的才回落到 URL 上的 ?docType= 参数
+            CorpusManifest.Entry declared = manifest.find(fileName).orElse(null);
+            Integer resolvedType = declared != null
+                    ? declared.docType()
+                    : (docType == null ? KbDocument.TYPE_FAQ : docType);
+            if (declared == null && manifest.present()) {
+                log.warn("★ 语料文件未在清单里声明，回落用 docType={} file={}（建议补进 {}）",
+                        resolvedType, fileName, CorpusManifest.FILE_NAME);
+            }
+
             try (InputStream in = Files.newInputStream(file)) {
-                KbDocument doc = submitUpload(in, file.getFileName().toString(),
-                        docType == null ? KbDocument.TYPE_FAQ : docType,
-                        null, null, null);
+                KbDocument doc = submitUpload(in, fileName, resolvedType, null, null, null);
                 if (doc.getStatus() != KbDocument.STATUS_PENDING) {
-                    // 命中去重，返回的是已存在的那份文档
+                    // 命中去重，返回的是已存在的那份文档。
+                    // ★ 内容没变不等于【元数据】没变 —— 清单里改了 doc_type 之后，
+                    //   必须把库里那份校正过来，否则改了清单却看不到任何效果
+                    if (reconcileDocType(doc, declared)) {
+                        reconciled++;
+                    }
                     skipped++;
                 } else {
                     submitted.add(doc.getId());
@@ -178,9 +210,70 @@ public class KbIngestServiceImpl implements KbIngestService {
             }
         }
 
-        log.info("语料扫描完成 目录={} 候选={} 提交={} 跳过={}",
-                dir.toAbsolutePath(), files.size(), submitted.size(), skipped);
+        log.info("语料扫描完成 目录={} 候选={} 提交={} 跳过={} 校正doc_type={}",
+                dir.toAbsolutePath(), files.size(), submitted.size(), skipped, reconciled);
         return KbBatchSubmitResponse.of(files.size(), submitted, skipped);
+    }
+
+    /**
+     * 把库里已存在文档的 {@code doc_type} 校正成语料清单声明的值。
+     *
+     * <p><b>为什么这件事不能省</b>：{@link #findReusableByHash} 的语义是
+     * 「内容没变就不重新向量化」，它<b>只比较文件内容</b>。
+     * 但 {@code doc_type} 属于<b>元数据</b> —— 改了清单里的归类之后，
+     * 文件内容一个字都没变，去重照样命中，于是 doc_type 永远不会被更新，
+     * 表现为「改了 manifest.yml 却毫无效果」。
+     *
+     * <p>这也正是增量校正能成立的原因：{@code doc_type} 既不影响
+     * {@code embedding} 也不影响 {@code search_text}，所以只改列即可，
+     * <b>不需要重新调用向量化接口</b>。
+     *
+     * @return true 表示确实改了（调用方用来计数）
+     */
+    private boolean reconcileDocType(KbDocument doc, CorpusManifest.Entry declared) {
+        Integer previous = doc.getDocType();
+        if (declared == null || previous == null || declared.docType() == previous) {
+            return false;
+        }
+        int target = declared.docType();
+
+        KbDocument patch = new KbDocument();
+        patch.setId(doc.getId());
+        patch.setDocType(target);
+        patch.setUpdatedAt(OffsetDateTime.now());
+        documentMapper.updateById(patch);
+
+        // ★ 冗余列必须一起改：意图定向检索过滤的是 kb_chunk.doc_type，
+        //   只改主表会让「界面上看着对、检索时按旧值过滤」
+        int chunks = chunkMapper.updateDocTypeByDocumentId(doc.getId(), target);
+        doc.setDocType(target);
+
+        log.warn("★ 语料清单的 doc_type 与库中不一致，已校正（内容未变，未重新向量化）"
+                        + " docId={} file={} {} → {} 影响切片 {} 条",
+                doc.getId(), declared.fileName(), previous, target, chunks);
+        return true;
+    }
+
+    /**
+     * 清单里声明了、但目录里不存在的文件 —— 清单过期了，报出来。
+     *
+     * <p>为什么值得一条 WARN：这通常意味着文件被改名或删掉了，
+     * 而清单还指着旧名字。<b>不报的话，新文件会走「未声明回落」分支，
+     * 悄悄用 URL 参数入库</b>，等于又回到了这次要修的那个 bug。
+     */
+    private void warnAboutStaleManifestEntries(CorpusManifest.Manifest manifest, List<Path> files) {
+        if (!manifest.present()) {
+            return;
+        }
+        Set<String> present = new HashSet<>();
+        for (Path file : files) {
+            present.add(file.getFileName().toString());
+        }
+        for (String declaredName : manifest.entries().keySet()) {
+            if (!present.contains(declaredName)) {
+                log.warn("★ 语料清单声明了文件但目录里没有：{}（文件改名了？清单过期了？）", declaredName);
+            }
+        }
     }
 
     // ================================================================

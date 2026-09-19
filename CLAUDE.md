@@ -146,7 +146,7 @@ docker compose exec postgres psql -U xbla -d xbla_rag
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（197 个：实体映射回归 + 解析/切分/分词/融合/结构契约的单测）
+# 跑测试（212 个：实体映射回归 + 解析/切分/分词/融合/语料清单/结构契约的单测）
 ./mvnw test
 ```
 
@@ -203,7 +203,9 @@ python scripts/generate_corpus.py
 #    依赖：pip install reportlab python-docx openpyxl
 
 # ② 批量灌语料（异步，立刻返回 docId 列表）
-curl -s -X POST "localhost:8080/api/kb/documents/scan?docType=2"
+#    ★ 不传 docType —— 每份文件的类型由 data/corpus/manifest.yml 逐文件声明。
+#      传了也只是「清单里没声明的文件」的兜底，且会打 WARN
+curl -s -X POST "localhost:8080/api/kb/documents/scan"
 
 # ③ 数据库同步：把 after_sale_policy + product 表渲染成知识库文档
 curl -s -X POST localhost:8080/api/kb/documents/sync
@@ -214,6 +216,18 @@ curl -s -X POST localhost:8080/api/kb/documents \
 
 # ⑤ 查入库状态（前端轮询的就是这个；finished=true 表示可以停止轮询）
 curl -s localhost:8080/api/kb/documents/1 | python -m json.tool
+```
+
+> ★ **新增语料文件必须登记进 `data/corpus/manifest.yml`**，否则 `doc_type`
+> 会静默用兜底值（列表里没有它时打 WARN）。`doc_type` 词表：
+> `1商品详情 2售后政策 3促销规则 4FAQ 5说明书`。
+> 它是**阶段 5 意图定向检索的过滤条件**，标错的症状是「某一类查询永远返回空」。
+>
+> ⚠️ **`generate_corpus.py` 生成的必须是字节确定的文件**（时间戳已钉死）。
+> 一旦产物字节每次不同，入库去重会静默失效、重扫会重复灌入并**真的花向量化钱**。
+> 详见 `docs/08` ADR-028。
+
+```bash
 ```
 
 ### 阶段 3 新增：知识库检索探针（同样 @Profile("local")）

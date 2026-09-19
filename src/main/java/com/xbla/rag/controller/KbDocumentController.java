@@ -123,10 +123,15 @@ public class KbDocumentController {
      * 扫描 {@code xbla.kb.corpus-dir} 目录，把里面的文档批量入库。
      *
      * <p>这就是路线图 3.1 生成的仿真语料的入口。
-     * 重复调用是安全的 —— 内容摘要相同的文件会被跳过，不会重复花向量化的钱。
+     * 重复调用是安全的 —— 内容没变的文件会被跳过，不会重复花向量化的钱；
+     * 如果语料清单里改了某个文件的 {@code doc_type}，会被<b>校正过来</b>
+     * （只改元数据，不重新向量化）。
+     *
+     * <p>★ {@code docType} 参数只是<b>兜底</b>：每份文件的类型由目录里的
+     * {@code manifest.yml} 声明，没声明的才用这个参数（并打 WARN）。
      *
      * <pre>
-     *   curl -X POST "localhost:8080/api/kb/documents/scan?docType=2"
+     *   curl -X POST "localhost:8080/api/kb/documents/scan"
      * </pre>
      */
     @PostMapping("/documents/scan")

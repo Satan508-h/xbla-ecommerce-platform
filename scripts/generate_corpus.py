@@ -5,11 +5,30 @@
 输出到 data/corpus/，四种格式各若干份：
 
     售后政策汇编.docx      Word，用真正的 Heading 1/2/3 样式
-    售后政策汇编.pdf        PDF，用文档大纲（bookmark）标记标题
     商品导购指南.md        Markdown，用 # 号
     促销活动规则.md        Markdown
     售后FAQ.xlsx           Excel，两列问答表
-    商品说明书-星辰X1.pdf   PDF，多层大纲（三级）
+    商品说明书-星辰X1.pdf   PDF，用文档大纲（bookmark）标记标题
+
+★ 为什么【没有】售后政策汇编.pdf（2026-09-19 移除）
+
+    它原来是和 .docx 一起生成的，用来演示「同一份文档的两种格式会走两条
+    不同的标题提取路径」。但它在知识库里变成了**同一内容的第二份副本**，
+    而重复内容对检索是实打实的伤害：
+
+      · 两份几乎逐字相同的切片长期同时占据 Top-5 名额，挤掉别的答案；
+      · PDF 提取会带硬换行（「用户在本平台下单即⏎视为已阅读」），
+        bigram 在换行处被切断，反而比 .docx 那份更差；
+      · 评测集的 ground truth 被迫写 allow_multiple 去绕它。
+
+    而 PDF 的大纲提取路径**由 商品说明书-星辰X1.pdf 完整覆盖**
+    （实测：两者产出的 heading_path 都是「一级 > 二级」两层），
+    所以删掉它不丢任何演示点。
+
+    ⚠️ 入库侧的去重（KbIngestServiceImpl.findReusableByHash）拦不住这种情况 ——
+    它比的是**文件字节**的哈希，而 .docx 和 .pdf 字节不同。
+    那个机制是「别重复花向量化的钱」，不是「别让同一内容进两次库」，
+    内容层面的重复只能在语料源头解决。
 
 ★ 为什么四种格式都要生成
 
@@ -44,10 +63,30 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 
 # 输出目录：项目根目录下的 data/corpus
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "data", "corpus")
+
+# ----------------------------------------------------------------
+# ★ 固定时间戳：让生成的文件【字节确定】
+#
+# 为什么这件事很重要（踩过一次，2026-09-19）：
+#
+#   入库侧的「内容没变就不重复入库」（KbIngestServiceImpl.findReusableByHash）
+#   比的是**文件字节的 SHA-256**。而 docx / xlsx / PDF 三种格式都会把
+#   【创建时间】写进文件头 —— 于是「内容一模一样但重新生成了一次」的文件
+#   **哈希完全不同**，会被当成新文档再灌一遍。
+#
+#   症状是：跑一次 generate_corpus.py + POST /scan，知识库里就多出 3 份
+#   逐字相同的重复文档，而且真的会再调一次向量化接口花钱。
+#   重复内容会长期占据 Top-5 名额，挤掉别的答案。
+#
+#   修法：把三种格式的时间戳都钉死成同一个值。
+#   这样「重新生成 + 重新扫描」是幂等的 —— 内容没变就跳过，变了才重灌。
+# ----------------------------------------------------------------
+FIXED_TIMESTAMP = datetime(2026, 1, 1, 0, 0, 0)
 
 
 # ================================================================
@@ -435,8 +474,68 @@ MANUAL_SECTIONS = [
 # 生成器
 # ================================================================
 
+def _normalize_ooxml(path: str) -> None:
+    """
+    把 docx / xlsx 这类 OOXML 包（本质是 zip）里的时间戳全部钉死，使字节可复现。
+
+    ★ 为什么必须在【生成之后】再重写一遍，而不是给两个库设属性
+
+      实测（2026-09-19，python-docx + openpyxl 3.1.5）：
+
+        · **zip 条目自带的时间戳** —— 两个库都写「此刻」，**没有开关可关**。
+          docx 有 17 个条目、xlsx 有 9 个，全部带着当前时间，是哈希不稳定的主因。
+        · **core.xml 的 <dcterms:modified>** —— openpyxl 在 save() 里把它
+          覆盖成 datetime.utcnow()，显式给 wb.properties.modified 赋值【实测无效】。
+
+      逐库去设属性既不可靠、换版本还会悄悄失效（这次就踩了：第一次测"通过"
+      是因为两次生成间隔不到一秒，时间戳碰巧相同 —— 假阴性）。
+      改为生成后统一重写，行为稳定、看得见、可断言。
+
+    ⚠️ 只改两个日期字段和条目时间戳，其它字节（正文、样式、缩略图）原样保留。
+    """
+    import re
+    import zipfile
+
+    with zipfile.ZipFile(path) as zin:
+        entries = [(info, zin.read(info.filename)) for info in zin.infolist()]
+
+    fixed = FIXED_TIMESTAMP.timetuple()[:6]
+    iso = FIXED_TIMESTAMP.strftime("%Y-%m-%dT%H:%M:%SZ")
+    date_tag = re.compile(r"(<dcterms:(?:created|modified)[^>]*>)[^<]*(</dcterms:(?:created|modified)>)")
+
+    tmp = path + ".normalizing"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info, data in entries:
+            if info.filename == "docProps/core.xml":
+                text = date_tag.sub(lambda m: m.group(1) + iso + m.group(2),
+                                    data.decode("utf-8"))
+                data = text.encode("utf-8")
+            new = zipfile.ZipInfo(info.filename, date_time=fixed)
+            new.compress_type = zipfile.ZIP_DEFLATED
+            new.external_attr = info.external_attr
+            new.internal_attr = info.internal_attr
+            new.create_system = info.create_system
+            zout.writestr(new, data)
+
+    os.replace(tmp, path)
+
+
 def _register_chinese_font():
-    """注册 reportlab 自带的中文 CID 字体。不注册的话中文会变成黑方块。"""
+    """
+    注册 reportlab 自带的中文 CID 字体。不注册的话中文会变成黑方块。
+
+    ★ 同时把 reportlab 切成 **invariant 模式**，让产出的 PDF 字节确定。
+
+    PDF 文件头里有 /CreationDate 和 /ModDate，reportlab 默认写「此刻」，
+    另外还会生成一个基于随机的 /ID —— 两者都让同一个文档每次导出的
+    字节都不同，于是入库侧的字节哈希去重失效（见 FIXED_TIMESTAMP 的说明）。
+
+    reportlab 的 invariant 模式就是为「可复现构建」设计的：它把时间戳
+    固定、/ID 用内容派生，产出完全确定。必须在 build() 之前设置。
+    """
+    from reportlab import rl_config
+    rl_config.invariant = 1
+
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     for name in ("STSong-Light", "STHeiti-Regular"):
@@ -452,6 +551,13 @@ def make_docx(path: str) -> None:
     from docx.shared import Pt
 
     doc = Document()
+
+    # 只写「身份类」字段。时间类字段（created / modified）和 zip 条目时间戳
+    # 统一由 _normalize_ooxml 处理 —— 那里有实测原因，别在这里重复设
+    props = doc.core_properties
+    props.last_modified_by = "generate_corpus.py"
+    props.revision = 1
+
     doc.add_heading(AFTER_SALE_DOC["title"], level=1)
 
     for section in AFTER_SALE_DOC["sections"]:
@@ -462,62 +568,23 @@ def make_docx(path: str) -> None:
                 doc.add_paragraph(para)
 
     doc.save(path)
+    _normalize_ooxml(path)
 
 
-def make_pdf_from_doc(path: str, doc_spec: dict) -> None:
+def make_manual_pdf(path: str) -> None:
     """
-    从「标题 + 子标题 + 段落」的结构生成带文档大纲的 PDF。
+    产品说明书 PDF：带文档大纲的 PDF。
 
     ★ 关键点：标题必须写进 PDF 的 **outline（大纲）**，因为 Tika 提取 PDF 标题
       唯一可靠的来源就是它 —— PDF 格式本身不存储「这是标题」这个信息，
       正文里 Tika 也永远不会生成 <h1> 标签（实测确认）。
       没有大纲的 PDF，标题层级就彻底提取不出来，只能退化成定长切分。
+
+    ⚠️ 实测产出的 heading_path 是「星辰 X1 智能手机用户手册 > 产品简介」，
+      也就是**标题 + 一级小节**两层。原 docstring 写的是「三级大纲」，
+      但下面两个分支都是 h2（`h2 if level == 0 else h2`），实际只有一级小节 ——
+      这里按实际行为更正，不再声称三级。
     """
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer
-
-    _register_chinese_font()
-
-    h1 = ParagraphStyle("H1", fontName="STSong-Light", fontSize=18, leading=26, spaceAfter=12)
-    h2 = ParagraphStyle("H2", fontName="STSong-Light", fontSize=14, leading=22, spaceAfter=8)
-    h3 = ParagraphStyle("H3", fontName="STSong-Light", fontSize=12, leading=18, spaceAfter=6)
-    body = ParagraphStyle("Body", fontName="STSong-Light", fontSize=10.5, leading=17, spaceAfter=6)
-
-    styles = {"H1": h1, "H2": h2, "H3": h3}
-    seq = [0]
-
-    class OutlineDoc(BaseDocTemplate):
-        """在每写完一个标题段落时，往 PDF 大纲里登记一条"""
-
-        def afterFlowable(self, flowable):
-            if not isinstance(flowable, Paragraph):
-                return
-            name = flowable.style.name
-            if name not in styles:
-                return
-            level = int(name[1]) - 1          # H1 → 0, H2 → 1, H3 → 2
-            text = flowable.getPlainText()
-            seq[0] += 1
-            key = f"outline-{seq[0]}"
-            self.canv.bookmarkPage(key)
-            self.canv.addOutlineEntry(text, key, level=level, closed=(level > 0))
-
-    doc = OutlineDoc(path)
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="normal")
-    doc.addPageTemplates([PageTemplate(id="main", frames=[frame])])
-
-    story = [Paragraph(doc_spec["title"], h1), Spacer(1, 6)]
-    for section in doc_spec["sections"]:
-        story.append(Paragraph(section["heading"], styles[f"H{section['level']}"]))
-        for sub in section["subs"]:
-            story.append(Paragraph(sub["heading"], styles[f"H{sub['level']}"]))
-            for para in sub["paragraphs"]:
-                story.append(Paragraph(para, body))
-    doc.build(story)
-
-
-def make_manual_pdf(path: str) -> None:
-    """产品说明书 PDF：三级大纲（章 → 节）"""
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer
 
@@ -565,6 +632,12 @@ def make_xlsx(path: str, rows: list) -> None:
     from openpyxl.styles import Font
 
     wb = Workbook()
+
+    # 只写「身份类」字段。⚠️ 实测：即使在这里把 properties.modified 设成固定值，
+    # openpyxl 也会在 save() 时覆盖掉它 —— 时间字段全部交给 _normalize_ooxml
+    wb.properties.creator = "generate_corpus.py"
+    wb.properties.lastModifiedBy = "generate_corpus.py"
+
     ws = wb.active
     ws.title = "售后FAQ"
     for row in rows:
@@ -579,6 +652,7 @@ def make_xlsx(path: str, rows: list) -> None:
     ws.column_dimensions["B"].width = 60
     ws.column_dimensions["C"].width = 10
     wb.save(path)
+    _normalize_ooxml(path)
 
 
 # ================================================================
@@ -590,7 +664,6 @@ def main() -> int:
 
     tasks = [
         ("售后政策汇编.docx", lambda p: make_docx(p)),
-        ("售后政策汇编.pdf", lambda p: make_pdf_from_doc(p, AFTER_SALE_DOC)),
         ("商品说明书-星辰X1.pdf", lambda p: make_manual_pdf(p)),
         ("商品导购指南.md", lambda p: make_md(p, SHOPPING_GUIDE_DOC)),
         ("促销活动规则.md", lambda p: make_md(p, PROMOTION_DOC)),

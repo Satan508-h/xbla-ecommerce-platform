@@ -51,6 +51,24 @@ public interface KbIngestService {
      *
      * <p>会跳过子目录和隐藏文件。每个文件独立提交 ——
      * 其中一个文件格式不认识导致失败，不影响其余的。
+     *
+     * <h4>★ 文档类型来自目录里的 {@code manifest.yml}，不是 {@code docType} 参数</h4>
+     *
+     * <p>每份文件的 {@code doc_type} 由语料清单声明
+     * （见 {@code CorpusManifest}）。{@code docType} 参数只在
+     * <b>清单里没声明这个文件时</b>兜底 —— 且会打一条 WARN。
+     *
+     * <p>为什么不能用「整个目录一个类型」：那样促销规则、FAQ、说明书、
+     * 导购指南会被统统标成售后政策，而 {@code doc_type} 是阶段 5
+     * 意图定向检索的过滤条件，标错的后果是「某一类查询永远返回空」。
+     *
+     * <h4>★ 重复扫描会校正 doc_type</h4>
+     *
+     * <p>命中去重（内容没变）时，如果清单声明的类型与库里不一致，
+     * 会把 {@code kb_document} 和冗余的 {@code kb_chunk.doc_type} 一起改过来。
+     * <b>不重新向量化</b> —— {@code doc_type} 不参与 embedding 和分词。
+     *
+     * @param docType 清单未声明时的兜底类型。可为 null（默认 4 FAQ）
      */
     KbBatchSubmitResponse submitCorpusScan(Integer docType);
 

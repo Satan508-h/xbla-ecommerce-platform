@@ -262,6 +262,34 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
     SearchTextStats searchTextStats();
 
     /**
+     * 校正某份文档下所有切片的冗余 {@code doc_type}。
+     *
+     * <p><b>为什么需要单独一个方法</b>：{@code kb_chunk.doc_type} 是
+     * <b>冗余</b>自 {@code kb_document} 的列（阶段 5 的意图定向检索靠它，
+     * 这样过滤条件和向量排序能走同一次索引扫描，不用 join 回主表）。
+     * 冗余就意味着<b>两处必须同步改</b> —— 只改主表，检索过滤用的还是旧值，
+     * 而这种不一致在界面上完全看不出来。
+     *
+     * <p><b>为什么这条 UPDATE 不需要重新向量化</b>：{@code doc_type} 是元数据，
+     * 不参与 {@code embedding} 的计算，也不参与 {@code search_text} 的分词。
+     * 所以语料清单改了归类之后，只要改这一列即可 ——
+     * 这正是「把 doc_type 做成可校正的」的价值。
+     *
+     * <p>{@code updated_at} 手工 set：时间戳自动填充
+     * （{@code MybatisPlusMetaObjectHandler}）只对 MyBatis-Plus 的
+     * {@code updateById} 生效，走原生 SQL 时要自己写。同一个坑见
+     * {@link #updateSearchText}。
+     */
+    @org.apache.ibatis.annotations.Update("""
+            UPDATE kb_chunk
+            SET doc_type   = #{docType},
+                updated_at = now()
+            WHERE document_id = #{documentId}
+            """)
+    int updateDocTypeByDocumentId(@Param("documentId") Long documentId,
+                                  @Param("docType") int docType);
+
+    /**
      * 按「内容锚点」反查切片 ID —— 评测集加载用（阶段 4 · 4.8）。
      *
      * <p><b>为什么评测集不直接存 chunk_id</b>：那个值是 BIGSERIAL，
