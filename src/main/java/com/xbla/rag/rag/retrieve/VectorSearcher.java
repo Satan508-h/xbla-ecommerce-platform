@@ -94,29 +94,56 @@ public class VectorSearcher {
     }
 
     /**
-     * 用一句自然语言查询最相关的切片。
+     * 用一句自然语言查询最相关的切片，<b>不加 {@code doc_type} 限制</b>。
      *
      * @param query 用户问题
      * @param topK  返回条数，{@code null} 或非正数时用 {@link #DEFAULT_TOP_K}
      */
     public List<VectorHit> search(String query, Integer topK) {
-        if (query == null || query.isBlank()) {
-            return List.of();
-        }
-        return searchByVector(embedToLiteral(query), topK);
+        return search(query, topK, null);
     }
 
     /**
-     * 直接用向量检索。<b>复用已算好的向量时走这个重载</b> ——
-     * 比如阶段 4 的多路召回里，一次查询重写会产生多个子问题，
-     * 每个子问题的向量都已经算过了，不该再调一次接口。
+     * 用一句自然语言查询最相关的切片，可限定 {@code doc_type} 范围（阶段 5.4）。
+     *
+     * @param query    用户问题
+     * @param topK     返回条数，{@code null} 或非正数时用 {@link #DEFAULT_TOP_K}
+     * @param docTypes {@code doc_type} 数组字面量（如 {@code "{2,4}"}）；
+     *                 <b>{@code null} = 不限制</b>。由
+     *                 {@code RetrievalOptions.docTypesLiteral()} 生成
+     */
+    public List<VectorHit> search(String query, Integer topK, String docTypes) {
+        if (query == null || query.isBlank()) {
+            return List.of();
+        }
+        return searchByVector(embedToLiteral(query), topK, docTypes);
+    }
+
+    /**
+     * 直接用向量检索，<b>不加 {@code doc_type} 限制</b>。
+     *
+     * <p><b>复用已算好的向量时走这个重载</b> —— 比如阶段 4 的多路召回里，
+     * 一次查询重写会产生多个子问题，每个子问题的向量都已经算过了，
+     * 不该再调一次接口。
      */
     public List<VectorHit> searchByVector(String vectorLiteral, Integer topK) {
+        return searchByVector(vectorLiteral, topK, null);
+    }
+
+    /**
+     * 直接用向量检索，可限定 {@code doc_type} 范围。
+     *
+     * <p>★ 过滤在 SQL 里完成，<b>不是查出来再筛</b>：
+     * {@code doc_type IN (2,4)} 只占全库 4.1%，「先取 20 条再筛」平均只剩不到 1 条。
+     * 而且加了过滤条件之后规划器会弃用 HNSW 走精确扫描 —— 详见
+     * {@code KbChunkMapper.searchByVector} 的坑⑤。
+     */
+    public List<VectorHit> searchByVector(String vectorLiteral, Integer topK, String docTypes) {
         int k = normalizeTopK(topK);
         long start = System.nanoTime();
-        List<VectorHit> hits = chunkMapper.searchByVector(vectorLiteral, k);
-        log.debug("向量检索 topK={} 命中={} 耗时={}ms",
-                k, hits.size(), (System.nanoTime() - start) / 1_000_000);
+        List<VectorHit> hits = chunkMapper.searchByVector(vectorLiteral, k, docTypes);
+        log.debug("向量检索 topK={} docTypes={} 命中={} 耗时={}ms",
+                k, docTypes, hits.size(), (System.nanoTime() - start) / 1_000_000);
         return hits;
     }
 

@@ -30,6 +30,26 @@ import java.util.List;
  *       异常是「没查成」—— 这两件事在编排层的处理完全不同
  *       （一个照常融合，一个要降级到另一路）。用返回值表达失败会把它们混在一起。</li>
  * </ol>
+ *
+ * <h2>★ 三、范围过滤由实现类负责下推到 SQL（阶段 5.4）</h2>
+ *
+ * <p>{@link RetrievalOptions#docTypes()} 非空时，实现类必须把它做成 SQL 的
+ * {@code WHERE} 条件，<b>不能先查出来再在 Java 里筛</b>。
+ *
+ * <p>理由是实测的数：{@code doc_type IN (2,4)} 只占全库 4.1%（67/1640）。
+ * 「先取 topK=20 再筛掉不属于 {2,4} 的」平均只能剩下
+ * <b>不到 1 条</b>（20 × 4.1%），等于把检索废掉。
+ * 过滤必须发生在<b>取 topK 之前</b>。
+ *
+ * <p>好消息是 PostgreSQL 会为此选一个更好的计划 —— 实测：
+ * <pre>
+ *   不过滤：Index Scan using idx_kb_chunk_embedding (HNSW)      ← 近似
+ *   过滤：  Index Scan using idx_kb_chunk_doc_type + Sort       ← 精确
+ * </pre>
+ * 有过滤条件时规划器干脆不用 HNSW，改成在子集上做精确扫描 + 排序。
+ * <b>过滤让向量检索从近似变成了精确</b>，这是白拿的质量提升。
+ * （但这也是颗规模地雷：表一大规划器会翻回 HNSW + 过滤，
+ * 那时靠 {@code hnsw.iterative_scan}。见 {@code docs/05}。）
  */
 public interface Retriever {
 
@@ -43,12 +63,13 @@ public interface Retriever {
     /**
      * 召回。
      *
-     * @param query 查询文本。<b>原样传入，各实现自己决定要不要分词</b> ——
-     *              向量路直接把原文送去向量化，关键词路先分词再拼 tsquery。
-     *              在编排层统一预处理反而会让两路拿到不该拿的东西
-     * @param topK  最多返回条数
+     * @param query   查询文本。<b>原样传入，各实现自己决定要不要分词</b> ——
+     *                向量路直接把原文送去向量化，关键词路先分词再拼 tsquery。
+     *                在编排层统一预处理反而会让两路拿到不该拿的东西
+     * @param options 条数 + {@code doc_type} 范围。<b>不限制时 docTypes 是空列表</b>，
+     *                不是 {@code null}（归一化在 {@link RetrievalOptions} 的构造器里做）
      * @return 按相关度降序的候选。没有匹配时返回空列表，<b>不返回 null</b>
      * @throws RuntimeException 调用失败（向量化接口挂了 / 数据库出错）
      */
-    List<RetrievedChunk> retrieve(String query, int topK);
+    List<RetrievedChunk> retrieve(String query, RetrievalOptions options);
 }

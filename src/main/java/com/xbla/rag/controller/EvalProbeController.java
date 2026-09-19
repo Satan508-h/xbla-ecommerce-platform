@@ -62,6 +62,7 @@ public class EvalProbeController {
             m.put("question", q.question());
             m.put("category", q.category());
             m.put("difficulty", q.difficulty());
+            m.put("intent", q.intent());
             m.put("expectedChunkIds", q.expectedChunkIds());
             return m;
         }).toList());
@@ -73,8 +74,19 @@ public class EvalProbeController {
             byCategory.merge(q.category() == null ? "(未分类)" : q.category(), 1L, Long::sum);
         }
         response.put("byCategory", byCategory);
-        response.put("note", "intent 列暂为 " + EvalQuestionLoader.INTENT_PLACEHOLDER
-                + "，阶段 5 定义意图树后回填");
+
+        // 按意图统计 —— 意图树是 5.1 的交付物，这里报出每类各有多少题，
+        // 顺便让「某个意图一道题都没有」这件事可见（那意味着 7.2 算不出它的准确率）
+        Map<String, Long> byIntent = new LinkedHashMap<>();
+        for (EvalQuestionLoader.LoadedQuestion q : result.questions()) {
+            byIntent.merge(q.intent(), 1L, Long::sum);
+        }
+        response.put("byIntent", byIntent);
+        response.put("note", "intent 为人工标注，取值见 data/agent/intent-tree.yml。"
+                + "一致性（该题 gold doc_types ⊆ 意图声明的 doc_types）由 "
+                + "IntentTreeConsistencyTest 持续校验；"
+                + "历史哨兵值 " + EvalQuestionLoader.INTENT_PLACEHOLDER
+                + " 在重跑本接口后不再产生");
 
         return response;
     }

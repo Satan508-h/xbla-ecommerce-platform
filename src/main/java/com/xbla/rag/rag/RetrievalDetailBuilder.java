@@ -34,7 +34,8 @@ import java.util.Map;
  *     "keyword_hits": [{"chunk_id":45, "score":3.2}],
  *     "fused":        [{"chunk_id":12, "rrf_score":0.032}],
  *     "reranked":     [{"chunk_id":45, "rerank_score":0.95}],
- *     "final_top_k":  [45, 12, 8]
+ *     "final_top_k":  [45, 12, 8],
+ *     "filter":       {"doc_types":[2,4], "applied":true, "pool_size":67, "reason":"ok"}
  *   }
  * </pre>
  *
@@ -42,18 +43,31 @@ import java.util.Map;
  * {@code rerank_score}）—— 这不是笔误，是刻意的：它们的量纲完全不可比，
  * 用同一个名字会诱使后来的人拿它们互相比较。见 {@link RetrievedChunk} 的注释。
  *
+ * <p><b>★ {@code filter} 是阶段 5.4 加的第六个 key，也是唯一一次「扩了冻结结构」。</b>
+ * 原来那 5 个 key 一个都没动、含义一个都没变，所以阶段 4 的基线脚本
+ * （{@code scripts/eval_baseline.py} 按固定路径取 {@code reranked} 等段）
+ * <b>不受影响</b>。这是「加法式扩展」而不是「改结构」——
+ * 两者的区别是前者不需要重跑历史基线。
+ *
  * <h2>三、★ 必须截断</h2>
  *
  * <p>每段最多记 {@value #MAX_ENTRIES_PER_SECTION} 条。{@code qa_log} 是全项目
  * <b>写入最频繁</b>的表，而 {@code retrieval_detail} 是一个 JSONB 大字段；
  * 不截断的话，召回条数一调大（阶段 7 很可能这么干），这张表就会迅速膨胀。
  *
- * <h2>四、★ 附加字段是「加法式」的</h2>
+ * <h2>四、★ 字段分两类，判断标准是「它属不属于那五段」</h2>
  *
- * <p>上面 5 个 key <b>恒定存在且语义永不改变</b>。额外的诊断信息
- * （{@code events} / {@code sub_questions}）只在非空时才出现，
- * 且不改变那 5 个 key 的任何含义。这样阶段 7 的对比脚本可以直接按
- * 固定路径读取，不用管有没有附加字段。
+ * <p><b>恒定存在的 6 个 key</b>（{@code vector_hits} 到 {@code filter}）——
+ * 语义永不改变，<b>永远出现</b>，哪怕值是空数组。
+ * 阶段 7 的对比脚本可以按固定路径直接读，不用先判断 key 在不在。
+ *
+ * <p><b>附加字段</b>（{@code events} / {@code sub_questions} /
+ * {@code rewritten_question}）—— 只在有内容时才出现。
+ *
+ * <p>{@code filter} 属于前者而不是后者，是因为「<b>这次到底过滤了没有</b>」
+ * 是一次检索的固有属性：即使答案是「没有」，那也是一个必须能被机器读到的事实。
+ * 把它做成「非空才出现」，脚本就得写「key 不在 == 没过滤」这种隐式约定 ——
+ * 而隐式约定在改代码时会静默失效。
  */
 @Component
 public class RetrievalDetailBuilder {
@@ -79,6 +93,7 @@ public class RetrievalDetailBuilder {
         detail.put("fused", withScore(trace.fused(), "rrf_score"));
         detail.put("reranked", withScore(trace.reranked(), "rerank_score"));
         detail.put("final_top_k", trace.finalChunkIds());
+        detail.put("filter", filterSection(trace.filter()));
 
         // ── 以下是附加字段，只在有内容时出现 ──
         List<String> events = trace.events();
@@ -95,6 +110,35 @@ public class RetrievalDetailBuilder {
             detail.put("rewritten_question", trace.rewrittenQuestion());
         }
         return detail;
+    }
+
+    /**
+     * 把范围过滤的情况转成 {@code filter} 那一格（阶段 5.4）。
+     *
+     * <p>四个字段各有各的用途，缺一个就会让另一个变得难解释：
+     * <ul>
+     *   <li>{@code doc_types} —— <b>声明了什么</b>。即使最终没用上也如实记，
+     *       因为「声明了但被跳过」和「压根没声明」要靠它区分</li>
+     *   <li>{@code applied} —— <b>最终用了没有</b>。它和上面那 5 段说的是同一件事：
+     *       {@code applied=false} 时那些结果是全池查出来的</li>
+     *   <li>{@code pool_size} —— 该集合在全库有多少条切片。
+     *       ★ 这是排查时第一个该看的数：池子小说明意图声明得窄，
+     *       池子大却召回不到说明是检索或切分的问题 —— <b>两种原因的修法完全相反</b></li>
+     *   <li>{@code reason} —— 为什么是现在这个状态。取值见
+     *       {@link RetrievalTrace.FilterScope.Reason}</li>
+     * </ul>
+     *
+     * <p>{@code pool_size} 可能是 {@code null}（没测量过），
+     * 而 {@code null} 在 JSONB 里是存得下的 —— 但<b>不能省略这个 key</b>，
+     * 省略了就分不清「没测」和「忘了写」。
+     */
+    private static Map<String, Object> filterSection(RetrievalTrace.FilterScope scope) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("doc_types", scope.docTypes());
+        out.put("applied", scope.applied());
+        out.put("pool_size", scope.poolSize());
+        out.put("reason", scope.reason().wireName());
+        return out;
     }
 
     /**

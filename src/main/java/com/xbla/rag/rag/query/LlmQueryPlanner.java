@@ -108,7 +108,7 @@ public class LlmQueryPlanner implements QueryPlanner {
             ModelCallTrace rewriteTrace = new ModelCallTrace("rewrite-" + System.nanoTime());
 
             ChatRequest request = new ChatRequest(
-                    SYSTEM_PROMPT, List.of(), question, MAX_TOKENS, null);
+                    SYSTEM_PROMPT, List.of(), question, MAX_TOKENS, null, null);  // 改写不打工具
             ChatResponse response = router.chat(request, rewriteTrace);
 
             if (response.isEmptyContent()) {

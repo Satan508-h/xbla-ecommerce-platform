@@ -104,7 +104,56 @@ public class QaLog {
 
     private Integer totalLatencyMs;
 
-    /** 1成功 2失败 */
+    /**
+     * 本次问答实际发生的 MCP 工具调用（阶段 5.8），JSONB 数组，按发生顺序。
+     *
+     * <p>元素形状：{@code {"round":1,"tool":"query_order_status","isError":false,"detail":"chars=87"}}
+     *
+     * <p>★★ <b>{@code NULL} 表示「一次都没调」，不是空数组。</b>
+     * 和 {@code references} / {@code degradation_events} 同一条约定。
+     *
+     * <p>★ 为什么它必须是独立的一列：没有它，
+     * 「工具意图答错了」和「工具根本没被调用」<b>在数据上完全一样</b> ——
+     * 都是 {@code status=1}、有 {@code provider}、有 {@code final_answer}。
+     * 而这两种情况的排查方向正相反。详见 {@code V8} 迁移的注释。
+     *
+     * <p>⚠️ 它<b>不存工具返回的内容</b>：那是订单数据，没有理由在这里
+     * 再存一份；要复现就按同一个参数重调一次（工具是只读的）。
+     */
+    private String toolCalls;
+
+    // ================================================================
+    // status 的三个取值（与 V5 / V7 的 CHECK 约束一致）
+    //
+    // ★ 用常量而不是裸数字：这三个值决定阶段 7 能不能正确地筛出
+    //   「可评测的问答」，写错一个数字不会报错，只会让统计悄悄偏。
+    //   （同 KbDocument.STATUS_* 的做法。）
+    // ================================================================
+
+    /** 成功生成了答案。★ 阶段 7 的检索类与答案质量类指标<b>只统计这一种</b> */
+    public static final int STATUS_SUCCESS = 1;
+
+    /** 模型链路失败 */
+    public static final int STATUS_FAILED = 2;
+
+    /**
+     * 澄清反问（阶段 5.3）。
+     *
+     * <p>既不是成功也不是失败：系统判定用户那句话信息不足，
+     * <b>没有检索、也没有调生成模型</b>，直接反问了一句。
+     *
+     * <p>补这个取值的原因是它两边都不属于 —— 塞进任何一个都会污染统计：
+     * <ul>
+     *   <li>塞进「成功」→ {@code final_answer} 里躺着一句反问，
+     *       答案质量指标会给它打分，检索指标会把它算成「没召回到」</li>
+     *   <li>塞进「失败」→ 阶段 7 会把「系统正确识别出该反问」
+     *       统计成「模型挂了」</li>
+     * </ul>
+     * 详见 V7 迁移的注释。
+     */
+    public static final int STATUS_CLARIFY = 3;
+
+    /** 1成功生成答案 2模型链路失败 3澄清反问。取值见上面的常量 */
     private Integer status;
 
     private String errorMsg;

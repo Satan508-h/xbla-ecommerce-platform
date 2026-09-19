@@ -1,8 +1,10 @@
 package com.xbla.rag.controller;
 
+import com.xbla.rag.config.RetrievalProperties;
 import com.xbla.rag.rag.RetrievalDetailBuilder;
 import com.xbla.rag.rag.RetrievalPipeline;
 import com.xbla.rag.rag.RetrievalTrace;
+import com.xbla.rag.rag.retrieve.RetrievalOptions;
 import com.xbla.rag.rag.retrieve.RetrievedChunk;
 import com.xbla.rag.rag.retrieve.VectorHit;
 import com.xbla.rag.rag.retrieve.VectorSearcher;
@@ -71,17 +73,20 @@ public class KbProbeController {
     private final KbChunkMapper chunkMapper;
     private final RetrievalPipeline retrievalPipeline;
     private final RetrievalDetailBuilder detailBuilder;
+    private final RetrievalProperties retrievalProperties;
 
     public KbProbeController(VectorSearcher vectorSearcher,
                              SearchTextIndexer searchTextIndexer,
                              KbChunkMapper chunkMapper,
                              RetrievalPipeline retrievalPipeline,
-                             RetrievalDetailBuilder detailBuilder) {
+                             RetrievalDetailBuilder detailBuilder,
+                             RetrievalProperties retrievalProperties) {
         this.vectorSearcher = vectorSearcher;
         this.searchTextIndexer = searchTextIndexer;
         this.chunkMapper = chunkMapper;
         this.retrievalPipeline = retrievalPipeline;
         this.detailBuilder = detailBuilder;
+        this.retrievalProperties = retrievalProperties;
     }
 
     /**
@@ -269,11 +274,22 @@ public class KbProbeController {
      * 所以整个类标了 {@code @Profile("local")}。
      */
     @GetMapping("/retrieve")
-    public Map<String, Object> retrieve(@RequestParam("q") String question) {
+    public Map<String, Object> retrieve(@RequestParam("q") String question,
+                                        @RequestParam(value = "docTypes", required = false)
+                                        List<Integer> docTypes) {
         RetrievalTrace trace = new RetrievalTrace("probe-" + Long.toHexString(System.nanoTime()));
 
+        // ★ 5.4：传了 docTypes 就走「意图定向检索」那条路。
+        //   注意这里只是【声明】范围，跟 ChatServiceImpl 传的东西是同一个形状 ——
+        //   要不要真的下推由 RetrievalPipeline 决定，所以这个探针看到的
+        //   过滤行为和线上逐字一致（包括池子太小时它会拒绝过滤这件事）。
+        //   不传则等于阶段 4 的行为，可以直接和传了的结果对比。
+        RetrievalOptions options = docTypes == null || docTypes.isEmpty()
+                ? RetrievalOptions.unfiltered(retrievalProperties.getRetrieve().getVectorTopK())
+                : new RetrievalOptions(retrievalProperties.getRetrieve().getVectorTopK(), docTypes);
+
         long startNanos = System.nanoTime();
-        List<RetrievedChunk> chunks = retrievalPipeline.retrieve(question, trace);
+        List<RetrievedChunk> chunks = retrievalPipeline.retrieve(question, options, trace);
         long totalMs = (System.nanoTime() - startNanos) / 1_000_000;
 
         Map<String, Object> result = new LinkedHashMap<>();

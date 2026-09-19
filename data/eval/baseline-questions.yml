@@ -30,8 +30,22 @@
 #   colloquial —— 口语句（「这个适合送长辈吗」）
 # 三类查询在两条召回路上的表现本来就不同，基线报告必须按它切片。
 #
-# intent 列固定写 UNCLASSIFIED 作占位 —— 意图树是阶段 5 的事，
-# 阶段 5 定义后一条 UPDATE 就能回填。
+# ------------------------------------------------------------
+# ★ intent 字段（2026-09-19 阶段 5.1 新增，现在是【必填】）
+#
+# 取值必须是 data/agent/intent-tree.yml 里的某个【叶子】code。
+# 阶段 4 时这里写的是 UNCLASSIFIED 占位值，理由是「意图树还没定义」——
+# 现在定义了，那个理由就不成立，所以改成必填：缺了会直接导致
+# POST /api/debug/eval/reload 失败（和锚点解析不唯一一样吵）。
+#
+# 为什么存【叶子】code 而不是顶层 code（如 PRODUCT_INQUIRY）：
+# 顶层码可以由树 roll-up 算出来，反过来推不出来。
+# 只存顶层，「价格保护这类题答得怎么样」就永远算不出来。
+#
+# ★ 判据是【只读这个问题，它在问什么】，不是【答案落在哪个 doc_type】。
+#   后者是树的责任 —— 由一个自动校验盯着：
+#      该题 gold 的 doc_types 集合 ⊆ 该题 intent 声明的 doc_types 集合
+#   见 IntentTreeConsistencyTest。不满足 = 树画错了，而不是题标错了。
 #
 # ============================================================
 # ★★ 2026-09-19 修订：gold 从「单答案」改为「多答案」
@@ -74,6 +88,7 @@ questions:
     question: 退货要几天
     category: colloquial
     difficulty: 1
+    intent: RETURN_EXCHANGE
     expected_answer: 审核通过、商品寄回并验收合格后，退款在三个工作日内发起。
     anchors:
       - text: 审核通过后，商品寄回并验收合格，退款在三个工作日内发起
@@ -86,6 +101,7 @@ questions:
     question: 退款多久到账
     category: keyword
     difficulty: 1
+    intent: REFUND
     expected_answer: 原路退回。余额支付实时到账，银行卡支付三到十五个工作日。
     anchors:
       - text: 原路退回。余额支付实时到账，银行卡支付三到十五个工作日
@@ -100,6 +116,7 @@ questions:
     question: 拆封了还能退货吗
     category: colloquial
     difficulty: 1
+    intent: RETURN_EXCHANGE
     expected_answer: 普通商品拆封但包装完整的可以退；数码产品激活后不支持无理由退货。
     anchors:
       - text: 普通商品拆封但包装完整的可以退
@@ -113,6 +130,7 @@ questions:
     question: 退货运费谁承担
     category: keyword
     difficulty: 1
+    intent: RETURN_EXCHANGE
     expected_answer: 质量问题由平台承担，无理由退货由用户承担。
     # ★ 这条规则在 2 条切片里都出现（两份【不同】文档，不是重复灌入）：
     #   18 = 售后FAQ 的对应行
@@ -131,6 +149,7 @@ questions:
     question: 怎么申请售后
     category: keyword
     difficulty: 1
+    intent: RULES_AND_PROCESS
     expected_answer: 在「我的订单」中找到订单，点击「申请售后」填写信息并上传照片。
     anchors:
       - text: 在「我的订单」中找到订单，点击「申请售后」填写信息并上传照片
@@ -142,6 +161,7 @@ questions:
     question: 售后审核要多久
     category: keyword
     difficulty: 1
+    intent: RULES_AND_PROCESS
     expected_answer: 通常在二十四小时内完成审核。
     anchors:
       - text: 通常在二十四小时内完成审核
@@ -153,6 +173,7 @@ questions:
     question: 换货的条件是什么
     category: keyword
     difficulty: 2
+    intent: RETURN_EXCHANGE
     expected_answer: 签收后十五天内出现质量问题，外观完好、配件齐全即可申请换货。
     anchors:
       - text: 签收后十五天内出现质量问题，外观完好、配件齐全即可申请换货
@@ -164,6 +185,7 @@ questions:
     question: 七天无理由退货有什么附加条件
     category: keyword
     difficulty: 2
+    intent: RETURN_EXCHANGE
     expected_answer: 手机、电脑等数码产品拆封激活后不支持；定制类商品不支持。
     anchors:
       - text: 手机、电脑等数码产品拆封激活后不支持无理由退货
@@ -179,6 +201,7 @@ questions:
     question: 优惠券怎么用
     category: keyword
     difficulty: 1
+    intent: COUPON
     expected_answer: 每笔订单限用一张，不可拆分、不可兑换现金、不可转赠。
     anchors:
       - text: 每笔订单限用一张优惠券。优惠券不可拆分使用，不可兑换现金，不可转赠他人
@@ -191,6 +214,7 @@ questions:
     question: 优惠券过期了怎么办
     category: keyword
     difficulty: 1
+    intent: COUPON
     expected_answer: 有效期以券面标注为准，过期后自动失效，不予补发。
     anchors:
       - text: 优惠券的有效期以券面标注为准，过期后自动失效，不予补发
@@ -205,6 +229,12 @@ questions:
     question: 价格保护怎么申请
     category: keyword
     difficulty: 2
+    intent: PRICE_PROTECTION
+    # ★★ 这道题是【意图定向检索的压力测试】，故意保留。
+    #   它的正解横跨三种 doc_type：促销活动规则(3) + 价格保护政策(2) + 售后FAQ(4)，
+    #   无论路由到「促销活动」还是「售后服务」，只要 5.4 做硬过滤就必然切掉一部分。
+    #   它不是树的缺陷 —— 是语料的真实形态（同一条规则被写在三份文档里）。
+    #   5.4 怎么处理它，决定了「只对窄类型过滤」到底够不够。
     expected_answer: 下单之日起 15 天内同平台降价可申请退差价；需提供降价截图，每笔订单仅可申请一次。
     # ★★ 这道题原来只标了 109，而 109 是「附加条件」不是「申请方式」——
     #    标错了。真正的答案在另外两个文档里，重排把它们提上来时
@@ -223,6 +253,12 @@ questions:
     question: 满减活动能和优惠券一起用吗
     category: keyword
     difficulty: 2
+    intent: COUPON
+    # ★ 标 COUPON 而不是 FULL_REDUCTION，判据是【问题在问什么】：
+    #   它问的是「券和满减的叠加关系」，而售后FAQ 把这条答案归在自己的
+    #   「优惠券可以叠加吗」条目下 —— 语料的归类也是这么看的。
+    #   doc_types 上：COUPON 声明 {3,4}，本题 gold 是 {3,4} ✓；
+    #   若标成 FULL_REDUCTION（声明 {3,4}）也能通过，但语义上偏了。
     expected_answer: 可以，满减活动可与店铺优惠券叠加，但不与同类满减活动叠加。
     anchors:
       - text: 满减活动可以与店铺优惠券叠加使用，但不与同类满减活动叠加
@@ -235,6 +271,7 @@ questions:
     question: 发票能开纸质的吗
     category: keyword
     difficulty: 1
+    intent: RULES_AND_PROCESS
     expected_answer: 平台默认开具电子发票，可在订单详情页下载；需要纸质发票请在下单时备注。
     # ★ 这道题【故意保持单答案】，它是「补 gold 不能拿系统输出当依据」的反例。
     #   重排把 30（售后FAQ「可以开【电子】发票吗 | 可以，下单时可选择电子发票」）
@@ -251,6 +288,7 @@ questions:
     question: 退款什么时候到账
     category: colloquial
     difficulty: 2
+    intent: REFUND
     expected_answer: 验收通过后 1-3 个工作日原路返回；微信/支付宝通常 24 小时内到账，银行卡 3-7 个工作日。
     anchors:
       - text: 微信/支付宝支付通常 24 小时内到账；银行卡支付因银行处理时效不同，可能需要 3-7 个工作日
@@ -264,6 +302,7 @@ questions:
     question: 以旧换新的旧机估价有效期多久
     category: keyword
     difficulty: 2
+    intent: TRADE_IN
     expected_answer: 旧机估价在下单后 7 天内有效，逾期需重新估价。
     # 答案唯一，只有 以旧换新服务说明 讲这件事
     anchors:
@@ -274,6 +313,7 @@ questions:
     question: 收到货发现损坏怎么办
     category: colloquial
     difficulty: 2
+    intent: RULES_AND_PROCESS
     expected_answer: 签收时当面验货，外包装破损可拒收并拍照留证；签收后发现损坏需在 24 小时内联系客服并提供开箱视频。
     anchors:
       - text: 若签收后发现商品损坏，请在 24 小时内联系客服并提供开箱视频
@@ -289,6 +329,7 @@ questions:
     question: 这个适合送长辈吗
     category: colloquial
     difficulty: 1
+    intent: SCENARIO_PICK
     expected_answer: 给长辈挑礼物重点看操作是否简单、字够不够大、售后是否方便。
     anchors:
       - text: 给长辈挑选礼物，重点考虑三件事：操作是否简单、字够不够大、售后是否方便
@@ -298,6 +339,7 @@ questions:
     question: 商务人士选笔记本看什么
     category: colloquial
     difficulty: 2
+    intent: SCENARIO_PICK
     expected_answer: 便携性和续航优先；建议 1.3 公斤以内、续航八小时以上，屏幕比例 16:10 更合适。
     anchors:
       - text: 笔记本电脑建议选重量在 1.3 公斤以内、续航八小时以上的型号
@@ -307,6 +349,7 @@ questions:
     question: 学生买平板要注意什么
     category: colloquial
     difficulty: 2
+    intent: SCENARIO_PICK
     expected_answer: 平板适合记笔记和看课件，建议选支持手写笔的型号，并留意手写笔是标配还是需要单独购买。
     anchors:
       - text: 平板电脑适合记笔记和看课件，建议选支持手写笔的型号
@@ -316,6 +359,11 @@ questions:
     question: 笔记本处理器后缀 U 和 H 有什么区别
     category: keyword
     difficulty: 2
+    intent: SPEC_QUERY
+    # ★ 它来自导购指南「二、参数怎么看」，很容易被误标成购买决策。
+    #   判据：这句话在问【这个参数是什么意思】—— 是求事实，不是求建议。
+    #   对照 B-018「商务人士选笔记本看什么」：那句才是在求建议（→ SCENARIO_PICK）。
+    #   两者都落在 doc_type=1，检索行为一样，区别只在 answer_style。
     expected_answer: U/P 是轻薄本处理器，H 是标压处理器；H 性能更强但更耗电。
     anchors:
       - text: H 系列性能更强但更耗电，如果你主要在家或办公室使用

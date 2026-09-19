@@ -30,15 +30,15 @@ class RetrievalDetailBuilderTest {
     }
 
     // ============================================================
-    // 一、冻结的 5 个 key
+    // 一、冻结的 6 个 key
     // ============================================================
 
     @Nested
-    @DisplayName("一、★ 冻结结构（V5 里写死的 5 个 key）")
+    @DisplayName("一、★ 冻结结构（V5 写死 5 个 + 5.4 加的第 6 个）")
     class FrozenStructure {
 
         @Test
-        @DisplayName("★ key 集合恰好是 V5 冻结的那 5 个")
+        @DisplayName("★ key 集合恰好是冻结的那 6 个")
         void hasExactlyFrozenKeys() {
             RetrievalTrace trace = new RetrievalTrace("t");
             trace.vectorHits(List.of(chunk(1, 0.9)));
@@ -53,7 +53,8 @@ class RetrievalDetailBuilderTest {
                             + "任何「从库里读出来断言 key 顺序」的测试都必然失败。"
                             + "这里断言的是集合相等，顺序无关")
                     .hasSameElementsAs(List.of(
-                            "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k"));
+                            "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k",
+                            "filter"));
         }
 
         @Test
@@ -130,13 +131,39 @@ class RetrievalDetailBuilderTest {
         }
 
         @Test
-        @DisplayName("空 trace 仍然返回 5 个 key，值都是空列表")
+        @DisplayName("空 trace 仍然返回 6 个 key，值都是空列表 / 默认的 filter")
         void emptyTraceKeepsStructure() {
             Map<String, Object> detail = builder.build(new RetrievalTrace("t"));
 
-            assertThat(detail).hasSize(5);
+            assertThat(detail).hasSize(6);
             assertThat(detail.get("vector_hits")).isEqualTo(List.of());
             assertThat(detail.get("final_top_k")).isEqualTo(List.of());
+        }
+
+        @Test
+        @DisplayName("★ 从没声明过范围时，filter 那格是「没声明」而不是缺省")
+        void filterDefaultsToNoDeclaration() {
+            Map<String, Object> detail = builder.build(new RetrievalTrace("t"));
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> filter = (Map<String, Object>) detail.get("filter");
+
+            assertThat(filter)
+                    .as("★ filter 属于【恒定存在】的 key，不是「非空才出现」的附加字段。"
+                            + "理由：『这次到底过滤了没有』是一次检索的固有属性，"
+                            + "即使答案是「没有」也必须能被机器读到 —— "
+                            + "做成「key 不在 == 没过滤」会让脚本依赖一个隐式约定，"
+                            + "而隐式约定在改代码时会静默失效")
+                    .isNotNull();
+            assertThat(filter.get("doc_types"))
+                    .as("没声明 → 空列表，不是 null")
+                    .isEqualTo(List.of());
+            assertThat(filter.get("applied")).isEqualTo(false);
+            assertThat(filter.get("pool_size"))
+                    .as("★ 没测量过就是 null。注意这个 key 不能省 —— "
+                            + "省了就分不清「没测」和「忘了写」")
+                    .isNull();
+            assertThat(filter.get("reason")).isEqualTo("no_declaration");
         }
 
         @Test
@@ -172,7 +199,7 @@ class RetrievalDetailBuilderTest {
     // ============================================================
 
     @Nested
-    @DisplayName("三、★ 附加字段（加法式扩展，不改动那 5 个 key）")
+    @DisplayName("三、★ 附加字段（加法式扩展，不改动那 6 个 key）")
     class AdditiveFields {
 
         @Test
@@ -189,7 +216,7 @@ class RetrievalDetailBuilderTest {
         }
 
         @Test
-        @DisplayName("有失败事件时追加 events，但 5 个核心 key 不变")
+        @DisplayName("有失败事件时追加 events，但 6 个核心 key 不变")
         @SuppressWarnings("unchecked")
         void eventsAreAppended() {
             RetrievalTrace trace = new RetrievalTrace("t");
@@ -200,9 +227,10 @@ class RetrievalDetailBuilderTest {
 
             assertThat(detail).containsKey("events");
             assertThat(detail.keySet())
-                    .as("★ 5 个核心 key 必须仍然都在 —— 附加字段不能挤掉任何一个")
+                    .as("★ 6 个核心 key 必须仍然都在 —— 附加字段不能挤掉任何一个")
                     .containsAll(List.of(
-                            "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k"));
+                            "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k",
+                            "filter"));
             assertThat((List<String>) detail.get("events"))
                     .as("失败事件是【给代码判断用】的结构化列表，不是一段自然语言")
                     .containsExactly("keyword_failed: 连接超时");

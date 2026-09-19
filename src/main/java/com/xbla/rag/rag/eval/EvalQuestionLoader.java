@@ -67,12 +67,20 @@ public class EvalQuestionLoader {
     public static final String DEFAULT_PATH = "data/eval/baseline-questions.yml";
 
     /**
-     * {@code eval_question.intent} 的占位值。
+     * {@code eval_question.intent} 的<b>历史</b>占位值。
      *
-     * <p>那一列是 NOT NULL，而意图树的定义属于阶段 5。
-     * 这里<b>不复用 doc_type 的词表</b> —— 那会把「用户想问什么」
-     * 和「文档是什么类型」两个正交概念混在一起。
-     * 写哨兵值，阶段 5 回填时 {@code WHERE intent = 'UNCLASSIFIED'} 一眼能查出剩多少条。
+     * <p>那一列是 NOT NULL，而意图树的定义属于阶段 5。阶段 4 时这里写的是哨兵值，
+     * 目的是让阶段 5 回填时 {@code WHERE intent = 'UNCLASSIFIED'} 一眼查出剩多少条。
+     *
+     * <p>★ <b>2026-09-19 阶段 5.1 起，这个值不再被写入。</b>
+     * 意图树已经定义好了（{@code data/agent/intent-tree.yml}），
+     * 评测集 YAML 里的 {@code intent} 字段现在是<b>必填</b>的，
+     * 缺失会直接导致加载失败 —— 就像锚点解析不唯一一样。
+     *
+     * <p>保留这个常量是因为<b>库里的旧行还带着它</b>：
+     * 在跑过一次 {@code POST /api/debug/eval/reload} 之前，
+     * {@code eval_question} 里仍有 20 行是 UNCLASSIFIED。
+     * 调试探针用它来报告「还有多少条没回填」。
      */
     public static final String INTENT_PLACEHOLDER = "UNCLASSIFIED";
 
@@ -95,6 +103,7 @@ public class EvalQuestionLoader {
             String category,
             Integer difficulty,
             String expectedAnswer,
+            String intent,
             List<Long> expectedChunkIds) {
     }
 
@@ -221,12 +230,32 @@ public class EvalQuestionLoader {
             chunkIds.addAll(hits);
         }
 
+        // ★ intent 是【必填】的（阶段 5.1 起）。
+        //
+        //   为什么不做成「缺了就写 UNCLASSIFIED 哨兵」：那个占位值的理由是
+        //   「意图树还没定义」—— 现在定义了，理由就不成立了。
+        //   留一条可选的退路，等于保留一个已经没有意义的逃生口，
+        //   而它绕过的是 7.2 最能说明问题的那一列。
+        //
+        //   这里【不】校验 code 是否存在于意图树里 —— 那会让 rag/eval 反向依赖
+        //   agent/intent，而 agent 是更上层（它编排检索）。校验放在
+        //   IntentTreeConsistencyTest 里，那个测试同时还能验证「声明的 doc_types 对不对」，
+        //   比在这里查一次 code 存在性强得多。
+        String intent = optionalString(node, "intent");
+        if (intent == null) {
+            throw new IllegalStateException("缺少 intent 字段。它是 7.2「Top-1 意图准确率」的"
+                    + " ground truth，必须人工标注（不允许让模型生成 —— 那等于模型给自己打分）。"
+                    + " 取值必须是 data/agent/intent-tree.yml 里的某个叶子 code，"
+                    + "例如 SPEC_QUERY / PRICE_PROTECTION / RETURN_EXCHANGE");
+        }
+
         return new LoadedQuestion(
                 no,
                 question,
                 optionalString(node, "category"),
                 node.get("difficulty") instanceof Number n ? n.intValue() : null,
                 optionalString(node, "expected_answer"),
+                intent,
                 List.copyOf(chunkIds));
     }
 
@@ -238,14 +267,14 @@ public class EvalQuestionLoader {
         EvalQuestion entity = existing != null ? existing : new EvalQuestion();
         entity.setQuestionNo(q.questionNo());
         entity.setQuestion(q.question());
-        entity.setIntent(INTENT_PLACEHOLDER);
+        entity.setIntent(q.intent());
         entity.setExpectedAnswer(q.expectedAnswer());
         entity.setExpectedChunkIds(q.expectedChunkIds().toArray(new Long[0]));
         entity.setCategory(q.category());
         entity.setDifficulty(q.difficulty());
         entity.setIsBaseline(true);
         entity.setSource("reverse_constructed");
-        entity.setAnnotatedBy("阶段4-从语料反向构造");
+        entity.setAnnotatedBy("阶段4-反向构题，阶段5.1-标注意图");
         entity.setAnnotatedAt(OffsetDateTime.now());
 
         if (existing == null) {

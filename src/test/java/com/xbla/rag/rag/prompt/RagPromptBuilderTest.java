@@ -197,4 +197,164 @@ class RagPromptBuilderTest {
                     .isGreaterThan(prompt.indexOf("内容"));
         }
     }
+
+    // ============================================================
+    // 四、★ 会话历史约束（阶段 5.5）
+    // ============================================================
+
+    @Nested
+    @DisplayName("四、★ 会话历史约束")
+    class HistoryCaveat {
+
+        @Test
+        @DisplayName("★ 有历史时才出现，没有历史时一个字都不该有")
+        void onlyWhenThereIsHistory() {
+            String withHistory = builder.build(BASE, List.of(chunk(1, null, "内容")), true);
+            String withoutHistory = builder.build(BASE, List.of(chunk(1, null, "内容")), false);
+
+            assertThat(withHistory)
+                    .as("回放给模型的只有问答文本，当时的检索资料不在里面 —— "
+                            + "所以必须明确「事实以本次资料为准」")
+                    .contains("关于对话历史")
+                    .contains("以【本次】检索到的资料为准");
+            assertThat(withoutHistory)
+                    .as("★ 一轮问答配一句「历史仅供参考」是纯噪音，"
+                            + "还会稀释其他指令的权重。这条是【反证】—— "
+                            + "只断言 withHistory 含约束的话，"
+                            + "一个「永远加」的实现也能通过")
+                    .doesNotContain("关于对话历史");
+        }
+
+        @Test
+        @DisplayName("★ 约束必须在【可变资料之前】—— 它属于可缓存的固定前缀")
+        void caveatStaysInTheCacheablePrefix() {
+            String prompt = builder.build(BASE, List.of(chunk(1, null, "这段资料每次都不同")), true);
+
+            assertThat(prompt.indexOf("关于对话历史"))
+                    .as("★ 放进可变资料之后就永远缓存不到，而且位置一旦跟着资料走，"
+                            + "不同请求的前缀就不再一致 —— 那正是本节要防的事")
+                    .isLessThan(prompt.indexOf("【知识库资料】"));
+        }
+
+        @Test
+        @DisplayName("★ 检索为空但【有历史】时，约束仍然要在")
+        void caveatSurvivesEmptyRetrieval() {
+            String prompt = builder.build(BASE, List.of(), true);
+
+            assertThat(prompt)
+                    .as("★ 这条最容易漏：空检索是走另一条 return 分支的。"
+                            + "没有资料恰恰是「历史里的数字最可能被当真」的时候 —— "
+                            + "模型手边什么都没有，只有上文")
+                    .contains("关于对话历史")
+                    .contains("本次未从平台知识库中检索到相关内容");
+        }
+
+        @Test
+        @DisplayName("2 参数重载等价于 hasHistory=false")
+        void twoArgOverloadMeansNoHistory() {
+            List<RetrievedChunk> chunks = List.of(chunk(1, null, "内容"));
+
+            assertThat(builder.build(BASE, chunks))
+                    .as("★ 保留 2 参数重载是为了让不关心历史的调用方少写一个 false；"
+                            + "它必须等价于 false，否则两个入口的行为会悄悄分叉")
+                    .isEqualTo(builder.build(BASE, chunks, false));
+        }
+    }
+
+    // ============================================================
+    // 五、★ 更早对话的摘要（阶段 5.6）
+    // ============================================================
+
+    @Nested
+    @DisplayName("五、★ 更早对话的摘要")
+    class SessionSummary {
+
+        private static final String SUMMARY = "用户预算两千左右，用途是和孙子视频通话";
+
+        @Test
+        @DisplayName("★ 有摘要时出现，且排在【可变资料之前】")
+        void summarySitsBeforeTheMaterials() {
+            String prompt = builder.build(BASE,
+                    List.of(chunk(1, null, "这段资料每次都不同")), false, SUMMARY);
+
+            assertThat(prompt)
+                    .contains("【更早的对话摘要】")
+                    .contains(SUMMARY);
+            assertThat(prompt.indexOf("【更早的对话摘要】"))
+                    .as("★ 摘要是【半固定】的 —— 它由 SessionSummarizer 在窗口溢出后生成，"
+                            + "之后一直不变，直到游标再次推进。所以它比资料稳定得多，"
+                            + "排在资料之前能让这段缓存前缀在大多数轮次里命中。"
+                            + "放到资料之后就等于它每轮都是新的，一点都缓存不到")
+                    .isLessThan(prompt.indexOf("【知识库资料】"));
+        }
+
+        @Test
+        @DisplayName("★ 摘要在历史约束【之后】—— 规则在前，内容在后")
+        void caveatComesBeforeTheSummary() {
+            String prompt = builder.build(BASE, List.of(chunk(1, null, "资料")), false, SUMMARY);
+
+            assertThat(prompt.indexOf("关于对话历史"))
+                    .as("★ 两条都是「关于历史」的，但分工不同：约束是【规则】"
+                            + "（固定文本，可缓存），摘要是【内容】（半固定）。"
+                            + "规则在前，模型读到内容时已经知道该怎么对待它")
+                    .isLessThan(prompt.indexOf("【更早的对话摘要】"));
+        }
+
+        @Test
+        @DisplayName("★★ 只给摘要、不给历史原文时，历史约束也必须出现")
+        void summaryAloneStillTriggersTheCaveat() {
+            String prompt = builder.build(BASE, List.of(chunk(1, null, "资料")), false, SUMMARY);
+
+            assertThat(prompt)
+                    .as("★ 摘要【也是历史】，而且是【有损、最容易被模型当成精确事实】的那种。"
+                            + "如果这里只判 hasHistory，那么「窗口空了但摘要还在」的那一轮 ——"
+                            + "恰恰是模型手边只有压缩信息的一轮 —— 会缺掉这条约束")
+                    .contains("关于对话历史");
+        }
+
+        @Test
+        @DisplayName("★ 对照：没有摘要时一个字都不该有")
+        void noSummaryMeansNoSection() {
+            assertThat(builder.build(BASE, List.of(chunk(1, null, "资料")), true, null))
+                    .as("★ 和 hasHistory 同理：给一轮没有摘要的问答加一个空的摘要标题，"
+                            + "会把模型的注意力引向一个空的位置")
+                    .doesNotContain("更早的对话摘要");
+
+            assertThat(builder.build(BASE, List.of(chunk(1, null, "资料")), true, "   "))
+                    .as("★ 全空白等于没有 —— 判断要看内容，不能只看 null")
+                    .doesNotContain("更早的对话摘要");
+        }
+
+        @Test
+        @DisplayName("★ 3 参数重载等价于「没有摘要」")
+        void threeArgOverloadMeansNoSummary() {
+            List<RetrievedChunk> chunks = List.of(chunk(1, null, "内容"));
+
+            assertThat(builder.build(BASE, chunks, true))
+                    .as("★ 同 2 参数重载的理由：入口的行为必须一致")
+                    .isEqualTo(builder.build(BASE, chunks, true, null));
+        }
+
+        @Test
+        @DisplayName("★ 检索为空但有摘要时，摘要和约束都要在")
+        void summarySurvivesEmptyRetrieval() {
+            String prompt = builder.build(BASE, List.of(), false, SUMMARY);
+
+            assertThat(prompt)
+                    .contains("关于对话历史")
+                    .contains(SUMMARY)
+                    .contains("本次未从平台知识库中检索到相关内容");
+        }
+
+        @Test
+        @DisplayName("★ 摘要后面跟一句「有损」的说明")
+        void summaryCarriesTheLossyNote() {
+            String prompt = builder.build(BASE, List.of(chunk(1, null, "资料")), false, SUMMARY);
+
+            assertThat(prompt)
+                    .as("★ 摘要是压缩的，而模型读到「用户说过 X」时会当成精确事实。"
+                            + "这句让它需要引用具体数值时倾向于以本轮资料为准")
+                    .contains("只保留要点，细节可能不全");
+        }
+    }
 }

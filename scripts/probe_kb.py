@@ -49,7 +49,9 @@ BASE = "http://localhost:8080"
 
 def get(path: str, params: dict) -> dict:
     # ★ 绕开陷阱 ①：用 urllib 做百分号编码，中文不经过 shell
-    query = urllib.parse.urlencode(params, encoding="utf-8")
+    # doseq=True：值是 list 时展开成重复参数（docTypes=2&docTypes=4），
+    # 而不是 str(list) 那个既不是 JSON 也不是查询串的 "['2', '4']"
+    query = urllib.parse.urlencode(params, encoding="utf-8", doseq=True)
     url = f"{BASE}{path}?{query}"
     with urllib.request.urlopen(url, timeout=120) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -120,13 +122,42 @@ def cmd_retrieve(args: list) -> int:
 
     这条走的是 /api/debug/kb/retrieve，它会跑完整的
     「双路召回 → RRF 融合 → 重排 → 截断」，并把每一段的中间结果都打出来。
+
+    用法:
+        python scripts/probe_kb.py retrieve 送长辈合适吗
+        python scripts/probe_kb.py retrieve 退货要几天 --docTypes 2,4
+
+    ★ 传了 --docTypes 就走「意图定向检索」（阶段 5.4）。注意它只是【声明】
+      范围 —— 要不要真的下推由 RetrievalPipeline 决定（池子太小它会拒绝），
+      所以这里看到的过滤行为和线上逐字一致。
     """
-    question = args[0]
-    data = get("/api/debug/kb/retrieve", {"q": question})
+    positional = [a for a in args if not a.startswith("--")]
+    question = positional[0]
+
+    params = {"q": question}
+    doc_types = None
+    for i, a in enumerate(args):
+        if a == "--docTypes" and i + 1 < len(args):
+            doc_types = [int(x) for x in args[i + 1].split(",") if x.strip()]
+        elif a.startswith("--docTypes="):
+            doc_types = [int(x) for x in a.split("=", 1)[1].split(",") if x.strip()]
+    if doc_types:
+        # 重复参数名：urllib.parse.urlencode 默认只保留最后一个，
+        # 所以这里手工展开成 docTypes=2&docTypes=4
+        params["docTypes"] = doc_types
+
+    data = get("/api/debug/kb/retrieve", params)
     detail = data["detail"]
 
     print(f"问题: {data['question']}")
     print(f"耗时: {data['latency']}")
+
+    # ★ 范围过滤那一段：出问题时第一个该看的就是它
+    flt = detail.get("filter")
+    if flt:
+        mark = "✅ 已下推" if flt["applied"] else "⏭️  未下推"
+        print(f"范围: {mark}  doc_types={flt['doc_types']} "
+              f"池子={flt['pool_size']}  原因={flt['reason']}")
     print("-" * 78)
 
     sections = [

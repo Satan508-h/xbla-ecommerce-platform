@@ -105,6 +105,123 @@ public class ModelCallTrace {
         this.cost = cost;
     }
 
+    /**
+     * 把<b>另一轮</b>调用的轨迹并入本轨迹 —— 阶段 5.8 的工具往返用。
+     *
+     * <h2>为什么需要它</h2>
+     *
+     * <p>不用工具时，一次问答 = 一次模型调用。用工具时是<b>至少两次</b>：
+     * <pre>
+     *   第 1 轮：模型决定调工具     → 产出 tool_calls，没有正文
+     *   第 2 轮：模型把结果变成人话 → 产出正文
+     * </pre>
+     *
+     * <p>而 {@code qa_log} 只有<b>一行</b>（它的语义是「一次问答」，
+     * 不是「一次模型调用」）。所以多轮的轨迹必须合到一处，
+     * 否则第 1 轮的花费<b>凭空消失</b> —— 而那一轮在推理模型上并不便宜。
+     *
+     * <h2>★ 五个字段的合并规则【不一样】，这是本方法唯一容易写错的地方</h2>
+     *
+     * <table border="1">
+     *   <caption>逐字段的合并规则</caption>
+     *   <tr><th>字段</th><th>规则</th><th>为什么</th></tr>
+     *   <tr><td>降级事件</td><td><b>追加</b></td>
+     *       <td>每一轮的降级都发生过，丢掉哪一轮都是在隐藏事实</td></tr>
+     *   <tr><td>路由（provider/model）</td><td><b>覆盖</b></td>
+     *       <td>★ 用<b>最后一轮</b>的 —— 产出最终回答的就是它。
+     *           前面几轮如果降过级，{@code degradation_events} 里看得见</td></tr>
+     *   <tr><td>token 用量</td><td><b>累加</b></td>
+     *       <td>★ 覆盖会严重低估。用户付的是每一轮的账</td></tr>
+     *   <tr><td>耗时</td><td><b>累加</b></td>
+     *       <td>同上</td></tr>
+     *   <tr><td>成本</td><td><b>累加</b></td>
+     *       <td>★★ <b>不能拿「总 token × 最后一轮单价」重算</b> ——
+     *           降级时不同轮的单价不一样（P0 输出 4 元/百万、P1 是 3 元）。
+     *           只能逐轮算好再加</td></tr>
+     * </table>
+     *
+     * <p>⚠️ 任一轮的用量拿不到（{@code null}），合计就必须是 <b>null</b>，
+     * 不能把已知的那几轮加起来充数 —— 「少算了一点」和「不知道」
+     * 在成本分析里的含义完全不同（同 {@code ADR-010} 的 NULL 原则）。
+     *
+     * @param round 另一轮的轨迹。为 null 时什么都不做
+     */
+    public void mergeRound(ModelCallTrace round) {
+        if (round == null || round == this) {
+            return;
+        }
+
+        // ① 降级事件：追加
+        events.addAll(round.events());
+
+        // ② 路由：覆盖（用最后一轮的）
+        ModelDescriptor roundRoute = round.route();
+        if (roundRoute != null) {
+            route.set(roundRoute);
+        }
+
+        // ③ 用量：累加
+        this.usage.set(accumulate(this.usage.get(), round.usage(), ModelCallTrace::sum));
+
+        // ④ 耗时：累加
+        this.llmLatencyMs += round.llmLatencyMs();
+
+        // ⑤ 成本：累加
+        this.cost = accumulate(this.cost, round.cost(), BigDecimal::add);
+    }
+
+    /**
+     * 累加两份值 —— ★ <b>三态逻辑，不是简单的「null 当 0」</b>。
+     *
+     * <p>第一次合并时，本轨迹的对应字段<b>本来就是 null</b>（还没有任何一轮填过它）。
+     * 如果写成「任一方为 null 就返回 null」，那么第一次合并的结果永远是 null，
+     * 之后的每一次合并也永远是 null —— 最终 {@code qa_log.cost} 恒为 NULL，
+     * 而<b>没有任何报错</b>，看起来就像「用量拿不到」。
+     *
+     * <p>三种状态必须分开：
+     * <table border="1">
+     *   <caption>累加的三态</caption>
+     *   <tr><th>本轨迹</th><th>新的一轮</th><th>结果</th><th>含义</th></tr>
+     *   <tr><td>null</td><td>有值</td><td>新值</td><td>第一轮，直接采用</td></tr>
+     *   <tr><td>有值</td><td>null</td><td><b>null</b></td>
+     *       <td>★ 有一轮拿不到用量 → 合计<b>未知</b>。
+     *           把 null 当 0 会把「不知道」静默变成「没花钱」，成本被低估且无迹可循</td></tr>
+     *   <tr><td>有值</td><td>有值</td><td>相加</td><td>正常情况</td></tr>
+     * </table>
+     *
+     * @param current 本轨迹当前的值，可为 null
+     * @param incoming 新来一轮的值，可为 null
+     * @param summer 两者都非 null 时怎么相加
+     */
+    private static <T> T accumulate(T current, T incoming, java.util.function.BinaryOperator<T> summer) {
+        if (current == null) {
+            return incoming;
+        }
+        if (incoming == null) {
+            return null;
+        }
+        return summer.apply(current, incoming);
+    }
+
+    /** 两份用量相加。★ 只会被 {@link #accumulate} 在两份都不为 null 的情况下调用 */
+    private static ChatUsage sum(ChatUsage a, ChatUsage b) {
+        return new ChatUsage(
+                add(a.promptTokens(), b.promptTokens()),
+                add(a.completionTokens(), b.completionTokens()),
+                add(a.totalTokens(), b.totalTokens()),
+                add(a.reasoningTokens(), b.reasoningTokens()),
+                add(a.promptCacheHitTokens(), b.promptCacheHitTokens()),
+                add(a.promptCacheMissTokens(), b.promptCacheMissTokens()));
+    }
+
+    /** 单个 token 字段相加。★ 这里 null 当 0 是安全的：外层已经保证两份用量都不为 null */
+    private static Integer add(Integer a, Integer b) {
+        if (a == null) {
+            return b;
+        }
+        return b == null ? a : a + b;
+    }
+
     // ============================================================
     // 读取（由 ChatService 调用）
     // ============================================================

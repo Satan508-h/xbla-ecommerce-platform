@@ -102,9 +102,47 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
      * 以「未指定类型」发给 PostgreSQL。显式 CAST 让 PG 不用去猜
      * 这个未知类型的参数该按哪种类型解析。
      *
-     * @param vector 查询向量的文本形式 {@code [0.1,0.2,...]}。
-     *               可以用 {@code VectorTypeHandler.toLiteral(float[])} 生成
-     * @param topK   返回条数
+     * <p><b>④ ★ {@code docTypes} 是「意图定向检索」的过滤条件（阶段 5.4）。</b>
+     * 传 {@code null} 表示不加限制。
+     *
+     * <p>它的写法 {@code (CAST(X AS int[]) IS NULL OR doc_type = ANY(...))} 和
+     * {@link #selectForReindex} 的 {@code #{onlyMissing} = false OR ...} 是<b>同一个模式</b>：
+     * 用一条固定 SQL 覆盖两种调用，而不是写两条几乎相同的语句。
+     * 代价是 <b>null 判断必须写全</b> —— 少了 {@code IS NULL} 那一半，
+     * {@code doc_type = ANY(CAST(NULL AS int[]))} 求值为 {@code NULL}，
+     * 在 {@code WHERE} 里等于是 false，症状是「不过滤的时候一条都查不到」。
+     *
+     * <p>⚠️ <b>而且那个 {@code IS NULL} 的左边必须也套一层 CAST。</b>
+     * 写成裸的 {@code #{docTypes} IS NULL} 会让 PostgreSQL 直接报
+     * <b>{@code could not determine data type of parameter $N}</b> ——
+     * 因为在 {@code $N IS NULL} 里没有任何东西能告诉它这个参数是什么类型。
+     * 而 JDBC URL 上的 {@code stringtype=unspecified} 让驱动把字符串
+     * <b>按「未知类型」</b>发出去，于是「推断不出来」就成了报错而不是默认值。
+     *
+     * <p>★ 这个坑值得单独记一笔，因为它<b>在 Java 侧完全看不出来</b>：
+     * 参数、返回值类型、编译结果全都正常，只有真跑一次 SQL 才会炸。
+     * 而 {@code CAST(X AS int[]) IS NULL} 和 {@code X IS NULL} 在语义上完全等价 ——
+     * 那层 CAST 唯一的用途是<b>给 PostgreSQL 一个类型线索</b>。
+     *
+     * <p>⚠️ 值必须是<b>数组字面量字符串</b>（{@code "{2,4}"}），由
+     * {@code RetrievalOptions.docTypesLiteral()} 生成 ——
+     * 那里在结构上保证只有数字和逗号，所以不需要在这里做转义。
+     *
+     * <p><b>⑤ 加了这个条件之后，PostgreSQL 会换一个计划。</b>实测：
+     * <pre>
+     *   不过滤：Index Scan using idx_kb_chunk_embedding (HNSW)   ← 近似，可能漏
+     *   过滤：  Index Scan using idx_kb_chunk_doc_type + Sort    ← 精确，全扫子集
+     * </pre>
+     * 规划器在有过滤条件时干脆<b>不用 HNSW</b>，改成在子集上精确扫描 + 排序。
+     * 也就是说过滤顺带把这一路从「近似检索」变成了「精确检索」。
+     * 当前规模（1640 行）下这是白拿的；表大了规划器会翻回 HNSW + 过滤，
+     * 那时靠 {@code hnsw.iterative_scan}（默认 off）。见 {@code docs/05}。
+     *
+     * @param vector   查询向量的文本形式 {@code [0.1,0.2,...]}。
+     *                 可以用 {@code VectorTypeHandler.toLiteral(float[])} 生成
+     * @param topK     返回条数
+     * @param docTypes 允许的 {@code doc_type} 数组字面量，如 {@code "{2,4}"}；
+     *                 <b>{@code null} = 不限制</b>
      */
     @org.apache.ibatis.annotations.Select("""
             SELECT id,
@@ -116,10 +154,14 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
             FROM kb_chunk
             WHERE deleted = 0
               AND embedding IS NOT NULL
+              AND (CAST(#{docTypes,jdbcType=VARCHAR} AS int[]) IS NULL
+                   OR doc_type = ANY(CAST(#{docTypes,jdbcType=VARCHAR} AS int[])))
             ORDER BY embedding <=> CAST(#{vector} AS vector), id
             LIMIT #{topK}
             """)
-    List<VectorHit> searchByVector(@Param("vector") String vector, @Param("topK") int topK);
+    List<VectorHit> searchByVector(@Param("vector") String vector,
+                                   @Param("topK") int topK,
+                                   @Param("docTypes") String docTypes);
 
     // ================================================================
     // 关键词召回（阶段 4 · 4.2）
@@ -149,12 +191,14 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
      * 显式写出来是为了让「这一行没有索引」这件事对读代码的人可见 ——
      * 配套的覆盖率探针见 {@link #searchTextStats()}。
      *
-     * @param query 由 {@code SearchText.orQuery()} 生成的 {@code |} 分隔查询串。
-     *              ⚠️ <b>调用方必须先检查 {@code SearchText.isEmpty()}</b> ——
-     *              实测 {@code to_tsquery('simple','')} <b>不抛异常</b>，
-     *              只发一个 NOTICE 然后返回空 tsquery，{@code @@} 恒为 false，
-     *              <b>静默返回 0 行</b>，和「真的没有匹配」无法区分
-     * @param topK  返回条数
+     * @param query    由 {@code SearchText.orQuery()} 生成的 {@code |} 分隔查询串。
+     *                 ⚠️ <b>调用方必须先检查 {@code SearchText.isEmpty()}</b> ——
+     *                 实测 {@code to_tsquery('simple','')} <b>不抛异常</b>，
+     *                 只发一个 NOTICE 然后返回空 tsquery，{@code @@} 恒为 false，
+     *                 <b>静默返回 0 行</b>，和「真的没有匹配」无法区分
+     * @param topK     返回条数
+     * @param docTypes 允许的 {@code doc_type} 数组字面量，如 {@code "{2,4}"}；
+     *                 <b>{@code null} = 不限制</b>。语义与坑④见 {@link #searchByVector}
      */
     @org.apache.ibatis.annotations.Select("""
             SELECT id,
@@ -167,10 +211,40 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
             WHERE deleted = 0
               AND search_vector IS NOT NULL
               AND search_vector @@ CAST(#{query} AS tsquery)
+              AND (CAST(#{docTypes,jdbcType=VARCHAR} AS int[]) IS NULL
+                   OR doc_type = ANY(CAST(#{docTypes,jdbcType=VARCHAR} AS int[])))
             ORDER BY score DESC, id
             LIMIT #{topK}
             """)
-    List<VectorHit> searchByKeyword(@Param("query") String query, @Param("topK") int topK);
+    List<VectorHit> searchByKeyword(@Param("query") String query,
+                                    @Param("topK") int topK,
+                                    @Param("docTypes") String docTypes);
+
+    /**
+     * ★ <b>某个 {@code doc_type} 集合下有多少条切片</b> —— 5.4「值不值得过滤」判据的输入。
+     *
+     * <p>用途：{@code RetrievalPipeline} 在真正下推过滤条件之前问它一句
+     * 「过滤之后还剩多少」。池子比 {@code vector-top-k} 还小就直接不过滤，
+     * 理由见 {@code RetrievalPipeline} 的 {@code resolveScope}。
+     *
+     * <p><b>为什么不带该路自己的守卫条件</b>（向量路要 {@code embedding IS NOT NULL}、
+     * 关键词路要 {@code search_vector IS NOT NULL}）：这个数只用来做一次
+     * <b>量级判断</b>，不需要精确到「这一路实际能用几条」。而且两个守卫
+     * 对应的失败（忘了写 {@code search_text}、向量没算出来）
+     * 各自已经有探针了（{@code /api/debug/kb/search-text-stats}），
+     * 在这里再算一遍会把「池子小」和「索引没建好」两种原因混成一个数。
+     *
+     * <p>⚠️ 这个数会进 {@code retrieval_detail.filter.pool_size} ——
+     * 出问题时第一个该看的就是它：池子小说明意图声明得窄，
+     * 池子大却召回不到说明是检索或切分的问题。
+     */
+    @org.apache.ibatis.annotations.Select("""
+            SELECT count(*)
+            FROM kb_chunk
+            WHERE deleted = 0
+              AND doc_type = ANY(CAST(#{docTypes} AS int[]))
+            """)
+    int countByDocTypes(@Param("docTypes") String docTypes);
 
     // ================================================================
     // search_text 的维护（阶段 4 · 回填与重建）

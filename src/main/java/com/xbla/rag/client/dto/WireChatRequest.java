@@ -3,6 +3,7 @@ package com.xbla.rag.client.dto;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * {@code POST /v1/chat/completions} 的请求体 —— 线格式。
@@ -52,27 +53,98 @@ public record WireChatRequest(
         Boolean stream,
 
         /** 流式选项。非流式请求不要带这个字段 */
-        @JsonProperty("stream_options") WireStreamOptions streamOptions
+        @JsonProperty("stream_options") WireStreamOptions streamOptions,
+
+        /**
+         * ★ 可用的工具（阶段 5.8 新增）。null 时字段不出现 ——
+         * 这是「不用工具」的请求与 5.7 之前<b>逐字一致</b>的保证：
+         * 多一个空数组都是对前缀缓存的一次无谓改动。
+         *
+         * <p>每一项的形状由 {@link ToolSpec#toWireTool()} 生成。
+         */
+        List<Map<String, Object>> tools
 
 ) {
 
     /**
      * 一条对话消息。
      *
-     * <p>{@code role} 的取值：{@code system}（系统提示）/ {@code user}（用户）/ {@code assistant}（助手）。
+     * <p>★ 这里和 {@code WireChatResponse.Message} 不一样：
+     * <b>那边故意不声明 {@code reasoning_content}，这边必须声明。</b>
+     * 因为请求方向是我们要发出去的东西，少一个字段就是 400。
+     * 见 {@link #reasoningContent}。
+     *
+     * @param role             取值：{@code system} / {@code user} / {@code assistant} / {@code tool}
+     * @param content          正文。★ <b>可以省略</b>（真实响应的 tool_calls 回合
+     *                         {@code content} 就是空串）—— 实测省略不报错
+     * @param toolCalls        见 {@link ToolCall}
+     * @param toolCallId       role={@code tool} 时必填
+     * @param reasoningContent 见下
      */
-    public record WireMessage(String role, String content) {
+    public record WireMessage(
+
+            String role,
+
+            String content,
+
+            /**
+             * ★★ 是 {@link WireToolCall}（<b>嵌套</b>的），不是 {@link ToolCall}（平的）。
+             *
+             * <p>发出去时若用扁平形状，服务端会回
+             * {@code HTTP 422 messages[N]: missing field \`type\`}。
+             * 见 {@link WireToolCall#fromDomain} 的说明 —— 那是真踩过的。
+             */
+            @JsonProperty("tool_calls") List<WireToolCall> toolCalls,
+
+            @JsonProperty("tool_call_id") String toolCallId,
+
+            /**
+             * ★★ <b>推理模型的思考过程，工具调用时必须原样发回来。</b>
+             *
+             * <p>{@code deepseek-flash} 是推理模型。实测（2026-09-19）：
+             * 丢掉它再发回去，服务端会报
+             * <pre>
+             *   HTTP 400  The `reasoning_content` in the thinking mode
+             *             must be passed back to the API.
+             * </pre>
+             * 而 400 <b>不降级</b> —— 整个工具调用链路当场死掉。
+             *
+             * <p>⚠️ <b>这看起来很矛盾，因为 {@code WireChatResponse} 那边
+             * 故意声明「不接这个字段」。</b>两处都对，理由不同：
+             * <ul>
+             *   <li><b>响应方向</b>：不接 = 不落库、不返回给前端。
+             *       那是阶段 2「不存 reasoning_content」的决策，
+             *       在纯聊天路径上一直有效</li>
+             *   <li><b>请求方向</b>：必须发 = 它要在<b>一次工具往返的两条
+             *       HTTP 请求之间</b>活着。只活在内存里，不碰 {@code qa_log}、
+             *       不碰 {@code chat_message}</li>
+             * </ul>
+             * 一句话：<b>「不存」不等于「不传」。</b>
+             *
+             * <p>★ 还有一个更细的实测结论，见 {@link ToolCall} 的类注释：
+             * 单独丢掉这个字段<b>不一定</b>报错（服务端可能按 tool_call id
+             * 去缓存里找回来），但<b>丢掉它同时改动了 id</b> 一定报错。
+             * 所以两条一起守：字段原样带、id 原样搬。
+             */
+            @JsonProperty("reasoning_content") String reasoningContent
+
+    ) {
+
+        /** 一条纯文本消息 —— 最常用的形态，其余字段全为 null（序列化时被 NON_NULL 略过） */
+        public static WireMessage of(String role, String content) {
+            return new WireMessage(role, content, null, null, null);
+        }
 
         public static WireMessage system(String content) {
-            return new WireMessage("system", content);
+            return of("system", content);
         }
 
         public static WireMessage user(String content) {
-            return new WireMessage("user", content);
+            return of("user", content);
         }
 
         public static WireMessage assistant(String content) {
-            return new WireMessage("assistant", content);
+            return of("assistant", content);
         }
     }
 

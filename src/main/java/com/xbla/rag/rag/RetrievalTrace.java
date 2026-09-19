@@ -110,8 +110,79 @@ public class RetrievalTrace {
     private volatile int retrievalLatencyMs;
     private volatile int rerankLatencyMs;
 
+    /**
+     * 本次检索的范围过滤情况（阶段 5.4）。
+     *
+     * <p>初始值不是 {@code null} 而是一个「没声明范围」的实例 ——
+     * 这样 {@code retrieval_detail} 里那一格<b>永远存在</b>，
+     * 阶段 7 的脚本不用先判断它在不在。
+     */
+    private final AtomicReference<FilterScope> filter =
+            new AtomicReference<>(FilterScope.none());
+
     public RetrievalTrace(String traceId) {
         this.traceId = traceId;
+    }
+
+    /**
+     * 一次检索实际使用的 {@code doc_type} 范围过滤。
+     *
+     * <h3>★ {@code applied} 的定义：这次检索<b>最终</b>用了过滤吗</h3>
+     *
+     * <p>不是「打算用吗」、也不是「曾经用过吗」。所以<b>回落后它是 {@code false}</b> ——
+     * 因为回落意味着最终跑的是全池查询，{@code vector_hits} 那些段里装的
+     * 也是全池的结果。让 {@code applied} 和那几段说的是同一件事，
+     * 这个 JSON 才是自洽的：任何一格单独拿出来都能正确解释其他格。
+     *
+     * <p>{@code reason} 负责解释「为什么」，把四种情况分开：
+     *
+     * <table border="1">
+     *   <caption>reason 取值</caption>
+     *   <tr><th>取值</th><th>applied</th><th>含义</th><th>该去查什么</th></tr>
+     *   <tr><td>{@code no_declaration}</td><td>false</td>
+     *       <td>没给范围（没开意图识别 / 分类失败 / 该意图声明空集）</td>
+     *       <td>{@code qa_log.intent} 是 null 还是某个码</td></tr>
+     *   <tr><td>{@code small_pool}</td><td>false</td>
+     *       <td>范围太窄，池子比 top-k 还小，过滤不划算</td>
+     *       <td>{@code pool_size}，以及意图树里那个叶子的声明</td></tr>
+     *   <tr><td>{@code ok}</td><td>true</td>
+     *       <td>过滤真的下推了</td>
+     *       <td>——</td></tr>
+     *   <tr><td>{@code empty_result}</td><td>false</td>
+     *       <td>下推了但一条都没召回，改用全池重查</td>
+     *       <td>{@code events}，以及 {@code search_text} 覆盖率探针</td></tr>
+     * </table>
+     *
+     * @param docTypes 意图声明的集合，<b>如实记录</b>（即使最终没用上）。
+     *                 空列表 = 没声明
+     * @param applied  最终是否真的下推了 {@code WHERE doc_type IN (...)}
+     * @param poolSize 该集合在 {@code kb_chunk} 里的切片数；没测量时为 {@code null}
+     * @param reason   为什么是现在这个状态
+     */
+    public record FilterScope(List<Integer> docTypes, boolean applied,
+                              Integer poolSize, Reason reason) {
+
+        /** 见 {@link FilterScope} 的表 */
+        public enum Reason {
+            NO_DECLARATION,
+            SMALL_POOL,
+            OK,
+            EMPTY_RESULT;
+
+            /** 进 JSON 的写法：小写下划线，和 {@code retrieval_detail} 里别的字段一致 */
+            public String wireName() {
+                return name().toLowerCase(java.util.Locale.ROOT);
+            }
+        }
+
+        public FilterScope {
+            docTypes = docTypes == null ? List.of() : List.copyOf(docTypes);
+        }
+
+        /** 没做任何范围声明的初始状态 */
+        public static FilterScope none() {
+            return new FilterScope(List.of(), false, null, Reason.NO_DECLARATION);
+        }
     }
 
     // ================================================================
@@ -182,6 +253,11 @@ public class RetrievalTrace {
         this.retrievalLatencyMs = ms;
     }
 
+    /** 记录本次的范围过滤情况。见 {@link FilterScope} 关于 {@code applied} 的定义 */
+    public void filter(FilterScope scope) {
+        filter.set(scope == null ? FilterScope.none() : scope);
+    }
+
     public void rerankLatencyMs(int ms) {
         this.rerankLatencyMs = ms;
     }
@@ -234,6 +310,11 @@ public class RetrievalTrace {
         return rerankLatencyMs;
     }
 
+    /** 本次的范围过滤情况。<b>永不为 null</b>（没做过就是 {@link FilterScope#none()}） */
+    public FilterScope filter() {
+        return filter.get();
+    }
+
     /** 失败的路名列表 */
     public List<String> failedLegs() {
         return List.copyOf(failedLegs);
@@ -272,12 +353,19 @@ public class RetrievalTrace {
 
     /** 一行摘要，打日志用 */
     public String summary() {
+        FilterScope scope = filter.get();
         return "trace=" + traceId
                 + " 向量=" + vectorHits.get().size()
                 + " 关键词=" + keywordHits.get().size()
                 + " 融合=" + fused.get().size()
                 + " 重排=" + reranked.get().size()
                 + " 最终=" + finalChunks.get().size()
+                // 过滤那一段只在真的有声明时才打 —— 绝大多数请求是 no_declaration，
+                // 每次都打一个 "范围=[]" 只会稀释日志里真正有信息的那部分
+                + (scope.docTypes().isEmpty() ? ""
+                        : " 范围=" + scope.docTypes()
+                          + "(" + scope.reason().wireName()
+                          + "/池" + scope.poolSize() + ")")
                 + " 检索耗时=" + retrievalLatencyMs + "ms"
                 + " 重排耗时=" + rerankLatencyMs + "ms";
     }

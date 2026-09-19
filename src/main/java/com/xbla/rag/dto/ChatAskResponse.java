@@ -60,7 +60,29 @@ public record ChatAskResponse(
         int totalLatencyMs,
         boolean degraded,
         List<DegradationEvent> degradationEvents,
-        List<Map<String, Object>> references
+        List<Map<String, Object>> references,
+
+        /**
+         * 识别出的意图 code（阶段 5.3 新增）。
+         *
+         * <p>三种可能：
+         * <ul>
+         *   <li>业务意图的叶子码（{@code RETURN_EXCHANGE} 等）—— 正常问答</li>
+         *   <li>{@code NEEDS_CLARIFICATION} —— <b>这次回答是一次澄清反问</b>，
+         *       没有检索、也没有调用模型。此时 {@code provider} / {@code model} /
+         *       {@code usage} / {@code cost} <b>全部为 null</b>，
+         *       那是「没有发生模型调用」的诚实表达，不是缺数据</li>
+         *   <li>{@code null} —— 没开意图识别（{@code xbla.agent.intent.enabled=false}），
+         *       或分类失败。★ 不填「未知」之类的占位串：
+         *       阶段 7 必须能分清「没开」和「开了但没分出来」</li>
+         * </ul>
+         *
+         * <p>为什么值得放进响应体：前端需要把澄清反问<b>渲染成一次追问</b>
+         * 而不是一条回答（阶段 8）。有它才能区分，
+         * 否则只能靠比对文本 —— 那就是在猜。同阶段 4 给这个 record
+         * 加 {@code references} 的理由。
+         */
+        String intent
 
 ) {
 }

@@ -37,6 +37,14 @@
           ★ 为什么是 3.3.2 而不是最新的 4.0.0：见下面 dependency 里的详细说明
         -->
         <tika.version>3.3.2</tika.version>
+
+        <!--
+          MCP 官方 Java SDK 版本（阶段 5.8 引入）。
+
+          ★ 抽成属性是因为下面有两个 artifact 必须版本严格一致
+            （mcp-core 和 mcp-json-jackson2），分两处写迟早会漂移。
+        -->
+        <mcp-sdk.version>2.0.1</mcp-sdk.version>
     </properties>
 
     <!--
@@ -300,6 +308,53 @@
             <groupId>org.apache.tika</groupId>
             <artifactId>tika-core</artifactId>
             <version>${tika.version}</version>
+        </dependency>
+
+        <!-- ================================================== -->
+        <!--  阶段 5.8：MCP 官方 Java SDK（只用作 Client）        -->
+        <!-- ================================================== -->
+
+        <!--
+          mcp-core —— 协议本体（传输层 + 客户端 + 服务端）。
+
+          ★★ 为什么【不】直接依赖聚合包 io.modelcontextprotocol.sdk:mcp。
+
+          查 mcp-2.0.1.pom（实测，不是推测）：它只做一件事 ——
+          把 mcp-core 和 **mcp-json-jackson3** 捆在一起。而 Jackson 3
+          （groupId 是 tools.jackson）和本项目正在用的 Jackson 2
+          （com.fasterxml.jackson，Spring Boot 3.5 的默认值）**是两套并存的 API**。
+
+          引进来不会编译报错（包名不同，能共存），代价是：
+            - fat jar 里多一整个 JSON 库
+            - 两个 ObjectMapper 同时存在，几年后没人说得清哪个在生效
+            - 更要命的是**它不会被任何测试发现** —— 两条路都能跑
+
+          所以显式依赖 mcp-core + mcp-json-jackson2，把 Jackson 3 挡在门外。
+
+          ⚠️ 传输层用的是 JDK 自带的 java.net.http.HttpClient（实测 javap
+             HttpClientStreamableHttpTransport 的字段类型），不额外引入
+             OkHttp / Apache HttpClient —— 这是选它的一个隐性好处。
+        -->
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-core</artifactId>
+            <version>${mcp-sdk.version}</version>
+        </dependency>
+
+        <!--
+          mcp-json-jackson2 —— 告诉 SDK「用 Jackson 2 来序列化」。
+
+          ★ 这个 jar 里只有 5 个类，但它是【必须】的：
+            SDK 靠 java.util.ServiceLoader 在运行时查找
+            McpJsonMapperSupplier 的实现（见 JacksonMcpJsonMapperSupplier）。
+            只依赖 mcp-core 的话，运行时抛的是
+            「No McpJsonMapperSupplier found」——一个看起来完全不像
+            「缺依赖」的异常，堆栈里也不会提到 Jackson。
+        -->
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-json-jackson2</artifactId>
+            <version>${mcp-sdk.version}</version>
         </dependency>
     </dependencies>
 

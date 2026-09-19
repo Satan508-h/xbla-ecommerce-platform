@@ -1,33 +1,39 @@
 # CLAUDE.md — 休伯利安（XBLA）电商导购与售后 RAG 平台
 
-> 这份文件是**索引 + 硬性约定**，Claude Code 每次对话都会加载它，所以保持精简。
-> 详细内容全部在 `docs/` 下，按需查阅。
+> **这份文件是索引 + 硬性约定。Claude Code 每次对话都会加载它，所以它必须短。**
+> 只放两类东西：**不能违反的约束**、**会静默咬人的坑（一行）**。
+> 为什么这么做、备选方案是什么、实测数据 —— 全部在 `docs/` 下，按需查阅。
+>
+> ⚠️ **不要把解释性内容写回这里。** 判断标准：删掉它会不会让人写出静默出错的代码？
+> 会 → 留一行 + 指向 docs；不会 → 只留在 docs 里。
 
 ---
 
 ## 一、项目是什么
 
 面向电商场景（商品咨询、规格对比、促销政策、售后服务）的企业级 **RAG 智能问答平台**。
+核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**。
 
-核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**：有意图路由、多路召回、重排序、会话记忆、MCP 工具调用，以及一套端到端评测体系。
-
-**当前阶段**：阶段 4（RAG 核心 —— 检索链路）已完成 ✅ 2026-09-19，下一步阶段 5（智能体层）
-**详细路线图**：`docs/10-开发路线图.md`
+**当前阶段**：阶段 5（智能体层）—— 5.1 ~ 5.9 已完成 ✅ 2026-09-20，下一步 **阶段 6 高可用**。
+★ **验收标准 1 已达成**：问「我的订单到哪了」→ 真的走 MCP 工具 → 拿到实时订单数据。
+⚠️ 5.9 原写「四个业务工具」，实际是「**三个 MCP 工具 + 一个结构化上下文来源**」——
+售后政策没做成工具，原因见 `docs/08` ADR-067。**这一行是被改过的，不是被完成的。**
+路线图与验收标准：`docs/10-开发路线图.md`
 
 ---
 
-## 二、技术栈速查
+## 二、技术栈与模型
 
 | 层 | 技术 | 版本策略 |
 |---|---|---|
 | 语言/运行时 | Java（JDK 21 LTS） | 固定 |
 | 框架 | Spring Boot 3.x | 以搭建当日最新稳定版为准 |
 | ORM | MyBatis-Plus | 必须选支持 Spring Boot 3 的版本 |
-| 数据库 | PostgreSQL + **pgvector** | Docker 镜像 `pgvector/pgvector:pgXX` |
-| 缓存/限流 | Redis + Redisson | Docker 镜像 `redis:7-alpine` |
+| 数据库 | PostgreSQL + **pgvector** | 镜像 `pgvector/pgvector:pgXX` |
+| 缓存/限流 | Redis + Redisson | 镜像 `redis:7-alpine` |
 | 文档解析 | Apache Tika 2.x | — |
 | 熔断 | Resilience4j | `resilience4j-spring-boot3` |
-| MCP | 官方 Java SDK（Client）+ 手写 Server | — |
+| MCP | 手写 Server + 官方 Java SDK（Client） | SDK 已核实为 **2.0.1**（只认到协议 `2025-11-25`）。⚠️ 依赖要写 `mcp-core` + `mcp-json-jackson2`，**别用聚合包 `mcp`**（它会拖进 Jackson 3） |
 | 前端 | Vue 3 + Vite + Element Plus | — |
 | 编排 | Docker Compose | — |
 | 评测 | Python + RAGAS | 独立脚本，非主服务 |
@@ -42,24 +48,11 @@
 | — | 硅基流动 | **向量化**（唯一来源） | `BAAI/bge-m3`（1024 维，免费） |
 | — | 硅基流动 | **重排序**（唯一来源） | `BAAI/bge-reranker-v2-m3`（免费） |
 
-> ✅ 上表全部 ID 于 **2026-09-19 经 `GET /v1/models` 复核确认**（阶段 4 动工前）。
-> 同时核实：`bge-m3` 输出确实为 **1024 维**，与建表时的 `vector(1024)` 一致。
->
-> ⚠️ 这张表之前滞后于 `application.yml` 的实际配置（P1/P2 写的是旧 ID）。
-> **改模型相关代码前请以 `application.yml` 的 `xbla.llm.models` 为准，并重新拉一次 `/v1/models`。**
-
-> ⚠️ **DeepSeek 官方不提供向量化和重排序能力**，这两项只能用硅基流动。这是双供应商架构的根本原因。
->
-> ⚠️ 模型 ID 会变动。**每次动工涉及模型的代码前，先用 `GET /v1/models` 拉真实列表核实**，不要凭记忆硬编码。
-
-> ⚠️ **P0/P1 的 `deepseek-flash` 是「推理模型」**，与普通对话模型的行为不同，写代码时务必注意：
-> - 响应 `message` 里多一个**非标准字段 `reasoning_content`**（推理过程），
->   且 `usage.completion_tokens_details.reasoning_tokens` 单独统计推理消耗。
-> - **实测推理 token 占总输出的 87%**（124 个输出 token 里 108 个是推理）。
-> - **`max_tokens` 给小了会返回空 `content`** —— 推理把额度吃光，最终回答是空字符串。
->   这个 bug 在线上表现为「AI 不说话」，日志里看不出原因。
-> - 本项目**决策：不存储也不返回 `reasoning_content`**，只取最终回答。P2 的 `Qwen3-8B` 是非推理模型，
->   响应里没有这个字段，因此 `LlmClient` 需要能同时兼容两种响应形态。
+> ⚠️ **动模型相关代码前先 `GET /v1/models` 核实**，以 `application.yml` 的
+> `xbla.llm.models` 为准（本表曾滞后于配置）。上表 ID 于 **2026-09-19** 复核，`bge-m3` 确为 1024 维。
+> ⚠️ **DeepSeek 官方不提供向量化和重排序** —— 这是双供应商架构的根本原因。
+> ⚠️ **`deepseek-flash` 是「推理模型」**（推理 token 占输出 87%），响应含非标准字段 `reasoning_content`。
+> ★ **`max_tokens` 给小了会返回空 `content`**，现象是「AI 不说话」而日志无异常。项目决策：不存也不返回 `reasoning_content`。
 
 ---
 
@@ -72,17 +65,17 @@ com.xbla.rag
 ├── mapper/        MyBatis-Plus Mapper
 ├── entity/        数据库实体
 ├── dto/           请求/响应对象
-├── config/        配置类（模型供应商、Resilience4j、Redis 等）
+├── config/        配置类（模型供应商、Resilience4j、线程池、Redis 等）
 ├── client/        ★ 模型接入层：LlmClient / EmbeddingClient / RerankClient（手写 HTTP）
-├── rag/           ★ RAG 核心：解析、切分、召回、融合、重排
+├── rag/           ★ RAG 核心：解析、切分、召回、融合、重排、Prompt 组装
 ├── agent/         ★ 智能体层：意图路由、澄清反问、会话记忆
 ├── mcp/           ★ MCP Server（手写）+ Client（官方 SDK）
 ├── ratelimit/     ★ 高可用：Redis 信号量、Lua 脚本、ZSet 队列、Pub/Sub
 └── common/        通用工具、异常、统一响应封装
 ```
 
-**数据流**（详见 `docs/03-系统架构设计.md`）：
-`用户提问 → 意图识别 → [知识库检索 | MCP 工具调用] → 重排 → Prompt 组装 → LLM 生成 → SSE 流式返回`
+**数据流**：`用户提问 → 意图识别 → [知识库检索 | MCP 工具调用] → 重排 → Prompt 组装 → LLM 生成 → SSE`
+（详见 `docs/03-系统架构设计.md`）
 
 ---
 
@@ -117,180 +110,233 @@ com.xbla.rag
 
 | 文档 | 内容 |
 |---|---|
-| `docs/00-项目总览.md` | 一句话定位、简历故事线、面试叙述脚本 |
+| `docs/00-项目总览.md` | 一句话定位、简历故事线、面试叙述脚本 ⚠️ **不进公开仓库** |
 | `docs/01-产品需求文档.md` | 用户场景、功能清单、非功能需求、验收标准 |
 | `docs/02-技术选型与术语词典.md` | ★ **每个技术的白话解释 + 优缺点**（看不懂术语先查这里） |
 | `docs/03-系统架构设计.md` | 分层架构、端到端数据流、模块划分 |
 | `docs/04-数据库设计.md` | 全部表结构、索引、pgvector 列设计 |
-| `docs/05-检索与智能体设计.md` | 意图树、双路召回、RRF、重排、会话记忆、MCP 工具 |
+| `docs/05-检索与智能体设计.md` | ★ 意图树、双路召回、RRF、重排、会话记忆、摘要压缩 |
 | `docs/06-评测体系设计.md` | 指标定义与公式、标注集规范、A/B 对比方法 |
 | `docs/07-部署手册.md` | Docker Compose、Nginx、内网穿透、排障 |
 | `docs/08-技术决策记录(ADR).md` | ★ **每个决策的备选方案与被否决原因**（面试利器） |
 | `docs/09-面试问答准备.md` | 预判追问 + 标准答案 |
-| `docs/10-开发路线图.md` | 8 周阶段划分、每阶段验收标准、进度勾选 |
+| `docs/10-开发路线图.md` | 阶段划分、每阶段验收标准、**坑列表**、进度勾选 |
 
 ---
 
 ## 六、常用命令
 
 ```bash
-# 启动中间件
+# 中间件
 docker compose up -d
-
-# 查看中间件状态
 docker compose ps
-
-# 连接数据库
 docker compose exec postgres psql -U xbla -d xbla_rag
 
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（212 个：实体映射回归 + 解析/切分/分词/融合/语料清单/结构契约的单测）
-./mvnw test
-```
-
-### 阶段 2 新增：模型接入层的调试探针
-
-> ⚠️ 这些接口标了 `@Profile("local")`，只在本地开发时存在 ——
-> 它们可以无条件消耗 API 额度，**绝不能暴露到生产**。
-
-```bash
-# 降级链与熔断器实时状态
-curl -s localhost:8080/api/debug/llm/chain | python -m json.tool
-
-# 直连某一档（绕过熔断和降级），用于单独验证每个模型
-curl -s -G localhost:8080/api/debug/llm/chat \
-  --data-urlencode "q=你好" --data-urlencode "model=deepseek-flash"
-# model 传 auto 或不传 = 走完整降级链
-
-# 向量化（看 dimension 是不是 1024）
-curl -s -G localhost:8080/api/debug/embedding --data-urlencode "q=退货政策"
-
-# 语义相似度对比
-curl -s -G localhost:8080/api/debug/similarity \
-  --data-urlencode "a=退货政策怎么规定" --data-urlencode "b=我想退货"
-
-# 重排序（相关文档得分应显著高于不相关的）
-curl -s -G localhost:8080/api/debug/rerank \
-  --data-urlencode "q=怎么退货" --data-urlencode "docs=七天无理由退货,发货时效,优惠券规则"
-
-# 流式打字机（逐行 event: delta 陆续到达）
-curl -N -G localhost:8080/api/debug/llm/stream --data-urlencode "q=你好"
+# 跑测试（596 个）
+# ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
+#   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
+./mvnw clean test
 ```
 
 ### 业务接口
 
 ```bash
-# 非流式问答
-curl -s -X POST localhost:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"question":"商品支持七天无理由退货吗"}'
-
-# 流式问答（打字机效果）
-curl -N -G localhost:8080/api/chat/stream --data-urlencode "question=你好"
-# 浏览器演示页：http://localhost:8080/chat.html
-
-# 熔断器状态
+curl -s -X POST localhost:8080/api/chat -H 'Content-Type: application/json' \
+  -d '{"question":"商品支持七天无理由退货吗"}'          # 非流式
+curl -N -G localhost:8080/api/chat/stream --data-urlencode "question=你好"   # 流式
 curl -s localhost:8080/actuator/circuitbreakers | python -m json.tool
+# 浏览器演示页：http://localhost:8080/chat.html
 ```
 
-### 阶段 3 新增：知识库文档入库
+### 调试探针（全部 `@Profile("local")`）
+
+> ⚠️ 它们可以无条件消耗 API 额度，**绝不能暴露到生产**。
+> 完整清单见 `docs/10`；这里只列最常用的。
 
 ```bash
-# ① 生成仿真语料（6 份：PDF / Word / Markdown / Excel），输出到 data/corpus/
-python scripts/generate_corpus.py
-#    依赖：pip install reportlab python-docx openpyxl
+# ── 不花钱的（优先用这些）──
+curl -s localhost:8080/api/debug/kb/search-text-stats        # 分词覆盖率，missing 必须是 0
+curl -s localhost:8080/api/debug/agent/intent-tree | python -m json.tool
+curl -s localhost:8080/api/debug/agent/intent-prompt         # 分类 prompt 原文 —— 「分类不准」先看这个
+curl -s localhost:8080/api/debug/agent/memory | python -m json.tool
+curl -s "localhost:8080/api/debug/agent/memory?sessionNo=xxx" | python -m json.tool  # 摘要的接缝
 
-# ② 批量灌语料（异步，立刻返回 docId 列表）
-#    ★ 不传 docType —— 每份文件的类型由 data/corpus/manifest.yml 逐文件声明。
-#      传了也只是「清单里没声明的文件」的兜底，且会打 WARN
-curl -s -X POST "localhost:8080/api/kb/documents/scan"
+# ── 花钱的（调模型）──
+python scripts/probe_kb.py search 退货要几天         # ★ 中文走脚本，别直接 curl
+python scripts/probe_kb.py retrieve 送长辈合适吗     # 完整召回链路中间输出
+python scripts/probe_kb.py retrieve 退货要几天 --docTypes 2,4
+python scripts/probe_memory.py --rounds 20           # 5.6 验收：20 轮后还记得第 1 轮吗
+curl -s -G localhost:8080/api/debug/agent/classify --data-urlencode "q=退货要几天"
+curl -s -G localhost:8080/api/debug/llm/chat --data-urlencode "q=你好" \
+  --data-urlencode "model=deepseek-flash"     # 直连某一档；传 auto/不传 = 走完整降级链
 
-# ③ 数据库同步：把 after_sale_policy + product 表渲染成知识库文档
-curl -s -X POST localhost:8080/api/kb/documents/sync
+# ── 阶段 5.7：MCP ──
+python scripts/probe_mcp.py                          # ★ 完整握手 + 工具调用 + 越权，12 项判定
+curl -s localhost:8080/api/debug/mcp/tools | python -m json.tool   # 模型看到的工具清单
 
-# ④ 上传单个文件（multipart）
-curl -s -X POST localhost:8080/api/kb/documents \
-  -F "file=@data/corpus/售后政策汇编.docx" -F "docType=2"
+# ── 阶段 5.8 / 5.9：MCP Client + 工具调用 + 结构化硬数据 ──
+python scripts/probe_tool.py                        # ★★ 真实验收：30 项，会调模型（花钱）
+curl -s "localhost:8080/api/debug/mcp/client?userId=8" | python -m json.tool  # ★ 模型实际收到的报文
+curl -s "localhost:8080/api/debug/mcp/qa-log?traceId=xxx" | python -m json.tool  # 看 tool_calls 落库没有
+# ★ 直调工具看它的返回原文（走完整 MCP 链路，和模型拿到的一模一样）——【不花钱】
+curl -s "localhost:8080/api/debug/mcp/call?tool=query_my_coupons&userId=8" | python -m json.tool
+curl -s "localhost:8080/api/debug/agent/intent-tree" | python -m json.tool   # 看 structuredFactLeaves
 
-# ⑤ 查入库状态（前端轮询的就是这个；finished=true 表示可以停止轮询）
-curl -s localhost:8080/api/kb/documents/1 | python -m json.tool
-```
-
-> ★ **新增语料文件必须登记进 `data/corpus/manifest.yml`**，否则 `doc_type`
-> 会静默用兜底值（列表里没有它时打 WARN）。`doc_type` 词表：
-> `1商品详情 2售后政策 3促销规则 4FAQ 5说明书`。
-> 它是**阶段 5 意图定向检索的过滤条件**，标错的症状是「某一类查询永远返回空」。
->
-> ⚠️ **`generate_corpus.py` 生成的必须是字节确定的文件**（时间戳已钉死）。
-> 一旦产物字节每次不同，入库去重会静默失效、重扫会重复灌入并**真的花向量化钱**。
-> 详见 `docs/08` ADR-028。
-
-```bash
-```
-
-### 阶段 3 新增：知识库检索探针（同样 @Profile("local")）
-
-> ⚠️ **中文请用 `scripts/probe_kb.py`，不要直接用 curl。**
-> Windows + Git Bash 下有**两层**编码陷阱（shell 破坏命令行参数、
-> Python 按 GBK 读 UTF-8 响应），直接用 curl 会得到「像乱码又像 bug」的结果。
-
-```bash
-# 向量检索，看最相关的切片
-python scripts/probe_kb.py search 退货要几天
-python scripts/probe_kb.py search 这个适合送长辈吗 --topk 5
-
-# ★ 稳定性自检：同一问题查 N 次，比对 ID 序列是否逐位一致
-python scripts/probe_kb.py stability 退货要几天 --repeat 5
-
-# 查某份文档的入库状态
-python scripts/probe_kb.py status 1
-```
-
-> **关于「结果稳定」的正确预期**：
-> 命中的 **ID 序列**是完全稳定的（靠 SQL 里 `ORDER BY ..., id` 的兜底键）；
-> 但**分值不会逐位相同** —— 实测向量化接口本身有约 **3e-4** 的漂移
-> （同一问题连续调 6 次出现 2 种结果），这是 GPU 浮点并行归约的固有性质。
-> **别把「检索结果不稳定」当成 bug 去查**，先看 ID 序列是否一致。
-
-### 阶段 4 新增：RAG 检索链路
-
-```bash
-# ★ 完整召回链路的中间输出（验收标准 1 的落点）
-#    返回 vector_hits / keyword_hits / fused / reranked / final_top_k 五段
-python scripts/probe_kb.py retrieve 送长辈合适吗
-
-# ★ 中文分词索引的覆盖率。missing 必须是 0
-curl -s localhost:8080/api/debug/kb/search-text-stats
-
-# ★ 重建 search_text（force=true 是全量重建，换分词器后用）
+# ── 一次性 / 重建 ──
+python scripts/generate_corpus.py                    # 生成仿真语料（依赖 reportlab python-docx openpyxl）
+curl -s -X POST "localhost:8080/api/kb/documents/scan"    # 批量灌（异步）
 curl -s -X POST "localhost:8080/api/debug/kb/reindex?force=true"
-
-# 加载评测集（会重新解析锚点；锚点不唯一会直接报错 —— 这是刻意的）
-curl -s -X POST localhost:8080/api/debug/eval/reload
-
-# ★ 跑基线评测并生成报告（4 个配置对比 + 未命中归因）
-python scripts/eval_baseline.py --out eval_results/baseline-20260919
+curl -s -X POST localhost:8080/api/debug/eval/reload      # 重解析评测集锚点
+python scripts/eval_baseline.py --out eval_results/baseline-YYYYMMDD
 ```
 
-**关于检索链路的三个要点**
+**用环境变量覆盖配置跑 A/B**（Spring 的 relaxed binding 认这个，不用改文件）：
 
-1. **`qa_log.retrieval_detail` 和调试接口是同一个纯函数产出的**
-   （`RetrievalDetailBuilder`），所以「验收看到的中间输出」和「线上真正落库的内容」
-   物理上是同一份，永远不会漂移。
-2. **检索失败不影响问答** —— 退化成没有知识库上下文的裸聊。
-   扫码进 `qa_log` 的 `status=2` **只表示模型链路失败**，
-   检索的问题记在 `retrieval_detail.events` 里。
-3. **`xbla.rag.rewrite.enabled` 默认关闭**（查询重写/子问题拆分）。
-   这是为了让基线干净，阶段 7 的 A/B 有可比性 —— 详见 `docs/06` §4.1。
+```bash
+SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"enabled":false}}}}' ./mvnw spring-boot:run
+SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw spring-boot:run
+#                                     ↑ 窗口调小 = 10 轮就能触发摘要压缩（省钱的机制验证）
+```
 
-### ⚠️ Windows 环境下的两个坑
+---
 
-1. **命令行里的中文会被 shell 破坏。** Git Bash 传中文给 `curl -d` 会变成
-   `U+FFFD` 替换字符（`efbfbd`），服务端收到乱码。
-   **测试中文请用文件传输**：`curl --data-binary @payload.json`，
-   或者用 Python 做百分号编码（`urllib.parse.quote`）。
+## 七、★ 改代码前必看的约定
+
+> 一行一条。**都会被违反而没有任何报错**，所以列在这里。为什么这么做见括号里的文档。
+
+### 数据与配置
+
+- ⚠️ **新增语料文件必须登记进 `data/corpus/manifest.yml`**，否则 `doc_type` 静默用兜底值。
+  词表 `1商品详情 2售后政策 3促销规则 4FAQ 5说明书`，标错的症状是「某一类查询永远返回空」。
+- ⚠️ **`generate_corpus.py` 的产物必须字节确定**（时间戳已钉死）。产物一变，入库去重静默失效、重扫会重复灌并**真的花向量化钱**。（ADR-028）
+- ★★ **`SeedRunner` 的幂等粒度是【按表】；新加的随机流必须用【自己的 `Random`】** ——
+  `Random` 是位置依赖的，而按表幂等让「全量灌」和「只补一张表」成了两条路径，
+  共用一条流会让**同一份代码产出两套数据**（症状是「我这儿 3 张券、你那儿 2 张」）。
+  ⚠️ **别去统一改老方法** —— 那会改掉所有现有数据，包括已向量化的 1652 条切片。（ADR-074）
+- ⚠️ **`user_coupon` 的种子数据是 5.9 才补上的**（之前 `SeedRunner` 注释里写了它、代码里没有）。
+  `product.name` **没有唯一约束**，实测 200 个商品里 17 组重名 —— 它是**真实电商的常态**，不是数据 bug。
+- ⚠️ **V1–V5 迁移一个字都不能改**（`validate-on-migrate: true`，改了起不来）。新改动一律新增 Vn。
+- ⚠️ **意图树缺文件是【启动即崩】，语料清单缺文件是【WARN 回落】。** 这个不一致是刻意的。（ADR-034）
+- ★ **`data/eval/baseline-questions.yml` 里 `intent` 必填**（存**叶子码**），缺了 `reload` 直接失败。
+
+### 检索与评测
+
+- ★★ **评测指标只统计 `qa_log.status = 1`。** `2`=模型链路失败，`3`=澄清反问（没生成也没失败）。
+  常量是 `QaLog.STATUS_SUCCESS / STATUS_FAILED / STATUS_CLARIFY`。
+- ★ **`retrieval_detail` 是 6 段**（`vector_hits`/`keyword_hits`/`fused`/`reranked`/`final_top_k`/`filter`），
+  和调试接口是**同一个纯函数**产出的，永不漂移。（ADR-045）
+- ★ **检索失败不影响问答**（退化成裸聊）；`status=2` **只表示模型链路失败**。
+- ★ **命中的 ID 序列稳定，但分值有约 3e-4 漂移**（GPU 浮点归约）。别把「结果不稳定」当 bug 查，先看 ID 序列。
+- ⚠️ **`#{docTypes} IS NULL` 会让 PostgreSQL 报 `could not determine data type of parameter $N`。**
+  必须写 `CAST(#{docTypes} AS int[]) IS NULL` —— 那层 CAST 唯一的用途是给 PG 类型线索。
+
+### 智能体层
+
+- ★★ **三类非业务角色互斥**：`BUSINESS` / `OUT_OF_SCOPE`（不是我的业务）/ `CLARIFY`（是我的但没说清）。
+  混起来用户会拿到错误回答 —— 问「那个怎么样」会收到「我只处理商品导购与售后问题」。
+- ★ **澄清路径短路**：不检索不调模型，所以 `provider`/`cost`/`references`/`retrieval_detail` **全是 NULL** ——
+  那是「没有发生」的诚实表达。⚠️ 别传空对象，空 trace 和「检索跑了但没召回」序列化出来逐字相同。（ADR-041）
+- ⚠️ **`OUT_OF_SCOPE` 仍然走检索 + 生成**（树里标的是 `retrieval: NONE`，代码只对 `CLARIFY` 短路）——
+  **已知的不一致**，见 `docs/05` §9.3 ⑩。
+- ★★ **`doc_types: []` = 不限制**（不是「什么都不匹配」）。解读成不匹配会让三个工具意图**退化成裸聊**，
+  而裸聊会**编一个订单状态出来**。（ADR-044）
+- ★★ **过滤与否的判据是「池子绝对大小 ≥ `vector-top-k`」，不是「收窄倍数」** ——
+  实测倍数 1.1×~328×，而**倍数越大越危险**。（ADR-043）
+- ⚠️ **`temperature = 0.0` 不等于确定性。** 实测同一问题 8 次出现 7:1 分裂，单次准确率有 **±5%** 波动。（`docs/06` §1.4）
+- ⚠️ **`xbla.agent.intent.max-tokens` 绝不能给小**（推理模型吃光额度 → 空 content → 「分类永远失败」而日志无异常）。
+- ★★ **`intent-fewshot.yml` 和 `intent-tree.yml` 的 `examples` 不能合并** —— 后者与 20 道评测题
+  **有 18 条逐字相同**，合并会让准确率测的是「照抄能力」。由 `IntentFewShotTest` 结构性强制。（ADR-036）
+- ⚠️ **改完意图树跑 `IntentTreeConsistencyTest`**（gold `doc_types ⊆ declared`，当前 20/20）。
+
+### 会话记忆与摘要（5.5 / 5.6）
+
+- ★★ **历史只喂给生成，不喂给分类。** 这条不能动 —— 5.2 的 95% 和 5.4 的 20/20 都建立在
+  「分类器的输入只有这一句话」之上。（ADR-046）
+- ★★ **读记忆必须在 `saveUserMessage` 【之前】。** 反过来历史里会有本轮的提问，
+  模型收到**两条一样的用户消息**，而日志和落库数据两边各自都是对的。（ADR-047）
+- ★★ **孤儿用户消息要丢【末尾全部】，不是只丢最新那一条。** 只丢一条的话，
+  **连续两次失败之后会话永久答不出话**（连续两条 user → 400 → 不降级）。（ADR-049）
+- ★★ **摘要游标锚在「窗口起点 - 1」，宁可重叠绝不空洞。** 锚点是
+  `ConversationMemory.windowStartId` **单一出处**。（ADR-048）
+- ★★ **摘要压缩走异步单线程池**（最慢实测 41.5 秒；单线程是正确性要求，且 `maxPoolSize` 也要锁死）。（ADR-050）
+- ★★ **摘要的主角是用户不是助手**（助手的回答可再检索，用户的预算/用途/型号不可再生）。
+  ⚠️ 长度**没有完全压住**，稳定在 900–1100 字振荡，见 `docs/05` §9.6 ⑤。
+- ⚠️ **`chat_summary` 两列「有列不用」**：`summary_level` 恒为 1、`token_count` 恒为 NULL。
+- ⚠️ **摘要的花费不进 `qa_log`**（它的语义是「一次问答」）—— 第二个显式例外（第一个是 4.8 基线不写库）。
+- ⚠️ **`history.enabled` / `summary.enabled` 关掉时什么都不读**（不是「读了不拼」）——
+  否则阶段 7 分不清「没开」和「开了但是空的」。
+
+### MCP（5.7 Server / 5.8 Client / 5.9 三个工具）
+
+- ★★ **身份只能来自 `McpToolContext`，不能是工具参数。** 工具参数是**模型填的** ——
+  加一个 `user_id` 参数就是**模型可控的越权入口**，一段提示注入就够了。（ADR-054）
+- ⚠️ **`X-Xbla-User-Id` 不是认证**（明文未签名）。做到的是「身份不进模型的可控范围」，
+  另一半需要 OAuth。**别在文档里含糊过去。**
+- ★★ **工具的参数名只能写一次**（一个 `static final ToolField` 常量）——
+  schema 生成和取值都走它。两处各写一份的漂移是**静默**的。（ADR-057）
+- ★★ **`isError` 的判据是「工具有没有给出答案」，不是「答案是不是空的」。**
+  「查无此单」是 `isError:false`；标成 `true` 会让模型去为系统故障道歉。（ADR-056）
+- ★★ **协议版本是 `2025-11-25`，跟 SDK 对齐不跟规范仓库对齐**（规范已有 2026-07-28，
+  但 SDK 2.0.1 不认识）。升级 SDK 时反编译 `ProtocolVersions` 重新核实。（ADR-053）
+- ⚠️ **`Map.copyOf` / `Map.of` 拒绝 null 值** —— 而 JSON Schema 的可选字段
+  合法地就是 null。工具体验里要包结构化输出时用 `Collections.unmodifiableMap(new LinkedHashMap<>(…))`。（ADR-058）
+- ⚠️ **`Origin` 头缺席时放行**是刻意的（rebinding 必然由浏览器发起，而它总会带 Origin）。
+  别「顺手改成拒绝」—— 那只会挡住官方 SDK。（ADR-055）
+- ⚠️ **JSON-RPC 出错时 HTTP 仍是 200**；只有「身份缺失」和「会话失效」用 401/400。
+- ⚠️ **通知（`notifications/initialized`）必须回 202 且响应体为空** —— 它没有 id。
+- ⚠️ **`user_coupon` 表是空的，`app_user.id=1` 不存在。** 5.9 做优惠券工具前先补种子数据。
+- ★★ **线格式的 `tool_calls` 是【嵌套】的**（`name` 在 `function` 里），领域对象是平的 ——
+  **收发两个方向都要映射**（`WireToolCall`）。少一层：收→`name` 静默变 null；发→`422 missing field type`。（ADR-061）
+- ★★ **DTO 的形状，只有真的序列化/反序列化过一次才算验证过。** 桩造的对象验证不了它自己。（ADR-061）
+- ★★ **工具决策轮的「空正文」是成功**，判据用 `hasAnyContent()`。实测连续 5 次 `content` 全是空串。（ADR-060）
+- ★★ **`reasoning_content` 必须原样带回第二跳**（丢了 400，不降级）。★ **「不存」不等于「不传」。**（ADR-060）
+- ★★ **`tool_call` 的 id 和参数只能原样搬运**（改写会 400）。两家的 id 格式完全不同。（ADR-060）
+- ★★ **工具失败一律降级成「工具结果」喂回模型**，不让问答失败。⚠️ 请求的**构造**也要在包装网里。（ADR-062）
+- ★★ **工具意图【不检索知识库】**（判据是意图树的 `retrieval` 字段）。跑了会让模型编一个订单状态出来。
+- ★ **多轮合并：用量/耗时/成本【累加】，路由【覆盖】，事件【追加】。** ⚠️ 累加是三态逻辑，
+  写成「任一方 null 返回 null」会让 `qa_log.cost` **恒为 NULL**。（ADR-063）
+- ⚠️ **第二跳末尾不能有用户提问** —— 多一条 user 会让模型再调一次工具，像「模型陷入循环」。
+- ⚠️ **身份缺席时不是 401**，只有工具那条路回一句实话。全局 401 会打断演示页和所有 curl。（ADR-065）
+- ★★ **售后政策【不是 MCP 工具】** —— `AFTER_SALE` 是 `retrieval: KB`，模型在那个意图下
+  **拿不到任何工具**。它走 `structured_facts: POLICY` 的结构化注入。（ADR-067）
+- ★★ **`structured_facts` 是【叶子】粒度，且【不参与分类】**（`classificationTargets` 只看 `retrieval`）
+  —— 所以加它对 5.2 的准确率基线**零影响**。⚠️ 非 KB 的叶子声明它会**启动即崩**。（ADR-068）
+- ★★ **硬数据只带天数，不带 `conditions`** —— 后者**已经在知识库里**（实测 12 条切片）。（ADR-069）
+- ★★ **硬数据拼进【固定段】，检索为空时它仍然在。** 那正是最需要它的时刻。（ADR-070）
+- ★★ **`query_inventory` 只匹配商品名**，不匹配类目/品牌 —— 品类词命中几十个再返回前 3 个，
+  是**按 id 排的随机结果**，却看起来像答案。（ADR-071）
+- ★★ **商品名【会重复】**（实测 200 个里 17 组、35 个重名，`name` 上没有唯一约束）——
+  所以正文**总是**带 `product_no`。⚠️ 「总是」是要点：正文形状不能随数据变。（ADR-072）
+- ★★ **券「可用」= `status == 1` ∧ 没过期**，不是一个条件。⚠️ 而 `expired_at` 为 **null 视为不过期**
+  （`null = 已过期` 会把一张**真券藏起来**，用户无从发现）。（ADR-073）
+- ★ **`GET /api/debug/mcp/call?tool=&userId=&args=`** 直调工具（**不花钱**）。
+  它走**完整 MCP 链路**，拿到的和模型拿到的一模一样 —— 直接调 Bean 会跳过 schema 校验和身份注入。
+  ★ 它让「模型答错了」和「工具给的就是错的」能分开，而这两件事的修法完全相反。
+- ★★ **判据：先看工具说了什么，再看模型说了什么，然后比较。** 「回答里有某个词」会被模型的
+  措辞绑架（5.8 的「没找到 → 没查到」）；「回答里的东西**工具确实说过**」不会。
+
+### 代码风格（本项目强制）
+
+- ★ **`ApiResponse.CODE_SUCCESS = 0`**，不是 HTTP 的 200。判断成功要判 `code == 0`。
+- ★ **纯单测必须写正-反对照**：断言 A 成立的同时，断言「不做 A 的那个版本确实不成立」，否则断言可能恒真。
+- ★★ **凡是会进 Prompt 前缀的 JSON，一律用 `LinkedHashMap`，不用 `Map.of` / `Map.copyOf`** ——
+  它们的迭代顺序由 hash 决定，而 JDK 9+ 的 hash 掺了一个**每次 JVM 启动随机**的 SALT。
+  实测三个 JVM 三种顺序。代价是前缀缓存整段未命中（差 50 倍）。本项目已踩两次（ADR-058 / 064）。
+- ★ **别在 surefire 配置里加 `@Tag` 过滤** —— 写错会**静默漏跑**现有测试（文件还在、`mvn test` 还是绿的）。
+- ★ **测试用 `@MockitoBean`**（Boot 3.4+）。`./mvnw test` 只需要 docker postgres，**不花钱**。
+
+---
+
+## 八、⚠️ Windows 环境下的两个坑
+
+1. **命令行里的中文会被 shell 破坏。** Git Bash 传中文给 `curl -d` 会变成 `U+FFFD`（`efbfbd`），
+   服务端收到乱码然后报 500「服务内部错误」。
+   **中文请用文件传输**（`curl --data-binary @payload.json`）或 **Python 做百分号编码**
+   （`urllib.parse.quote`），或者直接用 `scripts/probe_kb.py`。
    *浏览器不受影响 —— 它会正确地做百分号编码。*
+   ⚠️ 反过来也成立：**Python 读服务端响应也可能按 GBK 解码而报错**，脚本里显式 `reconfigure(encoding="utf-8")`。
 2. **Maven 输出的中文会乱码。** 加环境变量：
    `export MAVEN_OPTS="-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"`

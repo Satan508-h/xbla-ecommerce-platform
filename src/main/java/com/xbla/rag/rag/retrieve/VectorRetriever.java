@@ -62,15 +62,19 @@ public class VectorRetriever implements Retriever {
     }
 
     @Override
-    public List<RetrievedChunk> retrieve(String query, int topK) {
+    public List<RetrievedChunk> retrieve(String query, RetrievalOptions options) {
         if (query == null || query.isBlank()) {
             return List.of();
         }
-        List<RetrievedChunk> hits = vectorSearcher.search(query, topK)
+        // ★ docTypes 直接透传给 SQL，不在 Java 里后置筛 —— 理由见 Retriever 的类注释：
+        //   4.1% 的选择率下，「先取 20 条再筛」平均只剩不到 1 条
+        List<RetrievedChunk> hits = vectorSearcher
+                .search(query, options.topK(), options.docTypesLiteral())
                 .stream()
                 .map(RetrievedChunk::from)
                 .toList();
-        log.debug("向量召回 topK={} 命中={}", topK, hits.size());
+        log.debug("向量召回 topK={} docTypes={} 命中={}",
+                options.topK(), options.docTypesLiteral(), hits.size());
         return hits;
     }
 }

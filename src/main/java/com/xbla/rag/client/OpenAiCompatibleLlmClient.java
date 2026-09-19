@@ -7,6 +7,7 @@ import com.xbla.rag.client.dto.ChatResponse;
 import com.xbla.rag.client.dto.ChatUsage;
 import com.xbla.rag.client.dto.ModelDescriptor;
 import com.xbla.rag.client.dto.StreamResult;
+import com.xbla.rag.client.dto.ToolSpec;
 import com.xbla.rag.client.dto.WireChatRequest;
 import com.xbla.rag.client.dto.WireChatResponse;
 import com.xbla.rag.client.dto.WireStreamChunk;
@@ -16,6 +17,8 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -103,18 +106,33 @@ public class OpenAiCompatibleLlmClient implements LlmClient {
                     descriptor.provider(), modelKey(), "响应里没有任何 choices");
         }
 
-        String content = choice.message() == null ? null : choice.message().content();
+        WireChatResponse.Message message = choice.message();
+        String content = message == null ? null : message.content();
         ChatUsage usage = ChatUsage.from(response.usage());
 
-        // ★ 这一道判断就是「推理模型把 max-tokens 吃光」的探测器。
-        //   HTTP 200、finish_reason=length、content 却是空串 ——
-        //   对外表现为「AI 不说话」，所以必须当成失败，让降级链接手。
-        if (content == null || content.isBlank()) {
+        // ★★★ 空正文探测 —— 判据必须是 hasAnyContent()，不是 isEmptyContent()。
+        //
+        //   这道判断的本来目的是「推理模型把 max-tokens 吃光」：
+        //   HTTP 200、finish_reason=length、内容却是空的 ——
+        //   对外表现为「AI 不说话」，所以当成失败让降级链接手。
+        //
+        //   ★ 但工具决策轮的 content 【本来就是空串】。
+        //     实测（2026-09-19）：连续 5 次让 deepseek-flash「需要订单信息就
+        //     直接调用工具、不要说话」，5 次的 content 全是 ''。
+        //
+        //   只判 content 的话，每一次工具调用都会掉进这里：
+        //     误判成失败 → ModelErrorKind.EMPTY_CONTENT 是可降级的
+        //     → 降级链走一圈 → 三家全失败 → qa_log.status=2
+        //     → 错误消息写着「输出 0 token，推理占 0%」
+        //   而真正发生的事是「模型很有礼貌，一个字都没说，只给了工具调用」。
+        //   排查方向会被这条消息带到「max-tokens 是不是给小了」上。
+        if (message == null || !message.hasAnyContent()) {
             throw ModelCallException.emptyContent(
                     descriptor.provider(), modelKey(), describeEmptyChoice(choice, usage));
         }
 
-        return new ChatResponse(content, choice.finishReason(), usage, descriptor, latencyMs);
+        return new ChatResponse(content, choice.finishReason(), usage, descriptor, latencyMs,
+                message.domainToolCalls(), message.reasoningContent());
     }
 
     // ============================================================
@@ -242,13 +260,22 @@ public class OpenAiCompatibleLlmClient implements LlmClient {
             streamOptions = WireChatRequest.WireStreamOptions.enabled();
         }
 
+        // ★ tools 为 null 时字段不出现 —— 不用工具的请求与 5.7 之前逐字一致。
+        //   顺序用 stream 的 map 直出，保证「同一份工具集 → 同一份字节」，
+        //   这是前缀缓存命中的前提（见 ToolSpec.toWireTool 的说明）。
+        List<Map<String, Object>> tools = null;
+        if (request.hasTools()) {
+            tools = request.tools().stream().map(ToolSpec::toWireTool).toList();
+        }
+
         return new WireChatRequest(
                 descriptor.modelId(),
                 request.toWireMessages(),
                 maxTokens,
                 temperature,
                 stream,
-                streamOptions);
+                streamOptions,
+                tools);
     }
 
     /**

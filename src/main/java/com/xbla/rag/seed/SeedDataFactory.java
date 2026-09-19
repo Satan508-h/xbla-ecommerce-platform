@@ -7,6 +7,7 @@ import com.xbla.rag.entity.Inventory;
 import com.xbla.rag.entity.Product;
 import com.xbla.rag.entity.ProductAttribute;
 import com.xbla.rag.entity.ProductSku;
+import com.xbla.rag.entity.UserCoupon;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -41,6 +42,39 @@ public class SeedDataFactory {
     private static final long RANDOM_SEED = 20260918L;
 
     private final Random random = new Random(RANDOM_SEED);
+
+    /**
+     * ★★ <b>用户券专用的随机流 —— 它是第二个流，这是刻意的。</b>
+     *
+     * <h4>为什么不能共用 {@link #random}</h4>
+     *
+     * <p>一个 {@link Random} 是<b>一条流</b>：第 N 次取值取决于「在它之前被取过多少次」。
+     * 于是每个方法的输出都隐式地依赖<b>它前面跑过哪些方法</b>。
+     *
+     * <p>这在「每次从空库全量灌」的世界里没问题（顺序永远是那个顺序）。
+     * 但 5.9 把幂等粒度改成了<b>按表</b> —— 于是出现了第二条路径：
+     * <pre>
+     *   全新建库 ：createUsers → createProducts → … → createOrders → createUserCoupons
+     *   只补 user_coupon：                              createUserCoupons
+     * </pre>
+     * 两条路径下 {@code createUserCoupons} 从同一条流里读到的位置<b>完全不同</b>，
+     * 于是<b>同一份代码、同一个种子，产出两套不同的券</b>。
+     * 而症状是「我这儿查出来 3 张券，你那儿是 2 张」—— 一个会被归因成
+     * 「数据没同步」的问题，实际上是我们自己的不确定性。
+     *
+     * <h4>为什么不去改前面那几个方法，让它们每个各用一条流</h4>
+     *
+     * <p>那才是根治。但代价是<b>所有现有数据都会变</b>：200 个商品的名称、
+     * 578 个 SKU、库存、订单、以及已经向量化入库的 208 份文档与 1652 条切片
+     * （{@code kb_chunk.related_product_id} 指向 product.id）。改完必须重建整个库
+     * 并<b>重新花钱做一遍向量化</b>。
+     *
+     * <p>所以：<b>新方法用新流，老方法一个字节都不动</b>。
+     * 这条「随机流是位置依赖的」的教训记在这里，将来再有人加种子表时，
+     * 请照 {@link #createUserCoupons} 的做法给新流。
+     */
+    private final Random couponRandom = new Random(RANDOM_SEED + 1);
+
     /** 商品编号递增序号，保证唯一 */
     private int productCounter = 0;
 
@@ -515,6 +549,128 @@ public class SeedDataFactory {
         c.setValidTo(OffsetDateTime.now().plusDays(60));
         c.setStatus(1);
         return c;
+    }
+
+    // ============================================================
+    // 用户券（阶段 5.9）
+    // ============================================================
+
+    /** 每张券的失效时间落在「领到手之后 7~52 天」。见 {@link #createUserCoupons} 的说明 */
+    private static final int MIN_VALID_DAYS = 7;
+    private static final int VALID_DAYS_SPAN = 45;
+
+    /** 一个用户最少/最多领几张券。上限 4 是刻意的：工具的输出要在一屏里读得完 */
+    private static final int MIN_COUPONS_PER_USER = 1;
+    private static final int MAX_COUPONS_PER_USER = 4;
+
+    /**
+     * 给每个用户发若干张券。
+     *
+     * <h4>一、为什么必须补这一步</h4>
+     *
+     * <p>{@code user_coupon} 一直是空的 —— 不是因为数据没灌，
+     * 而是因为 {@link SeedRunner} 的插入顺序注释里写了它、
+     * 代码里却从来没有这一步。「我的优惠券」工具在 5.9 之前
+     * <b>无论怎么实现都只会返回「你没有券」</b>。
+     *
+     * <h4>二、★ {@code expired_at} 不看券模板的 {@code valid_to}</h4>
+     *
+     * <p>看起来该取 {@code min(now + N, coupon.validTo)}，但那样会踩一个隐蔽的坑：
+     * 模板的 {@code valid_to} 是 {@code 建库那一刻 + 60 天}。
+     * 而补券发生在<b>建库之后很久</b> —— 那时 {@code validTo} 已经是过去时间，
+     * 于是所有「未使用」的券算出来都是<b>已过期</b>的，
+     * 工具查「可用券」会返回一张早就不能用的券。
+     *
+     * <p>所以这里按真实券系统的语义来：<b>模板的 {@code valid_to} 是「发券窗口」的边界，
+     * 不是「已发到用户手里的券」的失效时间</b>。券发出去之后，
+     * 它的 {@code expired_at} 就只由发放时刻决定 —— 模板下架不影响已经发出去的券。
+     * 数据库上也没有任何约束要求 {@code expired_at <= coupon.valid_to}。
+     *
+     * <h4>三、状态分布，以及它为什么必须是自洽的</h4>
+     *
+     * <p>未使用 70% / 已使用 20% / 已过期 10%。三条约束不能破：
+     * <ul>
+     *   <li>{@code ck_user_coupon_status}：status ∈ (1, 2, 3)</li>
+     *   <li>{@code ck_user_coupon_used_at}：<b>status = 2 必须同时有 used_at 和 order_id；
+     *       status ≠ 2 则 used_at 必须为 NULL</b></li>
+     *   <li>{@code uk_user_coupon}：同一用户不能重复领同一张券模板</li>
+     * </ul>
+     * 第一条和第三条由数据库兜底，第二条靠下面的分支结构保证。
+     *
+     * <p>★ 「已使用」的券必须挂到<b>该用户自己的</b>订单上 —— 不只是外键要求，
+     * 语义上也必须：券是用在某笔订单上的。所以入参要带一个用户 → 订单 id 的映射，
+     * 而没有订单的用户一律发「未使用」的券。
+     *
+     * @param users          用户，用到 {@code id}
+     * @param coupons        券模板，用到 {@code id}
+     * @param orderIdsByUser 每个用户自己的订单 id。<b>缺 key 或空列表</b>表示该用户没有订单，
+     *                       此时不会给他发「已使用」的券
+     */
+    public List<UserCoupon> createUserCoupons(List<AppUser> users, List<Coupon> coupons,
+                                              Map<Long, List<Long>> orderIdsByUser) {
+        List<UserCoupon> out = new ArrayList<>();
+        OffsetDateTime now = OffsetDateTime.now();
+
+        for (AppUser user : users) {
+            int want = MIN_COUPONS_PER_USER
+                    + couponRandom.nextInt(MAX_COUPONS_PER_USER - MIN_COUPONS_PER_USER + 1);
+
+            // ★ 打乱一份【副本】再取前 N 个 —— 这样「同一用户不重复领同一张」
+            //   是构造上成立的，而不是靠事后查重。
+            //   （coupons 本身必须不动：它的顺序是模板的书写顺序，别的方法也会用）
+            List<Coupon> pool = new ArrayList<>(coupons);
+            java.util.Collections.shuffle(pool, couponRandom);
+
+            List<Long> myOrders = orderIdsByUser.getOrDefault(user.getId(), List.of());
+
+            for (int i = 0; i < Math.min(want, pool.size()); i++) {
+                out.add(userCoupon(user, pool.get(i), myOrders, now));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 一张券。
+     *
+     * <p>★ 三条时间线的写法是<b>「先定锚点，再往两边推」</b>，而不是「三个字段各自随机」。
+     * 各自随机的话会产出 {@code used_at} 早于 {@code received_at} 这种自相矛盾的行 ——
+     * 数据库拦不住它（没有这条 CHECK），而工具把它渲染成
+     * 「你在 8 月 1 日使用了 8 月 20 日领的券」，读起来像个 bug，但其实是种子数据的错。
+     */
+    private UserCoupon userCoupon(AppUser user, Coupon coupon, List<Long> myOrders,
+                                  OffsetDateTime now) {
+        UserCoupon uc = new UserCoupon();
+        uc.setUserId(user.getId());
+        uc.setCouponId(coupon.getId());
+
+        // ★ 没有订单就只能是「未使用」—— status=2 需要 order_id，而它是 NOT NULL
+        int roll = myOrders.isEmpty() ? 0 : couponRandom.nextInt(10);
+
+        if (roll < 7) {
+            // 未使用：领券在过去，失效在未来。两个锚点各自定，中间必然夹着 now
+            uc.setStatus(1);
+            uc.setReceivedAt(now.minusDays(1 + couponRandom.nextInt(59)));
+            uc.setExpiredAt(now.plusDays(MIN_VALID_DAYS + couponRandom.nextInt(VALID_DAYS_SPAN)));
+
+        } else if (roll < 9) {
+            // 已使用：领券 → 用掉 → 现在，三段严格递增
+            uc.setStatus(2);
+            OffsetDateTime usedAt = now.minusDays(1 + couponRandom.nextInt(29));
+            uc.setReceivedAt(usedAt.minusDays(1 + couponRandom.nextInt(30)));
+            uc.setUsedAt(usedAt);
+            uc.setOrderId(myOrders.get(couponRandom.nextInt(myOrders.size())));
+            // 用掉之后有效期已无实际意义，给一个晚于 used_at 的自洽值
+            uc.setExpiredAt(usedAt.plusDays(30));
+
+        } else {
+            // 已过期：领券 → 失效 → 现在，三段严格递增
+            uc.setStatus(3);
+            OffsetDateTime expiredAt = now.minusDays(1 + couponRandom.nextInt(14));
+            uc.setReceivedAt(expiredAt.minusDays(30 + couponRandom.nextInt(31)));
+            uc.setExpiredAt(expiredAt);
+        }
+        return uc;
     }
 
     // ============================================================

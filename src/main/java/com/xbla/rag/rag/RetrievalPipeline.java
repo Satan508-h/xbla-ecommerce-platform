@@ -1,10 +1,12 @@
 package com.xbla.rag.rag;
 
 import com.xbla.rag.config.RetrievalProperties;
+import com.xbla.rag.mapper.KbChunkMapper;
 import com.xbla.rag.rag.fuse.RrfFuser;
 import com.xbla.rag.rag.query.QueryPlan;
 import com.xbla.rag.rag.query.QueryPlanner;
 import com.xbla.rag.rag.rerank.ChunkReranker;
+import com.xbla.rag.rag.retrieve.RetrievalOptions;
 import com.xbla.rag.rag.retrieve.RetrievedChunk;
 import com.xbla.rag.rag.retrieve.Retriever;
 import org.slf4j.Logger;
@@ -28,14 +30,17 @@ import java.util.concurrent.TimeoutException;
  *     │
  *     ├─① 查询计划 QueryPlanner（重写 / 子问题拆分，默认关闭）
  *     │
- *     ├─② 并行双路召回 ──┬─ VectorRetriever   （向量化 HTTP + 数据库）
+ *     ├─② 意图定向范围（阶段 5.4）：范围声明 → 值不值得过滤 → 下推 doc_type
+ *     │
+ *     ├─③ 并行双路召回 ──┬─ VectorRetriever   （向量化 HTTP + 数据库）
  *     │                  └─ KeywordRetriever  （数据库）
+ *     │        └─ 过滤后一无所获 → 回落到全池重查【一次】
  *     │
- *     ├─③ RRF 融合 RrfFuser（按名次合并，丢弃分数）
+ *     ├─④ RRF 融合 RrfFuser（按名次合并，丢弃分数）
  *     │
- *     ├─④ 精排 ChunkReranker（bge-reranker-v2-m3，失败回落融合顺序）
+ *     ├─⑤ 精排 ChunkReranker（bge-reranker-v2-m3，失败回落融合顺序）
  *     │
- *     └─⑤ 截断到 finalTopK → 送进 prompt
+ *     └─⑥ 截断到 finalTopK → 送进 prompt
  * </pre>
  *
  * <h2>一、★ 失败语义：单路失败不整体失败</h2>
@@ -80,6 +85,36 @@ import java.util.concurrent.TimeoutException;
  *       所以真正的超时防线是 {@code EmbeddingClient} 自己的
  *       {@code request-timeout: 15s}，本类的等待超时只是最后一道闸。</li>
  * </ol>
+ *
+ * <h2>四、★ 意图定向范围：为什么是「声明」而不是「命令」（阶段 5.4）</h2>
+ *
+ * <p>调用方（{@code ChatServiceImpl}）只把意图树里那个叶子声明的
+ * {@code doc_types} 传进来，<b>要不要真的下推这个条件由本类决定</b>。
+ *
+ * <p>之所以要留这一层，是因为「过滤」这件事在实测里<b>不是单调的</b>：
+ *
+ * <ul>
+ *   <li><b>窄到池子比 top-k 还小时，过滤是有害的</b> ——
+ *       取出来的恒等于全池，「按相关度截断」这个动作消失了。
+ *       实测意图树的 {@code USAGE_GUIDE} 声明 {@code [5]}，全库只有 5 条。</li>
+ *   <li><b>宽到几乎不筛掉任何东西时，过滤是白费的</b> ——
+ *       实测 {@code [1]}/{@code [1,3]}/{@code [1,5]} 的收窄倍数都是 1.0~1.1×。</li>
+ * </ul>
+ *
+ * <p>而<b>该不该过滤这件事只有本类知道</b>：它需要
+ * {@code kb_chunk} 里的实际条数（{@code KbChunkMapper.countByDocTypes}）
+ * 和 {@code vector-top-k} 配置，这两样调用方都没有。
+ *
+ * <p>还有一条更硬的理由：<b>调试探针必须和线上走同一套规则</b>。
+ * 如果让调用方各自判断，{@code /api/debug/kb/retrieve} 看到的
+ * 就不是线上真正跑的东西了 —— 那正是 {@code RetrievalDetailBuilder}
+ * 存在的全部理由。
+ *
+ * <p><b>安全边界</b>：无论过滤怎么决策，本类都<b>不减少</b>调用方拿到的召回量 ——
+ * 过滤只会让候选更集中。实测这一条有保证：20 道评测题里每一题的
+ * gold 切片 {@code doc_type} 都 ⊆ 它所属意图声明的集合
+ * （{@code IntentTreeConsistencyTest}，20/20），
+ * 所以过滤不可能把正确答案挡在外面。
  */
 @Component
 public class RetrievalPipeline {
@@ -102,38 +137,69 @@ public class RetrievalPipeline {
     private final ChunkReranker chunkReranker;
     private final RetrievalProperties properties;
     private final ThreadPoolTaskExecutor retrieveExecutor;
+    private final KbChunkMapper chunkMapper;
 
     public RetrievalPipeline(List<Retriever> retrievers,
                              QueryPlanner queryPlanner,
                              RrfFuser rrfFuser,
                              ChunkReranker chunkReranker,
                              RetrievalProperties properties,
-                             @Qualifier("retrieveExecutor") ThreadPoolTaskExecutor retrieveExecutor) {
+                             @Qualifier("retrieveExecutor") ThreadPoolTaskExecutor retrieveExecutor,
+                             KbChunkMapper chunkMapper) {
         this.retrievers = retrievers;
         this.queryPlanner = queryPlanner;
         this.rrfFuser = rrfFuser;
         this.chunkReranker = chunkReranker;
         this.properties = properties;
         this.retrieveExecutor = retrieveExecutor;
+        this.chunkMapper = chunkMapper;
     }
 
     /**
-     * 执行一次完整检索。
+     * 执行一次完整检索，<b>不做 {@code doc_type} 范围限制</b>。
+     *
+     * <p>等价于 {@code retrieve(question, RetrievalOptions.unfiltered(topK), trace)} ——
+     * 保留这个重载是为了让「不关心范围」的调用方（调试探针、阶段 4 的基线脚本）
+     * 不用自己编一个 topK 出来。
      *
      * @param question 用户原始问题
      * @param trace    轨迹收集器，<b>由调用方创建并传入</b>（同 {@code ModelCallTrace} 的模式）
      * @return 最终送进 prompt 的切片，按相关度降序。<b>可能为空，但不会为 null</b>
      */
     public List<RetrievedChunk> retrieve(String question, RetrievalTrace trace) {
+        RetrievalProperties.Retrieve cfg = properties.getRetrieve();
+        // 这里给的 topK 会在 doRetrieve 里被按路覆盖（向量路和关键词路各有各的），
+        // 传它的意义只是「别是 0」
+        return retrieve(question, RetrievalOptions.unfiltered(cfg.getVectorTopK()), trace);
+    }
+
+    /**
+     * 执行一次完整检索，可限定 {@code doc_type} 范围（阶段 5.4）。
+     *
+     * <p>★ <b>{@code options} 是「声明」而不是「命令」。</b>
+     * 调用方说的是「这个意图的答案可能在 {2,4} 里」，
+     * 至于要不要真的下推这个条件，由 {@link #resolveScope} 决定 ——
+     * 它可能因为池子太小而放弃过滤，也可能在过滤后一无所获时回落到全池。
+     *
+     * <p>为什么这个判断放在这里而不是调用方：<b>调试探针和线上必须走同一套规则</b>。
+     * 调用方各自判断的话，{@code /api/debug/kb/retrieve} 看到的就不是线上跑的东西了。
+     * （同一个理由见 {@code RetrievalDetailBuilder} 的类注释。）
+     *
+     * @param question 用户原始问题
+     * @param options  条数 + 允许的 {@code doc_type} 集合
+     * @param trace    轨迹收集器
+     * @return 最终送进 prompt 的切片。<b>可能为空，但不会为 null</b>
+     */
+    public List<RetrievedChunk> retrieve(String question, RetrievalOptions options, RetrievalTrace trace) {
         long startNanos = System.nanoTime();
         try {
-            return doRetrieve(question, trace);
+            return doRetrieve(question, options, trace);
         } finally {
             trace.retrievalLatencyMs(elapsedMs(startNanos));
         }
     }
 
-    private List<RetrievedChunk> doRetrieve(String question, RetrievalTrace trace) {
+    private List<RetrievedChunk> doRetrieve(String question, RetrievalOptions options, RetrievalTrace trace) {
         if (question == null || question.isBlank()) {
             return List.of();
         }
@@ -151,23 +217,28 @@ public class RetrievalPipeline {
         // 下游一律用加工后的问题；qa_log.question 永远用用户原话
         String query = plan.effectiveQuery();
 
-        // ── ② 并行双路召回 ──────────────────────────────────────
+        // ── ② 意图定向范围（阶段 5.4）────────────────────────────
         RetrievalProperties.Retrieve cfg = properties.getRetrieve();
-        long deadlineNanos = System.nanoTime() + LEG_WAIT_TIMEOUT_MS * 1_000_000L;
+        RetrievalOptions effective = resolveScope(options, cfg, trace);
 
-        List<CompletableFuture<List<RetrievedChunk>>> futures = retrievers.stream()
-                .map(r -> submitLeg(r, query, topKOf(r, cfg), trace))
-                .toList();
+        // ── ③ 并行双路召回 ──────────────────────────────────────
+        runLegs(query, effective, cfg, trace);
 
-        // 按 retrievers 的声明顺序等待。两路是并行跑的，
-        // 所以总等待时间取的是两者的最大值，不是相加
-        for (int i = 0; i < retrievers.size(); i++) {
-            Retriever retriever = retrievers.get(i);
-            List<RetrievedChunk> hits = awaitLeg(futures.get(i), deadlineNanos, retriever.name(), trace);
-            recordHits(retriever.name(), hits, trace);
+        // 过滤之后两路都没召回 → 回落到全池重查一次。
+        // ★ 这一步会【覆盖】trace 里两路的结果，而不是追加 ——
+        //   因为「最终实际发生的检索」就是全池那一次，
+        //   trace 的每一格都必须描述同一件事，否则这个 JSON 不自洽。
+        if (effective.filtered()
+                && trace.vectorHits().isEmpty()
+                && trace.keywordHits().isEmpty()) {
+            trace.event("doc_type_filter_fallback: 过滤后两路都没有召回，改用全池重查");
+            effective = effective.withoutFilter();
+            trace.filter(new RetrievalTrace.FilterScope(options.docTypes(), false,
+                    trace.filter().poolSize(), RetrievalTrace.FilterScope.Reason.EMPTY_RESULT));
+            runLegs(query, effective, cfg, trace);
         }
 
-        // ── ③ RRF 融合 ──────────────────────────────────────────
+        // ── ④ RRF 融合 ──────────────────────────────────────────
         RetrievalProperties.Fuse fuseCfg = properties.getFuse();
         List<RetrievedChunk> fused = rrfFuser.fuse(List.of(
                 new RrfFuser.Leg("vector", fuseCfg.getVectorWeight(), trace.vectorHits()),
@@ -182,7 +253,7 @@ public class RetrievalPipeline {
             return List.of();
         }
 
-        // ── ④ 精排 ──────────────────────────────────────────────
+        // ── ⑤ 精排 ──────────────────────────────────────────────
         RetrievalProperties.Rerank rerankCfg = properties.getRerank();
         int finalTopK = Math.max(1, cfg.getFinalTopK());
 
@@ -204,13 +275,111 @@ public class RetrievalPipeline {
         }
         trace.reranked(reranked);
 
-        // ── ⑤ 截断 ──────────────────────────────────────────────
+        // ── ⑥ 截断 ──────────────────────────────────────────────
         List<RetrievedChunk> finalChunks = List.copyOf(
                 reranked.subList(0, Math.min(reranked.size(), finalTopK)));
         trace.finalChunks(finalChunks);
 
         log.debug("检索完成 {}", trace.summary());
         return finalChunks;
+    }
+
+    // ================================================================
+    // 意图定向范围（阶段 5.4）
+    // ================================================================
+
+    /**
+     * ★ <b>过滤之后候选池还剩多少条，才值得真的下推 {@code doc_type} 条件。</b>
+     *
+     * <p>判据是「池子必须装得下这一路要取的条数」——
+     * 也就是 {@code poolSize >= vector-top-k}。小于这个数有两个独立的坏处：
+     *
+     * <ol>
+     *   <li><b>收益为零。</b>池子只有 5 条而 topK=20 时，取出来的恒等于全池，
+     *       过滤没有筛掉任何东西 —— 它只是把同样的结果换了个说法。</li>
+     *   <li><b>而且有害。</b>「取相似度最高的 K 条」这个截断动作消失了：
+     *       相关度再低的切片也一律进 prompt。实测意图树里
+     *       {@code USAGE_GUIDE} 声明 {@code doc_types: [5]}，而全库
+     *       {@code doc_type=5} 只有 <b>5 条</b> —— 任何「怎么用」的问题
+     *       都会把 5 条说明书切片全部塞进上下文，哪怕用户问的是开机键在哪。</li>
+     * </ol>
+     *
+     * <p><b>为什么用「池子绝对大小」而不是「收窄倍数」</b>：
+     * 实测收窄倍数从 1.1× 到 328× 都有，而倍数越大<b>越</b>危险 ——
+     * 判据的方向和风险的方向正好相反。绝对大小没有这个毛病：
+     * {@code doc_type=[1]}（1.1×，池子 1555）会被这条规则<b>放行</b>
+     * （它无害，只是没用），而 {@code [5]}（328×，池子 5）会被<b>拦下</b>。
+     *
+     * <p>用 {@code vector-top-k} 而不是 {@code keyword-top-k} 做门槛：
+     * 两路默认都是 20，而向量路是「必须先粗召回一批再让重排精排」的那一路，
+     * 对池子大小的要求更高。取更严的那个。
+     */
+    private static boolean worthFiltering(int poolSize, RetrievalProperties.Retrieve cfg) {
+        return poolSize >= cfg.getVectorTopK();
+    }
+
+    /**
+     * 把调用方的「范围声明」解析成「这次实际要下推的条件」，并把决策过程记进 trace。
+     *
+     * <p>四种结局见 {@link RetrievalTrace.FilterScope} 的表。
+     * 本方法只处理前三种，第四种（{@code empty_result}）要到真的召回之后才知道。
+     *
+     * <p>⚠️ 计数查询在<b>提交两路召回之前</b>发出，它在请求线程上串行执行。
+     * 一次 {@code count(*)} 走 {@code idx_kb_chunk_doc_type} 是亚毫秒级，
+     * 换来的是一条能解释清楚的规则 —— 这个交换是划算的。
+     * 真要省掉它，可以缓存「每个 doc_types 集合的池子大小」，
+     * 但缓存失效要挂在入库流程上，那属于阶段 7 的优化。
+     */
+    private RetrievalOptions resolveScope(RetrievalOptions requested,
+                                          RetrievalProperties.Retrieve cfg,
+                                          RetrievalTrace trace) {
+        if (!requested.filtered()) {
+            // 没声明范围。trace 保持初始的 no_declaration，什么都不用做
+            return requested;
+        }
+
+        int poolSize = chunkMapper.countByDocTypes(requested.docTypesLiteral());
+
+        if (!worthFiltering(poolSize, cfg)) {
+            trace.filter(new RetrievalTrace.FilterScope(requested.docTypes(), false,
+                    poolSize, RetrievalTrace.FilterScope.Reason.SMALL_POOL));
+            log.debug("范围过滤跳过：池子 {} 条 < vector-top-k {}，docTypes={}",
+                    poolSize, cfg.getVectorTopK(), requested.docTypes());
+            return requested.withoutFilter();
+        }
+
+        trace.filter(new RetrievalTrace.FilterScope(requested.docTypes(), true,
+                poolSize, RetrievalTrace.FilterScope.Reason.OK));
+        return requested;
+    }
+
+    // ================================================================
+    // 双路召回
+    // ================================================================
+
+    /**
+     * 并行跑两路并把结果写进 trace。
+     *
+     * <p>抽成方法是因为它<b>会被调用两次</b>：正常一次，
+     * 过滤后一无所获时回落到全池再一次（见 {@code doRetrieve}）。
+     * 第二次调用会覆盖 trace 里两路的结果 —— 那是刻意的，
+     * 理由写在那次调用的注释里。
+     */
+    private void runLegs(String query, RetrievalOptions options,
+                         RetrievalProperties.Retrieve cfg, RetrievalTrace trace) {
+        long deadlineNanos = System.nanoTime() + LEG_WAIT_TIMEOUT_MS * 1_000_000L;
+
+        List<CompletableFuture<List<RetrievedChunk>>> futures = retrievers.stream()
+                .map(r -> submitLeg(r, query, new RetrievalOptions(topKOf(r, cfg), options.docTypes()), trace))
+                .toList();
+
+        // 按 retrievers 的声明顺序等待。两路是并行跑的，
+        // 所以总等待时间取的是两者的最大值，不是相加
+        for (int i = 0; i < retrievers.size(); i++) {
+            Retriever retriever = retrievers.get(i);
+            List<RetrievedChunk> hits = awaitLeg(futures.get(i), deadlineNanos, retriever.name(), trace);
+            recordHits(retriever.name(), hits, trace);
+        }
     }
 
     /** 按路名取该路的 topK 配置 */
@@ -239,11 +408,11 @@ public class RetrievalPipeline {
      * 第一个 future 就成了没人等的孤儿任务。
      */
     private CompletableFuture<List<RetrievedChunk>> submitLeg(Retriever retriever, String query,
-                                                              int topK, RetrievalTrace trace) {
+                                                              RetrievalOptions options, RetrievalTrace trace) {
         try {
             return CompletableFuture.supplyAsync(() -> {
                 try {
-                    return retriever.retrieve(query, topK);
+                    return retriever.retrieve(query, options);
                 } catch (Exception e) {
                     // ★ 在这里吞掉异常，让 future 永远不「异常完成」。
                     //   这是下面能安全使用较简化的等待逻辑的前提：

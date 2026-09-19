@@ -78,7 +78,7 @@ public class KeywordRetriever implements Retriever {
     }
 
     @Override
-    public List<RetrievedChunk> retrieve(String query, int topK) {
+    public List<RetrievedChunk> retrieve(String query, RetrievalOptions options) {
         if (query == null || query.isBlank()) {
             return List.of();
         }
@@ -96,12 +96,13 @@ public class KeywordRetriever implements Retriever {
         }
 
         List<RetrievedChunk> hits = chunkMapper
-                .searchByKeyword(searchText.orQuery(), topK)
+                .searchByKeyword(searchText.orQuery(), options.topK(), options.docTypesLiteral())
                 .stream()
                 .map(RetrievedChunk::from)
                 .toList();
 
-        log.debug("关键词召回 topK={} 词元数={} 命中={}", topK, searchText.size(), hits.size());
+        log.debug("关键词召回 topK={} docTypes={} 词元数={} 命中={}",
+                options.topK(), options.docTypesLiteral(), searchText.size(), hits.size());
         return hits;
     }
 }

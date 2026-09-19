@@ -3,7 +3,9 @@ package com.xbla.rag.controller;
 import com.xbla.rag.common.ApiResponse;
 import com.xbla.rag.dto.ChatAskRequest;
 import com.xbla.rag.dto.ChatAskResponse;
+import com.xbla.rag.mcp.protocol.McpProtocol;
 import com.xbla.rag.service.ChatService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -63,8 +65,52 @@ public class ChatController {
      * 由 {@code GlobalExceptionHandler} 统一转成 {@link ApiResponse#fail}。
      */
     @PostMapping("/chat")
-    public ApiResponse<ChatAskResponse> chat(@Valid @RequestBody ChatAskRequest request) {
-        return ApiResponse.ok(chatService.ask(request));
+    public ApiResponse<ChatAskResponse> chat(@Valid @RequestBody ChatAskRequest request,
+                                             HttpServletRequest http) {
+        return ApiResponse.ok(chatService.ask(request, resolveUserId(http)));
+    }
+
+    /**
+     * 从请求头取身份 —— ★ 和 {@code /mcp} 用的是<b>同一个头名</b>。
+     *
+     * <h3>为什么身份走头，不走请求体</h3>
+     *
+     * <p>走 body 的话，同一个身份就有了两个来源（{@code /api/chat} 的 body 字段
+     * 和 {@code /mcp} 的请求头），两边不一致时以谁为准会变成一个新问题 ——
+     * 而那个问题的正确答案永远是「头」，因为头是<b>传输层</b>的，
+     * 请求体是<b>调用方可以随便填</b>的。
+     *
+     * <p>★ 这里是「客户端 → 我们」，{@code McpController} 那边是
+     * 「我们 → 工具服务」。两跳用同一个头名，意味着
+     * {@code ChatServiceImpl} 和 {@code SdkMcpToolGateway} 之间
+     * <b>不需要任何身份转换</b> —— 少一次转换就少一个出错的地方。
+     *
+     * <h3>⚠️ 它的边界</h3>
+     *
+     * <p>和 {@code McpToolContext} 里写的一样：<b>这个头是明文未签名的，不是认证。</b>
+     * 做到的是「身份不进模型的可控范围」，另一半（验证它是真的）属于认证。
+     *
+     * <h3>★ 为什么「没有身份」不是 401</h3>
+     *
+     * <p>因为<b>只有工具那一条路需要身份</b>。知识库问答、意图分类、会话记忆
+     * 都不需要知道你是谁 —— 对它们回 401 会把整个服务变成需要登录的，
+     * 而演示页和现有的每一个 curl 命令都没有带头。
+     *
+     * <p>所以：<b>头可以缺席，缺了只是查不了「我的」东西</b>，
+     * 由 {@code ToolLoop} 在那条路上回一句诚实的说明。
+     * <b>必需的校验放在真正需要它的地方</b>，而不是入口处一刀切。
+     */
+    private static Long resolveUserId(HttpServletRequest http) {
+        String raw = http.getHeader(McpProtocol.HEADER_USER_ID);
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            long value = Long.parseLong(raw.trim());
+            return value > 0 ? value : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     // ============================================================

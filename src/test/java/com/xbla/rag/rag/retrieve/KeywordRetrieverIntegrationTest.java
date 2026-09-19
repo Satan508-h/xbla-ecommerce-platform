@@ -111,7 +111,7 @@ class KeywordRetrieverIntegrationTest {
             Long once = insertTokenizedChunk(0, MARK + " 只出现一次的商品描述内容");
             Long twice = insertTokenizedChunk(1, MARK + " 出现两次，" + MARK + " 又出现了一次");
 
-            List<RetrievedChunk> hits = retriever.retrieve(MARK, 10);
+            List<RetrievedChunk> hits = retriever.retrieve(MARK, RetrievalOptions.unfiltered(10));
 
             assertThat(hits).as("两条都应该被召回").hasSize(2);
             assertThat(hits.get(0).id())
@@ -132,7 +132,7 @@ class KeywordRetrieverIntegrationTest {
                     tokenizer.tokenize(MARK + " 的标题路径测试").tokenText(),
                     "测试文档 > 一级 > 二级");
 
-            RetrievedChunk hit = retriever.retrieve(MARK, 10).get(0);
+            RetrievedChunk hit = retriever.retrieve(MARK, RetrievalOptions.unfiltered(10)).get(0);
 
             assertThat(hit.id()).isEqualTo(id);
             assertThat(hit.documentId()).isEqualTo(documentId);
@@ -147,7 +147,7 @@ class KeywordRetrieverIntegrationTest {
         @DisplayName("中文查询命中中文文档（英文分词器做不到这件事）")
         void chineseQueryMatchesChineseDoc() {
             Long id = insertTokenizedChunk(0, MARK + " 是这四个字组成的标记");
-            assertThat(retriever.retrieve(MARK, 10))
+            assertThat(retriever.retrieve(MARK, RetrievalOptions.unfiltered(10)))
                     .as("整串查询四个字，切出 犇骉/骉鑫/鑫焱 三个 bigram")
                     .extracting(RetrievedChunk::id)
                     .containsExactly(id);
@@ -171,11 +171,11 @@ class KeywordRetrieverIntegrationTest {
             // 如果 Java 侧不短路，这里会得到一个「看起来像查询失败」的空结果，
             // 而调用方无法区分「没匹配」和「查询串是空的」。
             assertThatCode(() -> {
-                assertThat(retriever.retrieve("，。！？", 10)).isEmpty();
-                assertThat(retriever.retrieve("退", 10)).as("单字被分词器丢弃 → 零词元").isEmpty();
-                assertThat(retriever.retrieve("   ", 10)).isEmpty();
-                assertThat(retriever.retrieve("", 10)).isEmpty();
-                assertThat(retriever.retrieve(null, 10)).isEmpty();
+                assertThat(retriever.retrieve("，。！？", RetrievalOptions.unfiltered(10))).isEmpty();
+                assertThat(retriever.retrieve("退", RetrievalOptions.unfiltered(10))).as("单字被分词器丢弃 → 零词元").isEmpty();
+                assertThat(retriever.retrieve("   ", RetrievalOptions.unfiltered(10))).isEmpty();
+                assertThat(retriever.retrieve("", RetrievalOptions.unfiltered(10))).isEmpty();
+                assertThat(retriever.retrieve(null, RetrievalOptions.unfiltered(10))).isEmpty();
             }).as("★ 全程不许抛异常 —— 关键词召回是「尽力而为」的一路，"
                     + "它自己挂掉不该把整次检索带下去").doesNotThrowAnyException();
         }
@@ -189,11 +189,11 @@ class KeywordRetrieverIntegrationTest {
             String emptyQuery = tokenizer.tokenizeQuery("，。！？", 64).orQuery();
             assertThat(emptyQuery).as("分词器确实产出了空查询串").isEmpty();
 
-            assertThatCode(() -> chunkMapper.searchByKeyword(emptyQuery, 10))
+            assertThatCode(() -> chunkMapper.searchByKeyword(emptyQuery, 10, null))
                     .as("真把这个空串发给 PostgreSQL 也不会报错 —— 正因为不报错，"
                             + "它才危险：没有任何信号能区分「没匹配」和「查询串是空的」")
                     .doesNotThrowAnyException();
-            assertThat(chunkMapper.searchByKeyword(emptyQuery, 10))
+            assertThat(chunkMapper.searchByKeyword(emptyQuery, 10, null))
                     .as("它静默返回空结果")
                     .isEmpty();
         }
@@ -215,7 +215,7 @@ class KeywordRetrieverIntegrationTest {
             Long indexed = insertTokenizedChunk(0, content);
             Long notIndexed = insertChunk(1, content, null);   // 模拟「入库忘了写索引」
 
-            List<Long> hitIds = retriever.retrieve(MARK2, 10)
+            List<Long> hitIds = retriever.retrieve(MARK2, RetrievalOptions.unfiltered(10))
                     .stream().map(RetrievedChunk::id).toList();
 
             assertThat(hitIds)
@@ -236,13 +236,13 @@ class KeywordRetrieverIntegrationTest {
             String content = MARK2 + " 补索引前查不到，补索引后能查到";
             Long id = insertChunk(0, content, null);
 
-            assertThat(retriever.retrieve(MARK2, 10))
+            assertThat(retriever.retrieve(MARK2, RetrievalOptions.unfiltered(10)))
                     .as("补之前：查不到")
                     .isEmpty();
 
             chunkMapper.updateSearchText(id, tokenizer.tokenize(content).tokenText());
 
-            assertThat(retriever.retrieve(MARK2, 10))
+            assertThat(retriever.retrieve(MARK2, RetrievalOptions.unfiltered(10)))
                     .as("补之后：立刻能查到 —— 这证明 search_text 是唯一缺的那一环，"
                             + "而不是检索 SQL 有问题")
                     .extracting(RetrievedChunk::id)
@@ -266,8 +266,8 @@ class KeywordRetrieverIntegrationTest {
             Long b = insertTokenizedChunk(1, MARK + " 并列测试");
             Long c = insertTokenizedChunk(2, MARK + " 并列测试");
 
-            List<Long> first = retriever.retrieve(MARK, 10).stream().map(RetrievedChunk::id).toList();
-            List<Long> second = retriever.retrieve(MARK, 10).stream().map(RetrievedChunk::id).toList();
+            List<Long> first = retriever.retrieve(MARK, RetrievalOptions.unfiltered(10)).stream().map(RetrievedChunk::id).toList();
+            List<Long> second = retriever.retrieve(MARK, RetrievalOptions.unfiltered(10)).stream().map(RetrievedChunk::id).toList();
 
             assertThat(first).as("三条都要召回").hasSize(3);
             assertThat(first)
@@ -287,7 +287,7 @@ class KeywordRetrieverIntegrationTest {
             Long mid = insertTokenizedChunk(1, MARK + " 三");
             Long high = insertTokenizedChunk(2, MARK + " 三");
 
-            assertThat(retriever.retrieve(MARK, 10))
+            assertThat(retriever.retrieve(MARK, RetrievalOptions.unfiltered(10)))
                     .extracting(RetrievedChunk::id)
                     .as("id 升序 —— BIGSERIAL 递增，所以插入顺序即 id 顺序")
                     .containsExactly(low, mid, high);
@@ -308,8 +308,8 @@ class KeywordRetrieverIntegrationTest {
             for (int i = 0; i < 6; i++) {
                 insertTokenizedChunk(i, MARK + " 第 " + i + " 条");
             }
-            assertThat(retriever.retrieve(MARK, 3)).hasSize(3);
-            assertThat(retriever.retrieve(MARK, 10)).hasSize(6);
+            assertThat(retriever.retrieve(MARK, RetrievalOptions.unfiltered(3))).hasSize(3);
+            assertThat(retriever.retrieve(MARK, RetrievalOptions.unfiltered(10))).hasSize(6);
         }
     }
 }

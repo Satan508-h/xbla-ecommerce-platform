@@ -188,9 +188,9 @@ public class AsyncConfig {
      *       而且用户本来就在等检索结果，让他早点拿到错误比多等 55 秒更好。</li>
      * </ul>
      *
-     * <p>三个池至此各自自洽：
+     * <p>四个池至此各自自洽：
      * <table border="1">
-     *   <caption>三个线程池的取值逻辑对比</caption>
+     *   <caption>四个线程池的取值逻辑对比</caption>
      *   <tr><th>池</th><th>队列</th><th>拒绝策略</th><th>关闭等待</th><th>一句话理由</th></tr>
      *   <tr><td>{@code sse-}</td><td>16</td><td>Abort</td><td>30s</td>
      *       <td>用户在盯着，宁可快速报错</td></tr>
@@ -198,6 +198,8 @@ public class AsyncConfig {
      *       <td>后台非幂等，宁可慢不可丢</td></tr>
      *   <tr><td>{@code retrieve-}</td><td>64</td><td>Abort</td><td>5s</td>
      *       <td>只读幂等，且调用方就是用户线程</td></tr>
+     *   <tr><td>{@code memory-}</td><td>256</td><td>Abort</td><td>10s</td>
+     *       <td><b>单线程</b>，且可丢可重做</td></tr>
      * </table>
      */
     @Bean("retrieveExecutor")
@@ -211,6 +213,64 @@ public class AsyncConfig {
 
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(5);
+
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * 会话摘要压缩专用线程池（阶段 5.6）。
+     *
+     * <h3>★ 为什么是【单线程】—— 这是它唯一重要的参数</h3>
+     *
+     * <p>不是保守，是<b>正确性要求</b>。
+     *
+     * <p>压缩的一次执行是「读游标 → 调模型 → CAS 推进游标」。
+     * 同一个会话如果有两个这样的执行重叠，两个都会基于<b>同一个旧游标</b>
+     * 去调模型，然后一个 CAS 成功、一个失败 —— 失败的那个白花一次
+     * LLM 调用（钱真的花了）。单线程让同一会话的任务天然串行，
+     * 这个竞态根本不会出现。
+     *
+     * <p>代价是<b>跨会话也被串行化了</b>。当前规模（单机、低并发）完全可以接受：
+     * 一次压缩 1–2 秒，而它<b>只有长会话（&gt; 10 轮）才触发</b>，
+     * 真实数据里绝大多数会话根本到不了那个长度。
+     * 真要并行，第一步是按 {@code sessionId} 哈希分片，而不是简单调大 core。
+     *
+     * <h3>其余参数</h3>
+     * <ul>
+     *   <li>{@code corePoolSize = 1} / {@code maxPoolSize = 1} —— 见上。
+     *       ★ 注意线程池的增长逻辑：<b>核心线程满了先入队，队列满了才扩容</b>。
+     *       所以光把 core 设成 1 是<b>不够</b>的 —— max 也必须锁死，
+     *       否则队列一满它就会扩容，单线程的保证就没了。</li>
+     *
+     *   <li>{@code queueCapacity = 256} —— 比其它三个池都大。
+     *       因为任务的<b>价值密度很低</b>：它只影响「很久以前的记忆」，
+     *       排队几秒毫无感觉。宁可排队，也不要拒绝。</li>
+     *
+     *   <li>{@code AbortPolicy} —— 仍然不用 {@code CallerRunsPolicy}：
+     *       调用方是 {@code sse-} 线程或 Tomcat 请求线程，
+     *       让它们去跑一次 1–2 秒的 LLM 调用正是被反复否决的做法。
+     *       队列满时抛出的异常由 {@code SessionSummarizer} 自己吞掉 ——
+     *       <b>它敢丢任务，因为压缩是自愈的</b>：游标不动，下次连这段一起压。</li>
+     *
+     *   <li>{@code awaitTerminationSeconds = 10} —— 介于 {@code retrieve-}(5s)
+     *       和 {@code ingest-}(60s) 之间。比检索长：压缩是<b>即将完成的</b>
+     *       一次外部调用，掐掉的话这次的钱白花了；比入库短得多：它可重做。</li>
+     * </ul>
+     *
+     * @see com.xbla.rag.agent.memory.SessionSummarizer
+     */
+    @Bean("memoryExecutor")
+    public ThreadPoolTaskExecutor memoryExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(256);
+        executor.setThreadNamePrefix("memory-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(10);
 
         executor.initialize();
         return executor;

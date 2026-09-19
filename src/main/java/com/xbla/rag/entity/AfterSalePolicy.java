@@ -17,9 +17,27 @@ import java.time.OffsetDateTime;
  *   <li>{@code content}（自由文本）→ 阶段 3 会切分向量化进知识库，
  *       回答"我拆封了还能退吗"这类答案藏在正文里的问题</li>
  *   <li>{@code returnDays} / {@code exchangeDays}（结构化字段）→
- *       供 MCP 工具精确查询，"退货政策是几天"直接 SELECT，比向量检索更准更快</li>
+ *       ★★ 由 {@code rag.facts.PolicyFactProvider} 读出来，注入 prompt</li>
  * </ul>
  * 两者服务不同场景，缺一不可。
+ *
+ * <h2>★★ 修正（阶段 5.9，2026-09-20）</h2>
+ *
+ * <p>上面那句原来是「供 <b>MCP 工具</b>精确查询」—— <b>那是意图，不是事实</b>。
+ * 真做的时候才发现路不通：{@code retrieval} 是<b>顶层</b>意图的性质（叶子继承），
+ * 售后服务是 {@code retrieval: KB} —— <b>模型在那个意图下根本拿不到任何工具</b>。
+ *
+ * <p>改成了<b>结构化注入</b>：意图树里 {@code AFTER_SALE.RETURN_EXCHANGE} 声明
+ * {@code structured_facts: POLICY}，知识库路径组装 prompt 时按类目查这张表，
+ * 把天数拼进 system prompt。完整推理见 {@code docs/08} ADR-067。
+ *
+ * <p>★ 只注入 {@code returnDays} / {@code exchangeDays}，
+ * <b>不注入 {@code conditions}</b> —— 后者<b>已经在知识库里</b>
+ * （实测 12 条「附加条件」切片），带进来就是让 prompt 有两份一样的文字。
+ * 而天数在 {@code content} 里是<b>散文</b>
+ * （「自签收之日起 7 天内支持无理由退货，15 天内支持换货」），
+ * 模型从散文里读数字可能把换货的 15 天读成退货的 15 天 ——
+ * <b>而那句话读起来完全通顺</b>。这才是这份硬数据存在的全部价值。
  */
 @Data
 @TableName("after_sale_policy")
