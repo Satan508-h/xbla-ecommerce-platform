@@ -11,7 +11,7 @@
 
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**：有意图路由、多路召回、重排序、会话记忆、MCP 工具调用，以及一套端到端评测体系。
 
-**当前阶段**：阶段 3（RAG 核心 —— 文档入库）
+**当前阶段**：阶段 4（RAG 核心 —— 检索链路）已完成 ✅ 2026-09-19，下一步阶段 5（智能体层）
 **详细路线图**：`docs/10-开发路线图.md`
 
 ---
@@ -37,14 +37,16 @@
 | 优先级 | 供应商 | 用途 | 模型 |
 |---|---|---|---|
 | P0 | DeepSeek 官方 | 对话生成（主力） | `deepseek-flash` |
-| P1 | 硅基流动 | 对话生成（同模型换源） | `deepseek-ai/DeepSeek-V4-Flash` |
-| P2 | 硅基流动 | 对话生成（兜底降级） | `Qwen/Qwen3-8B`（非推理，免费） |
+| P1 | 硅基流动 | 对话生成（同模型换源） | `deepseek-ai/DeepSeek-V3.2` |
+| P2 | 硅基流动 | 对话生成（兜底降级） | `Qwen/Qwen3.5-9B` |
 | — | 硅基流动 | **向量化**（唯一来源） | `BAAI/bge-m3`（1024 维，免费） |
 | — | 硅基流动 | **重排序**（唯一来源） | `BAAI/bge-reranker-v2-m3`（免费） |
 
-> ✅ 上表全部 ID 于 **2026-09-18 经 `GET /v1/models` + 真实调用实测确认**。
-> 当时核实出两处问题：① 原写的「DeepSeek-V4.1-Flash」**不存在**，实际是 `DeepSeek-V4-Flash`；
-> ② `bge-m3` 实测输出确实为 **1024 维**，与建表时的 `vector(1024)` 一致。
+> ✅ 上表全部 ID 于 **2026-09-19 经 `GET /v1/models` 复核确认**（阶段 4 动工前）。
+> 同时核实：`bge-m3` 输出确实为 **1024 维**，与建表时的 `vector(1024)` 一致。
+>
+> ⚠️ 这张表之前滞后于 `application.yml` 的实际配置（P1/P2 写的是旧 ID）。
+> **改模型相关代码前请以 `application.yml` 的 `xbla.llm.models` 为准，并重新拉一次 `/v1/models`。**
 
 > ⚠️ **DeepSeek 官方不提供向量化和重排序能力**，这两项只能用硅基流动。这是双供应商架构的根本原因。
 >
@@ -144,7 +146,7 @@ docker compose exec postgres psql -U xbla -d xbla_rag
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（128 个：EntityMappingTest 回归 + 解析/切分/向量转换的单测）
+# 跑测试（197 个：实体映射回归 + 解析/切分/分词/融合/结构契约的单测）
 ./mvnw test
 ```
 
@@ -237,6 +239,37 @@ python scripts/probe_kb.py status 1
 > 但**分值不会逐位相同** —— 实测向量化接口本身有约 **3e-4** 的漂移
 > （同一问题连续调 6 次出现 2 种结果），这是 GPU 浮点并行归约的固有性质。
 > **别把「检索结果不稳定」当成 bug 去查**，先看 ID 序列是否一致。
+
+### 阶段 4 新增：RAG 检索链路
+
+```bash
+# ★ 完整召回链路的中间输出（验收标准 1 的落点）
+#    返回 vector_hits / keyword_hits / fused / reranked / final_top_k 五段
+python scripts/probe_kb.py retrieve 送长辈合适吗
+
+# ★ 中文分词索引的覆盖率。missing 必须是 0
+curl -s localhost:8080/api/debug/kb/search-text-stats
+
+# ★ 重建 search_text（force=true 是全量重建，换分词器后用）
+curl -s -X POST "localhost:8080/api/debug/kb/reindex?force=true"
+
+# 加载评测集（会重新解析锚点；锚点不唯一会直接报错 —— 这是刻意的）
+curl -s -X POST localhost:8080/api/debug/eval/reload
+
+# ★ 跑基线评测并生成报告（4 个配置对比 + 未命中归因）
+python scripts/eval_baseline.py --out eval_results/baseline-20260919
+```
+
+**关于检索链路的三个要点**
+
+1. **`qa_log.retrieval_detail` 和调试接口是同一个纯函数产出的**
+   （`RetrievalDetailBuilder`），所以「验收看到的中间输出」和「线上真正落库的内容」
+   物理上是同一份，永远不会漂移。
+2. **检索失败不影响问答** —— 退化成没有知识库上下文的裸聊。
+   扫码进 `qa_log` 的 `status=2` **只表示模型链路失败**，
+   检索的问题记在 `retrieval_detail.events` 里。
+3. **`xbla.rag.rewrite.enabled` 默认关闭**（查询重写/子问题拆分）。
+   这是为了让基线干净，阶段 7 的 A/B 有可比性 —— 详见 `docs/06` §4.1。
 
 ### ⚠️ Windows 环境下的两个坑
 

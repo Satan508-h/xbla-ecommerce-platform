@@ -1,10 +1,18 @@
 package com.xbla.rag.controller;
 
+import com.xbla.rag.rag.RetrievalDetailBuilder;
+import com.xbla.rag.rag.RetrievalPipeline;
+import com.xbla.rag.rag.RetrievalTrace;
+import com.xbla.rag.rag.retrieve.RetrievedChunk;
 import com.xbla.rag.rag.retrieve.VectorHit;
 import com.xbla.rag.rag.retrieve.VectorSearcher;
+import com.xbla.rag.rag.tokenize.SearchTextIndexer;
+import com.xbla.rag.rag.tokenize.SearchTextStats;
+import com.xbla.rag.mapper.KbChunkMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -33,7 +41,16 @@ import java.util.Map;
  *   # ★ 稳定性自检：同一个问题查 N 次，逐字节比对结果
  *   curl -s -G localhost:8080/api/debug/kb/stability \
  *        --data-urlencode "q=退货要几天" --data-urlencode "repeat=3"
+ *
+ *   # ★ 中文分词索引的覆盖率（阶段 4）。missing 必须是 0
+ *   curl -s localhost:8080/api/debug/kb/search-text-stats
+ *
+ *   # ★ 重建 search_text。force=true 是全量重建（换分词器后用）
+ *   curl -s -X POST "localhost:8080/api/debug/kb/reindex?force=false"
  * </pre>
+ *
+ * <p>⚠️ <b>中文参数请用 {@code scripts/probe_kb.py}，不要直接用 curl</b> ——
+ * Windows + Git Bash 下有两层编码陷阱，详见该脚本的说明。
  */
 @Slf4j
 @RestController
@@ -50,9 +67,21 @@ public class KbProbeController {
     private static final double SCORE_TOLERANCE = 1e-3;
 
     private final VectorSearcher vectorSearcher;
+    private final SearchTextIndexer searchTextIndexer;
+    private final KbChunkMapper chunkMapper;
+    private final RetrievalPipeline retrievalPipeline;
+    private final RetrievalDetailBuilder detailBuilder;
 
-    public KbProbeController(VectorSearcher vectorSearcher) {
+    public KbProbeController(VectorSearcher vectorSearcher,
+                             SearchTextIndexer searchTextIndexer,
+                             KbChunkMapper chunkMapper,
+                             RetrievalPipeline retrievalPipeline,
+                             RetrievalDetailBuilder detailBuilder) {
         this.vectorSearcher = vectorSearcher;
+        this.searchTextIndexer = searchTextIndexer;
+        this.chunkMapper = chunkMapper;
+        this.retrievalPipeline = retrievalPipeline;
+        this.detailBuilder = detailBuilder;
     }
 
     /**
@@ -211,5 +240,131 @@ public class KbProbeController {
             end = literal.indexOf(',', end + 1);
         }
         return end < 0 ? literal : literal.substring(0, end) + ",…]";
+    }
+
+    // ================================================================
+    // ★ 完整检索链路（阶段 4 · 验收标准 1）
+    // ================================================================
+
+    /**
+     * <b>完整召回链路的中间输出</b> —— 路线图阶段 4 验收标准第 1 条的落点。
+     *
+     * <p>返回的 {@code detail} 就是 {@code qa_log.retrieval_detail} 的内容
+     * （两处调用的是同一个 {@link RetrievalDetailBuilder}），
+     * 所以它不只是「调试信息」，而是<b>线上真正会落库的那份证据</b>。
+     *
+     * <p>五段依次是：
+     * <ol>
+     *   <li>{@code vector_hits} —— 向量路原始召回（余弦相似度）</li>
+     *   <li>{@code keyword_hits} —— 关键词路原始召回（{@code ts_rank}）</li>
+     *   <li>{@code fused} —— RRF 融合后（只看名次，分数与上两段不可比）</li>
+     *   <li>{@code reranked} —— 重排后（bge-reranker 的相关度）</li>
+     *   <li>{@code final_top_k} —— 最终送进 prompt 的切片 ID</li>
+     * </ol>
+     *
+     * <p>另外返回 {@code finalChunks}（带正文），因为「最终喂给大模型的是哪几段话」
+     * 是排查「答案为什么不对」时第一眼要看的东西。
+     *
+     * <p>⚠️ 这个接口会调向量化接口和新版重排接口，<b>每次调用都花钱</b>，
+     * 所以整个类标了 {@code @Profile("local")}。
+     */
+    @GetMapping("/retrieve")
+    public Map<String, Object> retrieve(@RequestParam("q") String question) {
+        RetrievalTrace trace = new RetrievalTrace("probe-" + Long.toHexString(System.nanoTime()));
+
+        long startNanos = System.nanoTime();
+        List<RetrievedChunk> chunks = retrievalPipeline.retrieve(question, trace);
+        long totalMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("question", question);
+        result.put("detail", detailBuilder.build(trace));
+        result.put("latency", Map.of(
+                "retrievalMs", trace.retrievalLatencyMs(),
+                "rerankMs", trace.rerankLatencyMs(),
+                "totalMs", totalMs));
+        result.put("finalChunks", chunks.stream().map(c -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("chunkId", c.id());
+            m.put("documentId", c.documentId());
+            m.put("chunkIndex", c.chunkIndex());
+            m.put("score", c.score());
+            m.put("headingPath", c.headingPath());
+            m.put("preview", c.content() == null ? null : c.content().replace('\n', ' '));
+            return m;
+        }).toList());
+        return result;
+    }
+
+    // ================================================================
+    // search_text 的覆盖率与重建（阶段 4 · 4.2）
+    // ================================================================
+
+    /**
+     * {@code search_text} 覆盖率探针。
+     *
+     * <p><b>为什么这个接口比 {@code /reindex} 更重要</b>
+     *
+     * <p>关键词检索的条件是 {@code search_vector @@ query}，
+     * 而 SQL 里 {@code NULL} 参与布尔运算的结果是 NULL 而不是 false，
+     * 于是 {@code search_text} 为空的切片会被 {@code WHERE} <b>静默排除</b>。
+     *
+     * <p>也就是说：如果有人改了入库代码却忘了写 {@code search_text}，
+     * 症状是「<b>新文档检索不到，老文档一切正常</b>」，而且没有任何报错。
+     * 这个接口把那个静默的故障变成一行数字。
+     *
+     * <p>{@code healthy=true} 表示一条都没漏。
+     */
+    @GetMapping("/search-text-stats")
+    public Map<String, Object> searchTextStats() {
+        SearchTextStats stats = chunkMapper.searchTextStats();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("total", stats.total());
+        result.put("missing", stats.missing());
+        result.put("coverage", stats.total() == 0
+                ? "—（库是空的）"
+                : String.format("%.2f%%", 100.0 * (stats.total() - stats.missing()) / stats.total()));
+        result.put("minTokens", stats.minTokens());
+        result.put("avgTokens", stats.avgTokens());
+        result.put("maxTokens", stats.maxTokens());
+        result.put("healthy", stats.healthy());
+        result.put("note", stats.healthy()
+                ? "所有切片都有分词索引"
+                : "★ 有切片的 search_text 为空，它们会被关键词检索静默排除。"
+                        + "调 POST /api/debug/kb/reindex 回填");
+        return result;
+    }
+
+    /**
+     * 重建 {@code search_text}。
+     *
+     * <p>两个用途：<b>一次性回填</b>（列是新加的，老数据全是 NULL），
+     * 以及<b>换了分词器之后的全量重建</b>（阶段 7 做分词方案 A/B 时要用）。
+     *
+     * <p>逐行 UPDATE、逐条提交，所以中途失败再调一次会从断点继续，
+     * 已经做完的不会重做。
+     *
+     * @param force true = 全量重建（换分词器后用）；
+     *              false = 只补空值（默认，日常回填用）
+     */
+    @PostMapping("/reindex")
+    public Map<String, Object> reindex(
+            @RequestParam(value = "force", required = false, defaultValue = "false") boolean force) {
+        log.info("★ 开始重建 search_text：force={}（{}）", force,
+                force ? "全量重建，换分词器后用" : "只补空值");
+
+        SearchTextIndexer.Result r = force ? searchTextIndexer.reindexAll()
+                : searchTextIndexer.reindexMissing();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("mode", force ? "全量重建" : "只补空值");
+        result.put("processed", r.processed());
+        result.put("batches", r.batches());
+        result.put("emptyTokenized", r.emptyTokenized());
+        result.put("truncated", r.truncated());
+        result.put("elapsedMs", r.elapsedMs());
+        result.put("statsAfter", searchTextStats());
+        return result;
     }
 }

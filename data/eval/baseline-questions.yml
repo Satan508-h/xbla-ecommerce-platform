@@ -1,0 +1,227 @@
+# ============================================================
+# 阶段 4 基线评测集 —— 20 题
+#
+# 构造方式：从真实语料【反向构造】。先看 kb_chunk 里的实际切片，
+# 针对它写一个答案唯一的问题，再把那段话里的一个独有片段作为锚点。
+#
+# ⚠️ 诚实性声明（必须写进评测报告）
+#   这样构造出来的问题比真实用户提问【简单】—— 因为问题是从答案反推的，
+#   用词天然贴近原文。所以本文件算出的召回率【不是】线上真实水平，
+#   只能作为「同一套题、不同配置之间」的相对比较基线。
+#   阶段 7 才会用人工标注的 150 题（含真实用户分布）做正式评测。
+#
+# ------------------------------------------------------------
+# ★ 为什么存「锚点」而不是 chunk_id
+#
+# kb_chunk.id 是 BIGSERIAL，每台机器、每次重灌语料都不一样。
+# 把硬编码的 id 提交进 git，换台机器后 ground truth 就全部失效 ——
+# 而且【不会报错】，只会让 Recall@K 变成 0 或者随机数。
+# 这正是「阶段 7 没法做 A/B 对比」最隐蔽的一种成因。
+#
+# 锚点是那段切片里【独有的一段原文】，加载时用
+#     SELECT id FROM kb_chunk WHERE content LIKE '%锚点%'
+# 解析出来。命中 0 条或 >1 条都【直接抛异常】——
+# 静默取第一条会让基线悄悄漂移，而评测系统最不能犯的错就是「悄悄」。
+#
+# ------------------------------------------------------------
+# category 字段 = 查询形态，【不是】意图
+#   keyword    —— 词典型（「优惠券怎么用」）
+#   model      —— 型号型（「星辰X1 电池」）
+#   colloquial —— 口语句（「这个适合送长辈吗」）
+# 三类查询在两条召回路上的表现本来就不同，基线报告必须按它切片。
+#
+# intent 列固定写 UNCLASSIFIED 作占位 —— 意图树是阶段 5 的事，
+# 阶段 5 定义后一条 UPDATE 就能回填。
+# ============================================================
+
+questions:
+
+  # ---------- 售后政策（8 题）----------
+  - question_no: B-001
+    question: 退货要几天
+    category: colloquial
+    difficulty: 1
+    expected_answer: 审核通过、商品寄回并验收合格后，退款在三个工作日内发起。
+    anchors:
+      - text: 审核通过后，商品寄回并验收合格，退款在三个工作日内发起
+        doc_hint: 售后FAQ
+
+  - question_no: B-002
+    question: 退款多久到账
+    category: keyword
+    difficulty: 1
+    expected_answer: 原路退回。余额支付实时到账，银行卡支付三到十五个工作日。
+    anchors:
+      - text: 原路退回。余额支付实时到账，银行卡支付三到十五个工作日
+        doc_hint: 售后FAQ
+
+  - question_no: B-003
+    question: 拆封了还能退货吗
+    category: colloquial
+    difficulty: 1
+    expected_answer: 普通商品拆封但包装完整的可以退；数码产品激活后不支持无理由退货。
+    anchors:
+      - text: 普通商品拆封但包装完整的可以退
+        doc_hint: 售后FAQ
+
+  - question_no: B-004
+    question: 退货运费谁承担
+    category: keyword
+    difficulty: 1
+    expected_answer: 质量问题由平台承担，无理由退货由用户承担。
+    # ★ 这句话在 3 条切片里都出现：
+    #   18  = 售后FAQ 的对应行（本来想标的）
+    #   59/77 = 售后政策汇编「4.2 寄回与验收」，且那一章被灌了两份（doc 3 和 doc 4）
+    #   三条都能回答这个问题，所以命中文中任意一条都算检索成功。
+    #   实测见 docs/06 的基线报告 —— 这条正好演示了 allow_multiple 的用途
+    allow_multiple: true
+    anchors:
+      - text: 质量问题由平台承担，无理由退货由用户承担
+        doc_hint: 售后FAQ（及售后政策汇编 4.2）
+
+  - question_no: B-005
+    question: 怎么申请售后
+    category: keyword
+    difficulty: 1
+    expected_answer: 在「我的订单」中找到订单，点击「申请售后」填写信息并上传照片。
+    anchors:
+      - text: 在「我的订单」中找到订单，点击「申请售后」填写信息并上传照片
+        doc_hint: 售后FAQ
+
+  - question_no: B-006
+    question: 售后审核要多久
+    category: keyword
+    difficulty: 1
+    expected_answer: 通常在二十四小时内完成审核。
+    anchors:
+      - text: 通常在二十四小时内完成审核
+        doc_hint: 售后FAQ
+
+  - question_no: B-007
+    question: 换货的条件是什么
+    category: keyword
+    difficulty: 2
+    expected_answer: 签收后十五天内出现质量问题，外观完好、配件齐全即可申请换货。
+    anchors:
+      - text: 签收后十五天内出现质量问题，外观完好、配件齐全即可申请换货
+        doc_hint: 售后FAQ
+
+  - question_no: B-008
+    question: 七天无理由退货有什么附加条件
+    category: keyword
+    difficulty: 2
+    expected_answer: 手机、电脑等数码产品拆封激活后不支持；定制类商品不支持。
+    anchors:
+      - text: 手机、电脑等数码产品拆封激活后不支持无理由退货
+        doc_hint: 七天无理由退货政策
+
+  # ---------- 促销政策（4 题）----------
+  - question_no: B-009
+    question: 优惠券怎么用
+    category: keyword
+    difficulty: 1
+    expected_answer: 每笔订单限用一张，不可拆分、不可兑换现金、不可转赠。
+    anchors:
+      - text: 每笔订单限用一张优惠券。优惠券不可拆分使用，不可兑换现金，不可转赠他人
+        doc_hint: 促销活动规则
+
+  - question_no: B-010
+    question: 优惠券过期了怎么办
+    category: keyword
+    difficulty: 1
+    expected_answer: 有效期以券面标注为准，过期后自动失效，不予补发。
+    anchors:
+      - text: 优惠券的有效期以券面标注为准，过期后自动失效，不予补发
+        doc_hint: 促销活动规则
+
+  - question_no: B-011
+    question: 价格保护怎么申请
+    category: keyword
+    difficulty: 2
+    expected_answer: 下单之日起 15 天内同平台降价可申请退差价；需提供降价截图，每笔订单仅可申请一次。
+    anchors:
+      - text: 需提供降价截图；每笔订单仅可申请一次价格保护
+        doc_hint: 价格保护政策
+
+  - question_no: B-012
+    question: 满减活动能和优惠券一起用吗
+    category: keyword
+    difficulty: 2
+    expected_answer: 可以，满减活动可与店铺优惠券叠加，但不与同类满减活动叠加。
+    anchors:
+      - text: 满减活动可以与店铺优惠券叠加使用，但不与同类满减活动叠加
+        doc_hint: 促销活动规则
+
+  # ---------- 发票 / 退款 / 换新 / 物流（4 题）----------
+  - question_no: B-013
+    question: 发票能开纸质的吗
+    category: keyword
+    difficulty: 1
+    expected_answer: 平台默认开具电子发票，可在订单详情页下载；需要纸质发票请在下单时备注。
+    anchors:
+      - text: 平台默认开具电子发票，可在订单详情页下载。如需纸质发票，请在下单时备注
+        doc_hint: 发票与保修凭证说明
+
+  - question_no: B-014
+    question: 退款什么时候到账
+    category: colloquial
+    difficulty: 2
+    expected_answer: 验收通过后 1-3 个工作日原路返回；微信/支付宝通常 24 小时内到账，银行卡 3-7 个工作日。
+    anchors:
+      - text: 微信/支付宝支付通常 24 小时内到账；银行卡支付因银行处理时效不同，可能需要 3-7 个工作日
+        doc_hint: 退款到账时间说明
+
+  - question_no: B-015
+    question: 以旧换新的旧机估价有效期多久
+    category: keyword
+    difficulty: 2
+    expected_answer: 旧机估价在下单后 7 天内有效，逾期需重新估价。
+    anchors:
+      - text: 旧机估价在下单后 7 天内有效，逾期需重新估价
+        doc_hint: 以旧换新服务说明
+
+  - question_no: B-016
+    question: 收到货发现损坏怎么办
+    category: colloquial
+    difficulty: 2
+    expected_answer: 签收时当面验货，外包装破损可拒收并拍照留证；签收后发现损坏需在 24 小时内联系客服并提供开箱视频。
+    anchors:
+      - text: 若签收后发现商品损坏，请在 24 小时内联系客服并提供开箱视频
+        doc_hint: 物流损坏处理流程
+
+  # ---------- 商品导购（4 题）----------
+  - question_no: B-017
+    question: 这个适合送长辈吗
+    category: colloquial
+    difficulty: 1
+    expected_answer: 给长辈挑礼物重点看操作是否简单、字够不够大、售后是否方便。
+    anchors:
+      - text: 给长辈挑选礼物，重点考虑三件事：操作是否简单、字够不够大、售后是否方便
+        doc_hint: 商品导购指南
+
+  - question_no: B-018
+    question: 商务人士选笔记本看什么
+    category: colloquial
+    difficulty: 2
+    expected_answer: 便携性和续航优先；建议 1.3 公斤以内、续航八小时以上，屏幕比例 16:10 更合适。
+    anchors:
+      - text: 笔记本电脑建议选重量在 1.3 公斤以内、续航八小时以上的型号
+        doc_hint: 商品导购指南
+
+  - question_no: B-019
+    question: 学生买平板要注意什么
+    category: colloquial
+    difficulty: 2
+    expected_answer: 平板适合记笔记和看课件，建议选支持手写笔的型号，并留意手写笔是标配还是需要单独购买。
+    anchors:
+      - text: 平板电脑适合记笔记和看课件，建议选支持手写笔的型号
+        doc_hint: 商品导购指南
+
+  - question_no: B-020
+    question: 笔记本处理器后缀 U 和 H 有什么区别
+    category: keyword
+    difficulty: 2
+    expected_answer: U/P 是轻薄本处理器，H 是标压处理器；H 性能更强但更耗电。
+    anchors:
+      - text: H 系列性能更强但更耗电，如果你主要在家或办公室使用
+        doc_hint: 商品导购指南

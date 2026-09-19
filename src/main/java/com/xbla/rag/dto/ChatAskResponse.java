@@ -5,6 +5,7 @@ import com.xbla.rag.client.dto.DegradationEvent;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 
 /**
  * {@code POST /api/chat} 的响应体。
@@ -34,6 +35,17 @@ import java.util.List;
  * @param totalLatencyMs    端到端耗时
  * @param degraded          本次是否发生过降级
  * @param degradationEvents 降级轨迹。没降级时是空列表
+ * @param references        ★ 本次回答引用了哪些知识库切片（阶段 4 新增）。
+ *                          没检索到内容时是 <b>null</b> 而不是空列表 ——
+ *                          和 {@code degradationEvents} 的「空就不返回」约定一致。
+ *
+ *                          <p>每项形如
+ *                          {@code {"no":1,"chunk_id":15,"document_id":2,"score":0.9276,"heading_path":"售后FAQ"}}。
+ *                          {@code no} 对应 prompt 里的 {@code [1]} 引用编号。
+ *
+ *                          <p>加这个字段是<b>追加式</b>变更（向后兼容）——
+ *                          现有调用方不读它不受影响。不加的话，
+ *                          「检索有没有真的接进问答」在前端完全不可见
  */
 public record ChatAskResponse(
 
@@ -47,7 +59,8 @@ public record ChatAskResponse(
         int llmLatencyMs,
         int totalLatencyMs,
         boolean degraded,
-        List<DegradationEvent> degradationEvents
+        List<DegradationEvent> degradationEvents,
+        List<Map<String, Object>> references
 
 ) {
 }

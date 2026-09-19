@@ -13,6 +13,8 @@ import com.xbla.rag.rag.chunk.TextChunk;
 import com.xbla.rag.rag.chunk.TextChunkingOptions;
 import com.xbla.rag.rag.parse.DocumentParser;
 import com.xbla.rag.rag.parse.ParsedDocument;
+import com.xbla.rag.rag.tokenize.CjkTokenizer;
+import com.xbla.rag.rag.tokenize.SearchText;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -80,6 +82,7 @@ public class DocumentIngestWorker {
 
     private final DocumentParser documentParser;
     private final HeadingAwareChunker chunker;
+    private final CjkTokenizer tokenizer;
     private final EmbeddingClient embeddingClient;
     private final KbDocumentMapper documentMapper;
     private final KbChunkMapper chunkMapper;
@@ -87,12 +90,14 @@ public class DocumentIngestWorker {
 
     public DocumentIngestWorker(DocumentParser documentParser,
                                 HeadingAwareChunker chunker,
+                                CjkTokenizer tokenizer,
                                 EmbeddingClient embeddingClient,
                                 KbDocumentMapper documentMapper,
                                 KbChunkMapper chunkMapper,
                                 KbProperties kbProperties) {
         this.documentParser = documentParser;
         this.chunker = chunker;
+        this.tokenizer = tokenizer;
         this.embeddingClient = embeddingClient;
         this.documentMapper = documentMapper;
         this.chunkMapper = chunkMapper;
@@ -277,6 +282,19 @@ public class DocumentIngestWorker {
             //   字符数已经存在 charCount 里（TextChunk），需要时现算也有：
             //   LENGTH(content)。所以 null 不会丢信息
             entity.setEmbedding(vectors.get(index));
+
+            // ★ 关键词召回的倒排索引来源。用和检索时【同一个分词器】，
+            //   两边切分规则不一致的话关键词召回会静默失效 ——
+            //   查询切出的词元和索引里的对不上，一条都命中不了，且不报错。
+            //
+            //   ⚠️ 这里必须用 tokenize（不截断），不是 tokenizeQuery。
+            //   一个 500 字的中文切片有约 499 个 bigram，
+            //   按查询的 64 上限截断会直接毁掉索引。
+            //
+            //   ⚠️ 产出的 SearchText 是【倒排索引项】，不是模型计费的 token。
+            //   绝对不要把它的大小写进 tokenCount（见下方那段注释，以及 ADR-010）。
+            SearchText searchText = tokenizer.tokenize(chunk.content());
+            entity.setSearchText(searchText.tokenText());
 
             // ★ 冗余自文档的四个字段。阶段 5 的意图定向检索靠它们
             //   在向量扫描的同一次索引访问里完成过滤，避免 join 回表

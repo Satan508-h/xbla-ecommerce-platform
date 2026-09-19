@@ -137,4 +137,82 @@ public class AsyncConfig {
         executor.initialize();
         return executor;
     }
+
+    /**
+     * 检索链路专用线程池（阶段 4 新增）。
+     *
+     * <p><b>解决什么问题</b>：一次检索要并行跑两路召回
+     * （向量路 = 一次向量化 HTTP 调用 + 一次数据库查询；关键词路 = 一次数据库查询）。
+     * 串行跑就是两次网络往返相加，并行跑取两者的最大值。
+     * 而这两路都是<b>阻塞</b>操作，必须有线程承接。
+     *
+     * <h3>★ 为什么不用 {@code CompletableFuture.supplyAsync} 的默认池</h3>
+     *
+     * <p>和 {@link #sseExecutor} 同一条理由：不传 executor 会落到
+     * {@code ForkJoinPool.commonPool()}，并行度只有核数-1，
+     * 几个并发的阻塞调用就能让整个 JVM 卡死。
+     *
+     * <h3>★ 为什么不用虚拟线程</h3>
+     *
+     * <p>理由和 {@link #sseExecutor} 完全一致：虚拟线程是<b>无界</b>的，
+     * 没有队列、没有上限，也就没有任何背压。在阶段 6 的 Redis 分布式限流到位之前，
+     * 有界的平台线程池是更稳妥的选择。
+     *
+     * <h3>★ 参数怎么定的 —— max 的真正上限不是线程数，是连接池</h3>
+     *
+     * <ul>
+     *   <li>{@code corePoolSize = 4} —— 稳态约 2 个并发问答 × 2 路 = 4。
+     *       和 {@code ingestExecutor} 的 core=2 同源（都在等外部 HTTP），
+     *       但检索是<b>交互式</b>的：排队直接等于用户多等，所以给 2 倍。</li>
+     *
+     *   <li>{@code maxPoolSize = 16} —— ★ <b>这个值不能随便调大。</b>
+     *       真正的瓶颈在后面：{@code application.yml} 里
+     *       {@code spring.datasource.hikari.maximum-pool-size: 10}。
+     *       两路召回都要查数据库，16 个并发检索任务会同时抢 10 个连接，
+     *       抢不到的会卡在 {@code connection-timeout: 30000}（<b>30 秒</b>）上。
+     *       那比我们自己毫秒级地拒绝要糟得多 —— 用户会看到「检索卡了 30 秒然后失败」。
+     *       所以 max 的实际约束是「连接数的 1.5~2 倍」，不是「想要多少就多少」。</li>
+     *
+     *   <li>{@code queueCapacity = 64} —— 介于 sseExecutor(16) 和 ingestExecutor(200) 之间。
+     *       检索阻塞用户，队列不能太大；但一路召回可能只是几百毫秒，
+     *       也不能小到动不动就拒绝。64 格约等于 32 个并发请求的全部 fan-out。</li>
+     *
+     *   <li>{@code AbortPolicy} —— 调用方是 Tomcat 请求线程（非流式路径）
+     *       或 {@code sse-} 线程（流式路径）。
+     *       <b>不能用 CallerRunsPolicy</b>：那会让它们去跑阻塞的向量化调用 ——
+     *       正是 {@link #sseExecutor} 的注释里明确否决过的做法。</li>
+     *
+     *   <li>{@code awaitTerminationSeconds = 5} —— ★ 和 {@code ingestExecutor}
+     *       的 60 秒<b>刻意相反</b>。检索是<b>只读、幂等、可重跑</b>的，
+     *       掐掉就掐掉了，用户重发一次就行；而入库是<b>非幂等</b>的（写一半会留僵尸文档）。
+     *       而且用户本来就在等检索结果，让他早点拿到错误比多等 55 秒更好。</li>
+     * </ul>
+     *
+     * <p>三个池至此各自自洽：
+     * <table border="1">
+     *   <caption>三个线程池的取值逻辑对比</caption>
+     *   <tr><th>池</th><th>队列</th><th>拒绝策略</th><th>关闭等待</th><th>一句话理由</th></tr>
+     *   <tr><td>{@code sse-}</td><td>16</td><td>Abort</td><td>30s</td>
+     *       <td>用户在盯着，宁可快速报错</td></tr>
+     *   <tr><td>{@code ingest-}</td><td>200</td><td>CallerRuns</td><td>60s</td>
+     *       <td>后台非幂等，宁可慢不可丢</td></tr>
+     *   <tr><td>{@code retrieve-}</td><td>64</td><td>Abort</td><td>5s</td>
+     *       <td>只读幂等，且调用方就是用户线程</td></tr>
+     * </table>
+     */
+    @Bean("retrieveExecutor")
+    public ThreadPoolTaskExecutor retrieveExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(64);
+        executor.setThreadNamePrefix("retrieve-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(5);
+
+        executor.initialize();
+        return executor;
+    }
 }

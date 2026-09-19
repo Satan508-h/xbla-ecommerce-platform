@@ -23,6 +23,7 @@ Windows + Git Bash 下有**两层**中文编码陷阱，直接用 curl 会得到
 用法：
     python scripts/probe_kb.py search 退货要几天
     python scripts/probe_kb.py search 退货要几天 --topk 5
+    python scripts/probe_kb.py retrieve 送长辈合适吗      ← 完整链路的 5 段中间输出
     python scripts/probe_kb.py stability 退货要几天
     python scripts/probe_kb.py status 1
 """
@@ -113,7 +114,52 @@ def cmd_status(args: list) -> int:
     return 0
 
 
-COMMANDS = {"search": cmd_search, "stability": cmd_stability, "status": cmd_status}
+def cmd_retrieve(args: list) -> int:
+    """
+    完整检索链路的中间输出 —— 阶段 4 验收标准 1 的落点。
+
+    这条走的是 /api/debug/kb/retrieve，它会跑完整的
+    「双路召回 → RRF 融合 → 重排 → 截断」，并把每一段的中间结果都打出来。
+    """
+    question = args[0]
+    data = get("/api/debug/kb/retrieve", {"q": question})
+    detail = data["detail"]
+
+    print(f"问题: {data['question']}")
+    print(f"耗时: {data['latency']}")
+    print("-" * 78)
+
+    sections = [
+        ("vector_hits", "① 向量召回（余弦相似度）"),
+        ("keyword_hits", "② 关键词召回（ts_rank）"),
+        ("fused", "③ RRF 融合（只看名次）"),
+        ("reranked", "④ 重排（bge-reranker）"),
+    ]
+    for key, title in sections:
+        items = detail.get(key) or []
+        ids = [next(iter(i.values())) for i in items]
+        print(f"{title}  {len(items)} 条")
+        print(f"   {ids}")
+    print(f"⑤ 最终送进 prompt: {detail.get('final_top_k')}")
+
+    events = detail.get("events")
+    if events:
+        print(f"\n★ 过程事件: {events}")
+
+    print("\n最终切片:")
+    for c in data["finalChunks"]:
+        print(f"  [{c['chunkId']}] 分数={c['score']:.6f}")
+        print(f"       路径: {c['headingPath']}")
+        print(f"       内容: {c['preview']}")
+    return 0
+
+
+COMMANDS = {
+    "search": cmd_search,
+    "retrieve": cmd_retrieve,
+    "stability": cmd_stability,
+    "status": cmd_status,
+}
 
 
 def main() -> int:

@@ -56,6 +56,31 @@ public class KbChunk {
     private Integer tokenCount;
 
     /**
+     * ★ 中文分词后的词元串（空格分隔），关键词召回用的倒排索引来源。
+     *
+     * <p>数据库里还有一列 {@code search_vector}（{@code tsvector} 类型），
+     * 它是<b>生成列</b>：{@code to_tsvector('simple', search_text)}，
+     * GIN 索引建在它上面。<b>本实体不映射那一列</b> ——
+     * 应用只负责写 {@code searchText}，由数据库自动派生。
+     *
+     * <p><b>值由 {@code CjkTokenizer} 产出，不是原文。</b>
+     * 例：{@code '退货要几天'} → {@code '退货 货要 要几 几天'}。
+     * 直接存原文没有用 —— 实测 {@code to_tsvector('simple', '电池容量是5000mAh支持快充')}
+     * 会把整句粘成<b>一个</b>词元，关键词召回等于失效。
+     *
+     * <p>⚠️ <b>本字段和 {@link #tokenCount} 没有任何关系。</b>
+     * 「词元」在这里是<b>倒排索引项</b>，不是模型计费的 token。
+     * {@code tokenCount} 仍然刻意保持 null（ADR-010），
+     * <b>不要把 {@code searchText} 的长度或词元数写进去</b>。
+     *
+     * <p>⚠️ 为 null 或空串的切片会被关键词检索<b>静默排除</b>
+     * （{@code search_vector @@ query} 对 NULL 返回 NULL，不报错）。
+     * 覆盖率由 {@code GET /api/debug/kb/search-text-stats} 监控，
+     * 回填走 {@code POST /api/debug/kb/reindex}。
+     */
+    private String searchText;
+
+    /**
      * ★ 向量列，1024 维（对应 bge-m3 的输出维度）。数据库类型是 {@code vector(1024)}。
      *
      * <p><b>为什么是 {@code float[]} 而不是 {@code String} 或 {@code double[]}？</b>
