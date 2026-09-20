@@ -4,6 +4,7 @@ import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 休伯利安（XBLA）电商导购与售后 RAG 平台 —— 启动类。
@@ -65,6 +66,25 @@ import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
  * LlmProperties 会被扫到。将来配置类变多了也不用回来改这里。
  */
 @ConfigurationPropertiesScan
+/*
+ * @EnableScheduling —— 开启 @Scheduled 支持（阶段 6 新增，本项目第一次用定时任务）。
+ *
+ * 【它做什么】
+ * 注册一个 ScheduledAnnotationBeanPostProcessor，它会去扫所有带 @Scheduled 的方法，
+ * 以及所有实现了 SchedulingConfigurer 的 Bean，把它们排进一个 TaskScheduler。
+ *
+ * 【为什么不挂在 ratelimit 的配置类上】
+ * 它是一个**平台能力**，不是某个模块的私事 —— 和上面的 @MapperScan /
+ * @ConfigurationPropertiesScan 同一性质。挂在 xbla.ratelimit.enabled 下面的话，
+ * 将来任何一个模块想加定时任务，都得先知道「原来调度是被限流模块开着的」，
+ * 而那个关联没有任何道理。
+ *
+ * 【谁真的在用它】
+ * 目前只有 QueueHeartbeat（看门狗续期 + 僵尸清扫），它自己带
+ * @ConditionalOnProperty，所以 xbla.ratelimit.enabled=false 时
+ * 这个开关还在、但一个任务都不会注册，调度器线程也不会被创建。
+ */
+@EnableScheduling
 public class XblaRagApplication {
 
     public static void main(String[] args) {

@@ -11,6 +11,7 @@ import com.xbla.rag.agent.memory.SessionSummarizer;
 import com.xbla.rag.agent.tool.ToolLoop;
 import com.xbla.rag.client.ChatModelRouter;
 import com.xbla.rag.client.ModelCallTrace;
+import com.xbla.rag.common.TraceId;
 import com.xbla.rag.config.AgentProperties;
 import com.xbla.rag.config.RetrievalProperties;
 import com.xbla.rag.rag.RetrievalDetailBuilder;
@@ -31,6 +32,7 @@ import com.xbla.rag.entity.ChatSession;
 import com.xbla.rag.entity.QaLog;
 import com.xbla.rag.service.ChatMessageService;
 import com.xbla.rag.service.ChatService;
+import com.xbla.rag.service.CallContext;
 import com.xbla.rag.service.ChatSessionService;
 import com.xbla.rag.service.QaLogService;
 import lombok.RequiredArgsConstructor;
@@ -42,7 +44,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 /**
  * 问答业务编排的实现。
@@ -375,8 +376,22 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public ChatAskResponse ask(ChatAskRequest request, Long userId) {
+        return ask(request, userId, CallContext.fresh());
+    }
+
+    /**
+     * 非流式问答（阶段 6：带调用上下文）。
+     *
+     * <p>★ 上面那个两参版本只做一件事：造一个「没排队」的上下文然后委托过来。
+     * <b>把它写成「两参 = 三参的特例」，而不是两份平行实现</b> ——
+     * 后者正是 {@link #askStream} 的注释里反复提到的那个坑
+     * （本项目已经因为「两条平行路径改了一条」踩过 ADR-047）。
+     */
+    @Override
+    public ChatAskResponse ask(ChatAskRequest request, Long userId, CallContext ctx) {
         long startNanos = System.nanoTime();
-        String traceId = newTraceId();
+        ctx = ctxOrFresh(ctx);
+        String traceId = ctx.traceId();
 
         ChatSession session = resolveSession(request.sessionNo(), request.question());
 
@@ -412,7 +427,7 @@ public class ChatServiceImpl implements ChatService {
         ClarificationDecider.Decision decision =
                 clarificationDecider.decide(request.question(), intent);
         if (decision.shouldClarify()) {
-            return answerWithClarification(traceId, session, request.question(),
+            return answerWithClarification(ctx, session, request.question(),
                     intent, decision.clarifyText(), startNanos);
         }
 
@@ -439,7 +454,7 @@ public class ChatServiceImpl implements ChatService {
         //      分类失败/关闭时 retrievalOf 返回 null，走原来的检索路径 ——
         //      那等于阶段 5.7 之前的行为，不引入回归。
         if (isToolIntent(intent)) {
-            return answerWithTools(traceId, session, request, memory, intent, userId, startNanos);
+            return answerWithTools(ctx, session, request, memory, intent, userId, startNanos);
         }
 
         // ★ 检索插在【用户消息落库之后】。顺序是有意的：
@@ -463,7 +478,7 @@ public class ChatServiceImpl implements ChatService {
             ChatResponse response = router.chat(modelRequest, trace);
 
             saveAssistantMessage(session.getId(), response, chunks, intent);
-            saveQaLogSuccess(traceId, session, request.question(), trace, retrievalTrace,
+            saveQaLogSuccess(ctx, session, request.question(), trace, retrievalTrace,
                     response, chunks, startNanos, intent);
             touchSession(session);
 
@@ -485,7 +500,7 @@ public class ChatServiceImpl implements ChatService {
             //
             //   ★ 注意这里的 e 【只可能来自模型链路】—— 检索与意图分类的异常
             //     已经被 retrieveSafely / classifySafely 各自吞掉了。混进来会让归因错乱
-            saveQaLogFailure(traceId, session, request.question(), trace, retrievalTrace,
+            saveQaLogFailure(ctx, session, request.question(), trace, retrievalTrace,
                     chunks, e, startNanos, intent);
             touchSession(session);
             throw e;
@@ -549,10 +564,11 @@ public class ChatServiceImpl implements ChatService {
      * （见那个类的注释第二节）。所以下面那个 catch 的语义
      * 「模型失败了」是准确的，不会把工具故障误记成模型故障。
      */
-    private ChatAskResponse answerWithTools(String traceId, ChatSession session,
+    private ChatAskResponse answerWithTools(CallContext ctx, ChatSession session,
                                             ChatAskRequest request, MemoryContext memory,
                                             IntentClassification intent, Long userId,
                                             long startNanos) {
+        String traceId = ctx.traceId();
 
         ModelCallTrace trace = new ModelCallTrace(traceId);
 
@@ -577,7 +593,7 @@ public class ChatServiceImpl implements ChatService {
                     trace);
 
             saveAssistantToolAnswer(session.getId(), result, intent);
-            saveQaLogTool(traceId, session, request.question(), trace, result, startNanos, intent);
+            saveQaLogTool(ctx, session, request.question(), trace, result, startNanos, intent);
             touchSession(session);
 
             // ★ 5.6 的摘要压缩照常触发 —— 工具回答也是会话的一部分，
@@ -592,7 +608,7 @@ public class ChatServiceImpl implements ChatService {
 
         } catch (Exception e) {
             // ★ 只有模型链路失败才会到这里。检索那两列传 null —— 这条路径没检索过
-            saveQaLogFailure(traceId, session, request.question(), trace, null, null,
+            saveQaLogFailure(ctx, session, request.question(), trace, null, null,
                     e, startNanos, intent);
             touchSession(session);
             throw e;
@@ -649,10 +665,10 @@ public class ChatServiceImpl implements ChatService {
      * <p>和 {@link #saveQaLogSuccess} 的唯一区别是多填了一列
      * {@code tool_calls}，以及检索那几列走 {@code null} 的既有语义。
      */
-    private void saveQaLogTool(String traceId, ChatSession session, String question,
+    private void saveQaLogTool(CallContext ctx, ChatSession session, String question,
                                ModelCallTrace trace, ToolLoop.Result result,
                                long startNanos, IntentClassification intent) {
-        QaLog log = baseLog(traceId, session, question, trace, null, null, startNanos, intent);
+        QaLog log = baseLog(ctx, session, question, trace, null, null, startNanos, intent);
         log.setFinalAnswer(result.answer());
         log.setToolCalls(serializeToolCalls(result));
         log.setStatus(QaLog.STATUS_SUCCESS);
@@ -725,8 +741,21 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public void askStream(ChatAskRequest request, ChatStreamSink sink) {
+        askStream(request, sink, CallContext.fresh());
+    }
+
+    /**
+     * 流式问答（阶段 6：带调用上下文）。
+     *
+     * <p>★ 排队层在主调这一个是<b>刻意的</b>：
+     * traceId 在排队开始的那一刻就产生了，一路用到 {@code qa_log.trace_id}。
+     * 见 {@code ChatService#askStream(ChatAskRequest, ChatStreamSink, CallContext)} 的说明。
+     */
+    @Override
+    public void askStream(ChatAskRequest request, ChatStreamSink sink, CallContext ctx) {
         long startNanos = System.nanoTime();
-        String traceId = newTraceId();
+        ctx = ctxOrFresh(ctx);
+        String traceId = ctx.traceId();
 
         ChatSession session = resolveSession(request.sessionNo(), request.question());
 
@@ -762,7 +791,7 @@ public class ChatServiceImpl implements ChatService {
         ClarificationDecider.Decision decision =
                 clarificationDecider.decide(request.question(), intent);
         if (decision.shouldClarify()) {
-            answerStreamWithClarification(traceId, session, request.question(),
+            answerStreamWithClarification(ctx, session, request.question(),
                     intent, decision.clarifyText(), sink, startNanos);
             return;
         }
@@ -808,7 +837,7 @@ public class ChatServiceImpl implements ChatService {
 
             saveAssistantStreamMessage(session.getId(), trace, streamResult, fullAnswer, chunks,
                     intent);
-            saveQaLogStreamSuccess(traceId, session, request.question(), trace, retrievalTrace,
+            saveQaLogStreamSuccess(ctx, session, request.question(), trace, retrievalTrace,
                     streamResult, fullAnswer, chunks, startNanos, intent);
             touchSession(session);
 
@@ -827,7 +856,7 @@ public class ChatServiceImpl implements ChatService {
                     memory.summary());
 
         } catch (Exception e) {
-            saveQaLogFailure(traceId, session, request.question(), trace, retrievalTrace,
+            saveQaLogFailure(ctx, session, request.question(), trace, retrievalTrace,
                     chunks, e, startNanos, intent);
             touchSession(session);
 
@@ -861,11 +890,12 @@ public class ChatServiceImpl implements ChatService {
      *
      * <p>调用方靠 {@code intent = "NEEDS_CLARIFICATION"} 认出这是一次反问。
      */
-    private ChatAskResponse answerWithClarification(String traceId, ChatSession session,
+    private ChatAskResponse answerWithClarification(CallContext ctx, ChatSession session,
                                                     String question, IntentClassification intent,
                                                     String clarifyText, long startNanos) {
+        String traceId = ctx.traceId();
         saveAssistantClarification(session.getId(), clarifyText, intent);
-        saveQaLogClarification(traceId, session, question, intent, clarifyText, startNanos);
+        saveQaLogClarification(ctx, session, question, intent, clarifyText, startNanos);
         touchSession(session);
 
         log.info("澄清反问（非流式）traceId={} intent={}", traceId, intentCode(intent));
@@ -893,9 +923,10 @@ public class ChatServiceImpl implements ChatService {
      *
      * @see #answerWithClarification 关于响应体里那些 null 的说明
      */
-    private void answerStreamWithClarification(String traceId, ChatSession session, String question,
+    private void answerStreamWithClarification(CallContext ctx, ChatSession session, String question,
                                                IntentClassification intent, String clarifyText,
                                                ChatStreamSink sink, long startNanos) {
+        String traceId = ctx.traceId();
         try {
             sink.onDelta(clarifyText);
             sink.onComplete(new ChatAskResponse(
@@ -910,7 +941,7 @@ public class ChatServiceImpl implements ChatService {
             sink.onError(userFacingMessage(e), traceId);
         } finally {
             saveAssistantClarification(session.getId(), clarifyText, intent);
-            saveQaLogClarification(traceId, session, question, intent, clarifyText, startNanos);
+            saveQaLogClarification(ctx, session, question, intent, clarifyText, startNanos);
             touchSession(session);
         }
     }
@@ -943,14 +974,14 @@ public class ChatServiceImpl implements ChatService {
      * <p>{@code retrieval_detail} 会是 {@code null}（没检索），
      * 这本身就是一条信息：「这一次没有走检索链路」。
      */
-    private void saveQaLogClarification(String traceId, ChatSession session, String question,
+    private void saveQaLogClarification(CallContext ctx, ChatSession session, String question,
                                         IntentClassification intent, String clarifyText,
                                         long startNanos) {
         // ★ retrievalTrace 传【null】而不是空对象 —— 语义是「没有发生检索」，
         //   于是几个检索列一起写 NULL。传空对象会得到一份和
         //   「检索跑了但什么都没召回」逐字相同的 JSON，两者分不开。
         //   ModelCallTrace 同样传 null，理由一样（没有生成调用）。
-        QaLog log = baseLog(traceId, session, question,
+        QaLog log = baseLog(ctx, session, question,
                 null, null, List.of(), startNanos, intent);
         log.setStatus(QaLog.STATUS_CLARIFY);
         // ★ final_answer 存的是【反问句】。阶段 7 必须靠 status 把它筛掉，
@@ -983,7 +1014,10 @@ public class ChatServiceImpl implements ChatService {
 
         ChatSession session = new ChatSession();
         session.setSessionNo(sessionNo != null && !sessionNo.isBlank()
-                ? sessionNo : newTraceId());
+                // ★ 会话号复用同一个生成器：它和 traceId 一样是「一段不可猜测的随机串」，
+                //   没有理由为它再写一份 UUID 处理。★ 但两者【语义不同】——
+                //   一个标识会话，一个标识这一次请求，别把它们当成同一个东西。
+                ? sessionNo : TraceId.newId());
         session.setUserId(null);            // 阶段 2 还没有登录体系，支持匿名会话
         session.setTitle(truncateTitle(question));
         session.setMessageCount(0);
@@ -1094,23 +1128,23 @@ public class ChatServiceImpl implements ChatService {
     // qa_log 落库 ★ 项目最重要的表
     // ============================================================
 
-    private void saveQaLogSuccess(String traceId, ChatSession session, String question,
+    private void saveQaLogSuccess(CallContext ctx, ChatSession session, String question,
                                   ModelCallTrace trace, RetrievalTrace retrievalTrace,
                                   ChatResponse response, List<RetrievedChunk> chunks,
                                   long startNanos, IntentClassification intent) {
-        QaLog log = baseLog(traceId, session, question, trace, retrievalTrace, chunks,
+        QaLog log = baseLog(ctx, session, question, trace, retrievalTrace, chunks,
                 startNanos, intent);
         log.setFinalAnswer(response.content());
         log.setStatus(QaLog.STATUS_SUCCESS);
         writeQaLog(log);
     }
 
-    private void saveQaLogStreamSuccess(String traceId, ChatSession session, String question,
+    private void saveQaLogStreamSuccess(CallContext ctx, ChatSession session, String question,
                                         ModelCallTrace trace, RetrievalTrace retrievalTrace,
                                         StreamResult streamResult,
                                         String fullAnswer, List<RetrievedChunk> chunks,
                                         long startNanos, IntentClassification intent) {
-        QaLog entity = baseLog(traceId, session, question, trace, retrievalTrace, chunks,
+        QaLog entity = baseLog(ctx, session, question, trace, retrievalTrace, chunks,
                 startNanos, intent);
         entity.setStatus(QaLog.STATUS_SUCCESS);
         // ★ 完整回答已经由 askStream 累积好了，这里落库。
@@ -1119,7 +1153,7 @@ public class ChatServiceImpl implements ChatService {
         writeQaLog(entity);
     }
 
-    private void saveQaLogFailure(String traceId, ChatSession session, String question,
+    private void saveQaLogFailure(CallContext ctx, ChatSession session, String question,
                                   ModelCallTrace trace, RetrievalTrace retrievalTrace,
                                   List<RetrievedChunk> chunks, Exception e, long startNanos,
                                   IntentClassification intent) {
@@ -1127,7 +1161,7 @@ public class ChatServiceImpl implements ChatService {
         //   这正是 V5 里 retrieval_detail 那列注释要回答的问题：
         //   「召回失败是因为向量检索没找到，还是重排排错了，还是切分粒度不对」
         //   —— 只在成功时记，就永远回答不了它
-        QaLog log = baseLog(traceId, session, question, trace, retrievalTrace, chunks,
+        QaLog log = baseLog(ctx, session, question, trace, retrievalTrace, chunks,
                 startNanos, intent);
         log.setStatus(QaLog.STATUS_FAILED);
         log.setErrorMsg(truncate(e.getMessage(), 1000));
@@ -1141,12 +1175,28 @@ public class ChatServiceImpl implements ChatService {
      * 都按同样的规则填写 —— 否则阶段 7 做统计时会出现
      * 「成功的有成本、失败的没成本」这种难以解释的偏差。
      */
-    private QaLog baseLog(String traceId, ChatSession session, String question,
+    private QaLog baseLog(CallContext ctx, ChatSession session, String question,
                           ModelCallTrace trace, RetrievalTrace retrievalTrace,
                           List<RetrievedChunk> chunks, long startNanos,
                           IntentClassification intent) {
         QaLog log = new QaLog();
-        log.setTraceId(traceId);
+        log.setTraceId(ctx.traceId());
+
+        // ★★ 排队两列（V9 新增）—— 【在这里填，不在各条路径上填】。
+        //
+        //   这是本方法存在的同一个理由：成功、失败、工具、澄清、
+        //   以及未来任何一条新路径，都从这里经过。把这两行写在别处的话，
+        //   每加一条路径就多一次「忘了填」的机会 —— 而漏填的症状是
+        //   那一列恒为 NULL，从数据上完全看不出来。
+        //   （本项目为「两条平行路径漏改一条」已经踩过 ADR-047。）
+        //
+        //   ⚠️ ctx.queueMs() 为 null 是【常态】而不是异常：绝大多数请求
+        //      名额够用、根本没排队。写成 `queueMs == null ? 0 : queueMs`
+        //      会把「平均等多久」稀释到接近 0，看起来像排队功能没生效。
+        //      见 CallContext 类注释第二节。
+        log.setQueueMs(ctx.queueMs());
+        log.setQueuePosition(ctx.queuePosition());
+
         log.setSessionId(session.getId());
         log.setUserId(session.getUserId());
         log.setQuestion(question);
@@ -1371,7 +1421,21 @@ public class ChatServiceImpl implements ChatService {
         return (int) ((System.nanoTime() - startNanos) / 1_000_000L);
     }
 
-    private static String newTraceId() {
-        return UUID.randomUUID().toString().replace("-", "");
+    /**
+     * 上下文缺失或 traceId 为空时，回落到一个「没排队」的新上下文。
+     *
+     * <p>★ <b>不抛异常</b>：它是观测数据，不该因为调用方忘了传
+     * 而让用户的问答失败。这个取舍和「检索失败不影响问答」是同一条 ——
+     * <b>旁路信息缺失时，主流程该继续跑，而不是停下来。</b>
+     *
+     * <p>⚠️ 回落出来的上下文里排队两列是 <b>null 而不是 0</b>：
+     * 我们确实不知道它排没排过队，而「不知道」和「没排队」在这里
+     * 恰好是同一个意思 —— 两者都不该被算进「平均等了多久」。
+     */
+    private static CallContext ctxOrFresh(CallContext ctx) {
+        if (ctx == null || ctx.traceId() == null || ctx.traceId().isBlank()) {
+            return CallContext.fresh();
+        }
+        return ctx;
     }
 }

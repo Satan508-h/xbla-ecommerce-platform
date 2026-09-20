@@ -34,7 +34,22 @@ import java.util.concurrent.ThreadPoolExecutor;
 public class AsyncConfig {
 
     /**
-     * SSE 流式推送专用线程池。
+     * <b>「拿到名额之后跑回答」的线程池</b> —— 两条问答路径共用。
+     *
+     * <h3>★ 它在阶段 6 之前的名字是 {@code sseExecutor}</h3>
+     *
+     * <p>那时候只有流式一条路用它，名字是对的。阶段 6.7 让非流式
+     * {@code POST /api/chat} 也走同一批 Redis 名额 —— 而<b>名额只保证「拿到」，
+     * 不保证「在哪跑」</b>，所以拿到之后那条路也得有一个「不占 Tomcat 线程」的地方跑。
+     * 那个地方就是这个池。
+     *
+     * <p>★ 改名的理由不是洁癖：如果它继续叫 {@code sseExecutor}，
+     * 下一个要加异步问答路径的人会认为「非流式的活不该在这里跑」，
+     * 于是<b>另建一个池</b> —— 而那一建，{@code permits = 8} 就不再等于真正的并发数了，
+     * 因为两个池各有各的 8 个线程。这个错误不会报错，只会让限流悄悄失效。
+     *
+     * <p>⚠️ 线程名前缀也跟着从 {@code sse-} 变成了 {@code answer-}，
+     * 所以在日志和 jstack 里看到的是新名字。
      *
      * <p><b>参数怎么定的</b>：
      * <ul>
@@ -64,13 +79,13 @@ public class AsyncConfig {
      *
      * <p>这个取舍已记录在 {@code docs/08-技术决策记录(ADR).md}。
      */
-    @Bean("sseExecutor")
-    public ThreadPoolTaskExecutor sseExecutor() {
+    @Bean("answerExecutor")
+    public ThreadPoolTaskExecutor answerExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(8);
         executor.setMaxPoolSize(32);
         executor.setQueueCapacity(16);
-        executor.setThreadNamePrefix("sse-");
+        executor.setThreadNamePrefix("answer-");
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
 
         // 关闭时等待正在跑的流式任务结束，避免把用户晾在半截
@@ -91,7 +106,7 @@ public class AsyncConfig {
      * 所以上传接口立刻返回 {@code docId}，真正的活在后台线程里跑，
      * 前端轮询 {@code kb_document.status} 看进度。
      *
-     * <p><b>参数和 sseExecutor 完全不同，这是有意的</b>：
+     * <p><b>参数和 answerExecutor 完全不同，这是有意的</b>：
      * <ul>
      *   <li>{@code corePoolSize = 2} / {@code maxPoolSize = 4} —— <b>故意开得很少</b>。
      *       入库的瓶颈不在我们的 CPU，而在<b>对方的限流阈值</b>。
@@ -108,7 +123,7 @@ public class AsyncConfig {
      *       对后台任务来说，「变慢」远好于 {@code AbortPolicy} 的「丢失任务」。</li>
      * </ul>
      *
-     * <p><b>为什么不能复用 sseExecutor</b>：两者的取值逻辑是相反的
+     * <p><b>为什么不能复用 answerExecutor</b>：两者的取值逻辑是相反的
      * （一个要队列小、要快速拒绝；一个要队列大、要慢慢排队）。
      * 混用会让任何一边的行为变得无法解释 —— 而且入库任务把 SSE 的
      * 16 格队列占满，用户就能明显感觉到「聊天变卡了」。
@@ -148,13 +163,13 @@ public class AsyncConfig {
      *
      * <h3>★ 为什么不用 {@code CompletableFuture.supplyAsync} 的默认池</h3>
      *
-     * <p>和 {@link #sseExecutor} 同一条理由：不传 executor 会落到
+     * <p>和 {@link #answerExecutor} 同一条理由：不传 executor 会落到
      * {@code ForkJoinPool.commonPool()}，并行度只有核数-1，
      * 几个并发的阻塞调用就能让整个 JVM 卡死。
      *
      * <h3>★ 为什么不用虚拟线程</h3>
      *
-     * <p>理由和 {@link #sseExecutor} 完全一致：虚拟线程是<b>无界</b>的，
+     * <p>理由和 {@link #answerExecutor} 完全一致：虚拟线程是<b>无界</b>的，
      * 没有队列、没有上限，也就没有任何背压。在阶段 6 的 Redis 分布式限流到位之前，
      * 有界的平台线程池是更稳妥的选择。
      *
@@ -173,14 +188,14 @@ public class AsyncConfig {
      *       那比我们自己毫秒级地拒绝要糟得多 —— 用户会看到「检索卡了 30 秒然后失败」。
      *       所以 max 的实际约束是「连接数的 1.5~2 倍」，不是「想要多少就多少」。</li>
      *
-     *   <li>{@code queueCapacity = 64} —— 介于 sseExecutor(16) 和 ingestExecutor(200) 之间。
+     *   <li>{@code queueCapacity = 64} —— 介于 answerExecutor(16) 和 ingestExecutor(200) 之间。
      *       检索阻塞用户，队列不能太大；但一路召回可能只是几百毫秒，
      *       也不能小到动不动就拒绝。64 格约等于 32 个并发请求的全部 fan-out。</li>
      *
      *   <li>{@code AbortPolicy} —— 调用方是 Tomcat 请求线程（非流式路径）
-     *       或 {@code sse-} 线程（流式路径）。
+     *       或 {@code answer-} 线程（流式路径）。
      *       <b>不能用 CallerRunsPolicy</b>：那会让它们去跑阻塞的向量化调用 ——
-     *       正是 {@link #sseExecutor} 的注释里明确否决过的做法。</li>
+     *       正是 {@link #answerExecutor} 的注释里明确否决过的做法。</li>
      *
      *   <li>{@code awaitTerminationSeconds = 5} —— ★ 和 {@code ingestExecutor}
      *       的 60 秒<b>刻意相反</b>。检索是<b>只读、幂等、可重跑</b>的，
@@ -192,7 +207,7 @@ public class AsyncConfig {
      * <table border="1">
      *   <caption>四个线程池的取值逻辑对比</caption>
      *   <tr><th>池</th><th>队列</th><th>拒绝策略</th><th>关闭等待</th><th>一句话理由</th></tr>
-     *   <tr><td>{@code sse-}</td><td>16</td><td>Abort</td><td>30s</td>
+     *   <tr><td>{@code answer-}</td><td>16</td><td>Abort</td><td>30s</td>
      *       <td>用户在盯着，宁可快速报错</td></tr>
      *   <tr><td>{@code ingest-}</td><td>200</td><td>CallerRuns</td><td>60s</td>
      *       <td>后台非幂等，宁可慢不可丢</td></tr>
@@ -248,7 +263,7 @@ public class AsyncConfig {
      *       排队几秒毫无感觉。宁可排队，也不要拒绝。</li>
      *
      *   <li>{@code AbortPolicy} —— 仍然不用 {@code CallerRunsPolicy}：
-     *       调用方是 {@code sse-} 线程或 Tomcat 请求线程，
+     *       调用方是 {@code answer-} 线程或 Tomcat 请求线程，
      *       让它们去跑一次 1–2 秒的 LLM 调用正是被反复否决的做法。
      *       队列满时抛出的异常由 {@code SessionSummarizer} 自己吞掉 ——
      *       <b>它敢丢任务，因为压缩是自愈的</b>：游标不动，下次连这段一起压。</li>
@@ -271,6 +286,99 @@ public class AsyncConfig {
 
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(10);
+
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * 排队等待专用线程池（阶段 6 新增） —— <b>它的存在是为了「可见的等待」</b>。
+     *
+     * <h3>★★ 为什么不能用 {@link #answerExecutor}</h3>
+     *
+     * <p>{@code answerExecutor} 是 core=8 / max=32 / queue=16，<b>最多只接得住 48 个请求</b>，
+     * 第 49 个直接抛 {@code TaskRejectedException}。
+     * 而阶段 6 的验收标准是「压测 100 并发，确认排队生效」——
+     * 如果等待占住 answer- 线程，100 并发里会有<b>一半直接失败</b>，
+     * 而那正好和阶段 6 的全部目的（<b>有序等待，而不是随机失败</b>）相反。
+     *
+     * <h3>★★★ {@code queueCapacity = 0} 是这里唯一不能改的参数</h3>
+     *
+     * <pre>
+     *   queueCapacity &gt; 0  →  等待中的任务会静静地躺在【执行器自己的队列】里，
+     *                         【没有任何线程在跑它们】→ 没人能推 SSE 位置
+     *                         → 用户看到的是一个空白页面
+     *   queueCapacity = 0  →  走 SynchronousQueue，任务立刻拿到线程
+     * </pre>
+     *
+     * <p>而「空白页面」正是 {@link #answerExecutor} 那段注释里明确否决过的东西：
+     * <i>「排队的请求在用户那边就是『一个空白页面』，没有任何反馈」</i>。
+     * 阶段 6 之所以敢反过来做，就是因为我们<b>能推位置</b>了 ——
+     * 而 {@code queueCapacity} 一改，这个能力就没了，<b>且不会有任何报错</b>：
+     * 应用照常启动、日志一切正常，只是用户对着白屏等。
+     *
+     * <p>★ 所以它写死在这里，<b>不出现在 {@code application.yml} 里</b>
+     * （同 {@code RateLimitProperties.QueuePool} 的说明）：
+     * 一个「改了会静默破坏功能」的参数，不该给出配置项。
+     *
+     * <h3>参数</h3>
+     * <ul>
+     *   <li>{@code maxPoolSize = 128}（可配）—— ★ <b>它才是真正的
+     *       「这台机器最多允许多少人在等」</b>。超过就抛
+     *       {@code TaskRejectedException}，由 {@code ChatController} 捕获后
+     *       发一个 {@code failed} 事件。<b>不能让它落到兜底的 500 JSON</b> ——
+     *       那时 SSE 响应还没提交，用户会收到一个和流式协议无关的错误。</li>
+     *
+     *   <li>{@code corePoolSize = 32}（可配）—— 因为队列是 0，它实际只表示
+     *       「不回收的常驻线程数」。线程池的增长逻辑是<b>核心满了先入队、
+     *       队列满了才扩容</b>，而这里队列容量是 0，所以会一路扩到 max。</li>
+     *
+     *   <li>{@code AbortPolicy} —— 和 {@code memoryExecutor} / {@code retrieveExecutor}
+     *       一致。不能用 {@code CallerRunsPolicy}：那会让 <b>Tomcat 请求线程</b>
+     *       去跑整个等待循环（最多 120 秒），把 Web 容器自己拖垮。</li>
+     *
+     *   <li>{@code awaitTerminationSeconds = 5} —— 等待中的 <b>sink 已经断了</b>，
+     *       掐掉就掐掉了。而且这些线程只在 sleep，没有任何未完成的副作用。</li>
+     * </ul>
+     *
+     * <p>★ 参数放在 {@code RateLimitProperties.QueuePool} 下，和
+     * {@code ingestExecutor} 的参数放 {@code KbProperties.Ingest} 是同一个做法。
+     *
+     * <h3>五个池至此的分工</h3>
+     * <table border="1">
+     *   <caption>线程池取值逻辑</caption>
+     *   <tr><th>池</th><th>队列</th><th>拒绝</th><th>关闭等待</th><th>一句话理由</th></tr>
+     *   <tr><td>{@code answer-}</td><td>16</td><td>Abort</td><td>30s</td>
+     *       <td>用户在盯着，宁可快速报错</td></tr>
+     *   <tr><td>{@code ingest-}</td><td>200</td><td>CallerRuns</td><td>60s</td>
+     *       <td>后台非幂等，宁可慢不可丢</td></tr>
+     *   <tr><td>{@code retrieve-}</td><td>64</td><td>Abort</td><td>5s</td>
+     *       <td>只读幂等，且调用方就是用户线程</td></tr>
+     *   <tr><td>{@code memory-}</td><td>256</td><td>Abort</td><td>10s</td>
+     *       <td><b>单线程</b>，且可丢可重做</td></tr>
+     *   <tr><td><b>{@code queue-}</b></td><td><b>0</b></td><td>Abort</td><td>5s</td>
+     *       <td><b>队列必须是 0</b>，否则等待中的请求没有线程能推位置</td></tr>
+     * </table>
+     *
+     * @see RateLimitProperties.QueuePool 参数在这里可调
+     * @see com.xbla.rag.ratelimit.ChatAdmissionService 用它的地方
+     */
+    @Bean("queueExecutor")
+    public ThreadPoolTaskExecutor queueExecutor(RateLimitProperties rateLimitProperties) {
+        RateLimitProperties.QueuePool props = rateLimitProperties.getQueuePool();
+
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(props.getCorePoolSize());
+        executor.setMaxPoolSize(props.getMaxPoolSize());
+
+        // ★★★ 写死 0，不给配置项 —— 理由见上面那段。见 RateLimitProperties.QueuePool。
+        executor.setQueueCapacity(0);
+
+        executor.setThreadNamePrefix("queue-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(5);
 
         executor.initialize();
         return executor;

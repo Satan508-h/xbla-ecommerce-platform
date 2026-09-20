@@ -122,8 +122,44 @@ public class QaLog {
      */
     private String toolCalls;
 
+    /**
+     * 排队等待毫秒数（阶段 6）。
+     *
+     * <p>★★ <b>{@code NULL} 表示「没排队」，不是 0。</b>
+     * 「没排队」和「排队等了 0 毫秒」在语义上是一回事，
+     * 但在<b>统计上不是</b> —— 把没排队算成 0，会让「开了排队之后平均多等多久」
+     * 这个问题的答案被往下拉；更要紧的是，
+     * 「没开排队」和「开了但没排队」会变得无法区分。
+     *
+     * <p>★ 它和 {@link #totalLatencyMs} 的关系是<b>相加</b>：
+     * <pre>
+     *   total_latency_ms = queue_ms + （检索 + 重排 + 生成）
+     * </pre>
+     * 从阶段 6 起只记 total 就再也拆不开这两段了，而它们的优化方向相反：
+     * 排队久是容量问题，剩下的久是检索/模型问题。
+     *
+     * <p>⚠️ 排队期不调模型，所以它<b>不计入 cost</b>。
+     */
+    private Integer queueMs;
+
+    /**
+     * 刚入队时「前面还有几个人」（阶段 6）。0-based，队首是 0。
+     *
+     * <p>★★ <b>必须在【入队那一刻】取，不能在拿到名额时取</b> ——
+     * 后者恒为 0（轮到你时你必然是队首）。
+     * 一整列 0 看起来像数据、有类型有值，<b>但不携带任何信息</b>，
+     * 而那比 NULL 危险：它不像缺失，像是「所有人都没排队」。
+     *
+     * <p>★ 它和 {@link #queueMs} 一起才能区分两种「等了 30 秒」：
+     * <pre>
+     *   前面 1 个人，每人 30 秒    →  下游慢
+     *   前面 50 个人，每人 0.6 秒  →  并发上限太小
+     * </pre>
+     */
+    private Integer queuePosition;
+
     // ================================================================
-    // status 的三个取值（与 V5 / V7 的 CHECK 约束一致）
+    // status 的四个取值（与 V5 / V7 / V9 的 CHECK 约束一致）
     //
     // ★ 用常量而不是裸数字：这三个值决定阶段 7 能不能正确地筛出
     //   「可评测的问答」，写错一个数字不会报错，只会让统计悄悄偏。
@@ -153,7 +189,30 @@ public class QaLog {
      */
     public static final int STATUS_CLARIFY = 3;
 
-    /** 1成功生成答案 2模型链路失败 3澄清反问。取值见上面的常量 */
+    /**
+     * 被排队限流挡住（阶段 6）：队列已满被拒，或者排队等到超时。
+     *
+     * <p>★ 它的存在是为了堵一个<b>随负载变大而变大的数据盲区</b>：
+     * 这类请求<b>根本没进 {@code ChatService}</b>，所以如果一个值都不给它，
+     * 它们在过去是<b>一行都不写</b>的 ——
+     * 100 个人来问、30 个被拒，{@code qa_log} 里只有 70 行，
+     * 而那 30 个在任何地方都没有记录。<b>越忙越需要数据，恰恰越忙丢得越多。</b>
+     *
+     * <p>它内部还分两种（队列满 / 排队超时），用 {@code error_msg} 区分 ——
+     * 两者的方向一致（容量不够），不值得再开一个取值。
+     *
+     * <p>★ 这类行的形状：{@code question} / {@code trace_id} /
+     * {@code queue_ms} / {@code queue_position} 有值，
+     * {@code provider} / {@code model} / {@code tokens} / {@code cost} /
+     * {@code final_answer} 全为 NULL —— 和 {@link #STATUS_CLARIFY} 一样，
+     * <b>没有发生的事就留空，不填空对象、不填 0</b>。
+     *
+     * <p>⚠️ 它不参与任何指标（阶段 7 仍然只统计 {@code status = 1}），
+     * 但它让「被限流掉的比例」第一次可以被算出来。
+     */
+    public static final int STATUS_RATE_LIMITED = 4;
+
+    /** 1成功生成答案 2模型链路失败 3澄清反问 4被限流。取值见上面的常量 */
     private Integer status;
 
     private String errorMsg;

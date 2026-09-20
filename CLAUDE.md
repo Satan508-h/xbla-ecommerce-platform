@@ -14,11 +14,11 @@
 面向电商场景（商品咨询、规格对比、促销政策、售后服务）的企业级 **RAG 智能问答平台**。
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**。
 
-**当前阶段**：阶段 5（智能体层）—— 5.1 ~ 5.9 已完成 ✅ 2026-09-20，下一步 **阶段 6 高可用**。
-★ **验收标准 1 已达成**：问「我的订单到哪了」→ 真的走 MCP 工具 → 拿到实时订单数据。
-⚠️ 5.9 原写「四个业务工具」，实际是「**三个 MCP 工具 + 一个结构化上下文来源**」——
-售后政策没做成工具，原因见 `docs/08` ADR-067。**这一行是被改过的，不是被完成的。**
-路线图与验收标准：`docs/10-开发路线图.md`
+**当前阶段**：阶段 6（高可用）—— 6.1 ~ 6.9 已完成 ✅ 2026-09-20，下一步 **阶段 7 评测体系**。
+★ **三条验收标准全部达成**：100 并发无超卖无死锁、位置与 `ZRANK` 逐字相等、名额不永久泄漏。
+★ 真实 10 并发端到端跑通（生产默认配置），`qa_log.queue_ms` / `queue_position` 已落库。
+⚠️ 6.9 的「看门狗」不在原计划里 —— 它是压测**抓到一个真机 bug** 之后补的（`docs/08` ADR-076）。
+路线图与验收记录：`docs/10-开发路线图.md`
 
 ---
 
@@ -30,7 +30,7 @@
 | 框架 | Spring Boot 3.x | 以搭建当日最新稳定版为准 |
 | ORM | MyBatis-Plus | 必须选支持 Spring Boot 3 的版本 |
 | 数据库 | PostgreSQL + **pgvector** | 镜像 `pgvector/pgvector:pgXX` |
-| 缓存/限流 | Redis + Redisson | 镜像 `redis:7-alpine` |
+| 缓存/限流 | Redis + **Lettuce + 手写 Lua**（★ 不是 Redisson，见 `docs/08` ADR-075） | 镜像 `redis:7-alpine` |
 | 文档解析 | Apache Tika 2.x | — |
 | 熔断 | Resilience4j | `resilience4j-spring-boot3` |
 | MCP | 手写 Server + 官方 Java SDK（Client） | SDK 已核实为 **2.0.1**（只认到协议 `2025-11-25`）。⚠️ 依赖要写 `mcp-core` + `mcp-json-jackson2`，**别用聚合包 `mcp`**（它会拖进 Jackson 3） |
@@ -70,12 +70,13 @@ com.xbla.rag
 ├── rag/           ★ RAG 核心：解析、切分、召回、融合、重排、Prompt 组装
 ├── agent/         ★ 智能体层：意图路由、澄清反问、会话记忆
 ├── mcp/           ★ MCP Server（手写）+ Client（官方 SDK）
-├── ratelimit/     ★ 高可用：Redis 信号量、Lua 脚本、ZSet 队列、Pub/Sub
+├── ratelimit/     ★ 高可用：名额表（ZSet + 租约）、手写 Lua、ZSet 队列、Pub/Sub、看门狗
 └── common/        通用工具、异常、统一响应封装
 ```
 
-**数据流**：`用户提问 → 意图识别 → [知识库检索 | MCP 工具调用] → 重排 → Prompt 组装 → LLM 生成 → SSE`
-（详见 `docs/03-系统架构设计.md`）
+**数据流**：`用户提问 → ★ 排队限流 → 意图识别 → [知识库检索 | MCP 工具调用] → 重排 → Prompt 组装 → LLM 生成 → SSE`
+（★ 阶段 6 的排队层跑在**整条链路之前**，且在 `ChatService` **之外** —— 见 `docs/08` ADR-077；
+详见 `docs/03-系统架构设计.md`）
 
 ---
 
@@ -135,9 +136,13 @@ docker compose exec postgres psql -U xbla -d xbla_rag
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（596 个）
+# 跑测试（680 个）
 # ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
 #   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
+#   ⚠️ 同一个坑 `./mvnw test-compile` 也有（见 docs/10 坑 12）。
+# ★★ 阶段 6 起 `./mvnw test` 需要 docker 的 **redis**，不再只是 postgres。
+#   ⚠️ 而且 Redis 没有事务回滚 —— `@Transactional` 对 Redis 测试完全无效，
+#      测试必须自己 `@AfterEach` 清 key，或者用【唯一的 key 前缀】隔离。
 ./mvnw clean test
 ```
 
@@ -184,6 +189,17 @@ curl -s "localhost:8080/api/debug/mcp/qa-log?traceId=xxx" | python -m json.tool 
 # ★ 直调工具看它的返回原文（走完整 MCP 链路，和模型拿到的一模一样）——【不花钱】
 curl -s "localhost:8080/api/debug/mcp/call?tool=query_my_coupons&userId=8" | python -m json.tool
 curl -s "localhost:8080/api/debug/agent/intent-tree" | python -m json.tool   # 看 structuredFactLeaves
+
+# ── 阶段 6：排队限流（★ 全部不花钱）──
+python scripts/probe_ratelimit.py                    # ★★ 29 项断言，八组，含 100 并发压测
+python scripts/probe_ratelimit.py --real             # ★ 外加真实 10 并发（花钱）
+curl -s localhost:8080/api/debug/ratelimit/state | python -m json.tool   # 名额/队列/本机登记/线程池/信号
+curl -s localhost:8080/api/debug/ratelimit/slots | python -m json.tool   # ★ ZCARD 偏大时：多出来的是【谁】
+curl -s "localhost:8080/api/debug/ratelimit/trace?traceId=xxx" | python -m json.tool  # 一个 id 在四个结构里的处境
+curl -sN "localhost:8080/api/debug/ratelimit/fake-stream?holdMs=3000"    # ★ 走完整排队链路但不调模型
+curl -s -X POST "localhost:8080/api/debug/ratelimit/leak?permits=8"      # 造「占着但没人续期」的僵尸
+curl -s -X POST localhost:8080/api/debug/ratelimit/reset                 # 清空 4 个 key + 本机表 + 信号计数
+docker compose exec -T redis redis-cli ZCARD "xbla:rl:{chat}:slots"      # 直接看 Redis
 
 # ── 一次性 / 重建 ──
 python scripts/generate_corpus.py                    # 生成仿真语料（依赖 reportlab python-docx openpyxl）
@@ -318,8 +334,46 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
 - ★★ **判据：先看工具说了什么，再看模型说了什么，然后比较。** 「回答里有某个词」会被模型的
   措辞绑架（5.8 的「没找到 → 没查到」）；「回答里的东西**工具确实说过**」不会。
 
+### 排队限流（阶段 6）
+
+- ★★★ **续期【不能创建】名额** —— `renew.lua` 里的 `ZSCORE` 判定不能删。
+  普通 `ZADD` 会把已释放的名额**复活**（成员不存在时它创建），后果是**容量静默变少**
+  —— 实测 8 个名额掉到 5 个，**没有异常、没有日志、没有指标**。（ADR-076）
+- ★★★ **名额的释放在 `answer-` 线程的 `finally` 里，不在 `admit` 返回时** ——
+  在那里释放就是「边跑边放名额」，直接超卖，且**不会报错**。（ADR-075）
+- ★★ **排队必须在 `ChatService` 之外** —— 插在 `saveUserMessage` 之后会留下孤儿用户消息，
+  **连续两次失败后那个会话永久答不出话**（ADR-049 的成因）。（ADR-077）
+- ★★ **Pub/Sub 是优化，轮询是正确性来源** —— `await` 永远受 `poll-interval` 限制，
+  所以消息丢了只是慢一点。**别把订阅成功当成功能可用的前提。**（ADR-078）
+- ★★ **`RedisMessageListenerContainer.start()` 在订阅失败后是静默 no-op**（`started` 不重置）
+  —— 所以每次重建都用**全新容器**，不要复用。（ADR-078）
+- ★★ **`queue-` 线程池的 `queueCapacity` 必须是 0**，它不是调优参数 ——
+  改成非 0 会让等待任务静止在执行器队列里，**没人能推位置 → 用户看到空白页**，且不报错。（ADR-077）
+- ★★ **`qa_log.queue_ms` 【不是】「哪一种拒绝」的判据** —— 实测 `0` 在「队列满」和
+  「池满」下都出现过。四种拒绝各自对症一个**不同的旋钮**，判据只能是 `error_msg` 的原因串。（ADR-080）
+- ★★ **`acquire.lua` 里那行 `ZREMRANGEBYSCORE` 不能省** —— `ZCARD` 包含已过期的僵尸，
+  只靠定时任务的话两次任务之间会**误判「满了」**。
+- ★★ **重抢时【保留原 score】**（`ZSCORE == false` 才 `ZADD`）—— 换新序号会让用户
+  看到自己从「前面 2 人」变成「前面 7 人」。（ADR-075）
+- ★ **队列的 score 是 `INCR` 单调序号，不是毫秒时间戳** —— 同毫秒入队时
+  `ZRANK` 会退化成 UUID 字典序（= 随机）。（ADR-075）
+- ★ **释放【不】分配名额**（不给队首「提拔」）—— 队首可能已经断了，
+  提拔它 = 名额被幽灵占着直到 TTL，直接威胁「无死锁」。代价是不保证 FIFO，这是刻意的。（ADR-075）
+- ★ **客户端断开是一个正常事件**，不该落到兜底 handler（一次关页面 = ERROR + 60 行堆栈 +
+  「异常处理器自己又抛了」）。同 `ExecutionException` 那类错误。（ADR-080）
+- ★ **探针的 `leak` 端点刻意【不】登记进 `LocalPermitRegistry`** ——
+  登记了就会被同进程心跳续期，于是「测试自己让自己通过」。（ADR-076）
+- ★ **`/reset` 之后 `queue-` 池不会立刻空** —— 在途的等待者要靠下一次重试才发现名额空出来，
+  大约 5 秒。**下一组测试必须等它排空**，否则整组会被「池满」拒掉（实测误报过一次）。
+
 ### 代码风格（本项目强制）
 
+- ★★ **同一列在多个路径上有多种形状时，任何一句「它总是 X」都注定是错的。**
+  `qa_log.queue_ms` 的注释因此改过三次（「总是 0」→「不可能是 0」→「0 = 池满」），
+  **三次全错**。**要写的是那张形状表，不是那句话。**（ADR-080）
+- ★★ **一个字段在两条路上有两个含义时，断言必须说清是哪条路。**
+  `ChatAskResponse.answer` 在非流式是正文，在流式**刻意是 null**（正文在 delta 里）——
+  实测因为拿非流式的形状去断言流式，白红了一次。（ADR-080）
 - ★ **`ApiResponse.CODE_SUCCESS = 0`**，不是 HTTP 的 200。判断成功要判 `code == 0`。
 - ★ **纯单测必须写正-反对照**：断言 A 成立的同时，断言「不做 A 的那个版本确实不成立」，否则断言可能恒真。
 - ★★ **凡是会进 Prompt 前缀的 JSON，一律用 `LinkedHashMap`，不用 `Map.of` / `Map.copyOf`** ——

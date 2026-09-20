@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ModelProbeController {
 
     private final ModelProbeService probeService;
-    private final ThreadPoolTaskExecutor sseExecutor;
+    private final ThreadPoolTaskExecutor answerExecutor;
 
     /**
      * 构造器注入需要 {@code @Qualifier} 指定线程池名字 ——
@@ -49,9 +49,9 @@ public class ModelProbeController {
      * 不指名道姓的话 Spring 不知道注入哪个。
      */
     public ModelProbeController(ModelProbeService probeService,
-                                @Qualifier("sseExecutor") ThreadPoolTaskExecutor sseExecutor) {
+                                @Qualifier("answerExecutor") ThreadPoolTaskExecutor answerExecutor) {
         this.probeService = probeService;
-        this.sseExecutor = sseExecutor;
+        this.answerExecutor = answerExecutor;
     }
 
     // ============================================================
@@ -98,7 +98,7 @@ public class ModelProbeController {
         // ★ 用专用线程池，不能图省事用 CompletableFuture.runAsync ——
         //   不传 executor 会用 ForkJoinPool.commonPool()，
         //   阻塞式 HTTP 调用会把它占满，拖垮整个 JVM。见 AsyncConfig。
-        sseExecutor.execute(() -> {
+        answerExecutor.execute(() -> {
             AtomicBoolean closed = new AtomicBoolean(false);
             try {
                 Map<String, Object> summary = probeService.chatStream(model, question, delta -> {

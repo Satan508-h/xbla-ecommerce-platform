@@ -37,6 +37,43 @@ public interface ChatService {
     ChatAskResponse ask(ChatAskRequest request, Long userId);
 
     /**
+     * 非流式问答，<b>由调用方指定 traceId</b>（阶段 6 新增的重载）。
+     *
+     * <h3>★ 为什么需要它：排队和问答必须是同一个 id</h3>
+     *
+     * <p>阶段 6 之前，{@code traceId} 是 {@code ChatServiceImpl} 在方法第一行自己生成的。
+     * 那时这没问题 —— <b>一次问答就是一个请求</b>，谁生成都一样。
+     *
+     * <p>但阶段 6 让请求在到达这里之前先<b>排队</b>，而排队期间就要往 SSE 推
+     * 「你在第几位」、要往 {@code qa_log} 写 {@code queue_ms}。
+     * 于是产生了一个选择：
+     *
+     * <pre>
+     *   两个 id  →  用户拿到的「排队 90 秒」和「回答耗时 3 秒」对不上号。
+     *               ★ 而且它们长得一模一样（都是 32 位十六进制），
+     *                 没人会怀疑它们不是一回事 —— 这才是最麻烦的：
+     *                 它会一直看起来是对的，直到某天真的需要串联。
+     *   一个 id  →  排队 → 检索 → 生成 → 落库，全程同一个 trace_id。
+     * </pre>
+     *
+     * <p>选了后者。所以排队层先 {@code TraceId.newId()} 拿到 id，
+     * 再把它传进来 —— <b>{@code qa_log.trace_id} 记的就是它</b>。
+     *
+     * <h3>★ 为什么是重载而不是改签名</h3>
+     *
+     * <p>改签名会让现有<b>每一个</b>调用点和测试都要改一遍，而那些改动<b>没有任何含义</b>
+     * （只是补一个 null）。追加一个重载，老的两参方法保持原样、
+     * 内部委托过来并自己生成 id —— 现有代码一行不动。
+     *
+     * <p>⚠️ 这也是「两条平行路径少改了一条」这个坑的防御（见 {@link #askStream} 那段）：
+     * 两条路加重载的方式完全一样，漏改一条时<b>编译不会过</b>。
+     *
+     * @param ctx 调用上下文（链路 ID + 排队信息）。★ traceId 为空时会回落到自己生成一个，
+     *            不抛异常 —— 它是观测数据，不该因为调用方忘了传而让用户的问答失败。
+     */
+    ChatAskResponse ask(ChatAskRequest request, Long userId, CallContext ctx);
+
+    /**
      * 流式问答。正文通过 {@code sink} 逐段推出。
      *
      * <p>⚠️ <b>它还没有 {@code userId} 参数 —— 而且这不是遗漏。</b>
@@ -59,6 +96,21 @@ public interface ChatService {
      * @param sink    事件接收器，由 controller 适配到 SseEmitter
      */
     void askStream(ChatAskRequest request, ChatStreamSink sink);
+
+    /**
+     * 流式问答，<b>由调用方指定 traceId</b>（阶段 6 新增的重载）。
+     *
+     * <p>存在的理由和 {@link #ask(ChatAskRequest, Long, CallContext)} 完全一样：
+     * 排队层先拿到 id，问答层沿用同一个。**两条路必须一起加重载** ——
+     * 这是刻意的，因为「只改了一条」在本项目已经发生过（ADR-047），
+     * 而那种漏改编译能过、测试能绿，只有演示的时候才看得出来。
+     *
+     * <p>★ 阶段 6 的流式路径是<b>排队层在主调它</b>，所以这个重载就是
+     * 流式路上真正被调用的那个；两参版本留给「不走排队的调用方」（测试、探针）。
+     *
+     * @param ctx 调用上下文（链路 ID + 排队信息）。★ traceId 为空时回落到自己生成一个
+     */
+    void askStream(ChatAskRequest request, ChatStreamSink sink, CallContext ctx);
 
     /**
      * 流式事件的接收端。
