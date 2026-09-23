@@ -321,8 +321,30 @@ public class RetrievalPipeline {
     /**
      * 把调用方的「范围声明」解析成「这次实际要下推的条件」，并把决策过程记进 trace。
      *
-     * <p>四种结局见 {@link RetrievalTrace.FilterScope} 的表。
-     * 本方法只处理前三种，第四种（{@code empty_result}）要到真的召回之后才知道。
+     * <p>五种结局见 {@link RetrievalTrace.FilterScope} 的表。
+     * 本方法只处理前四种，最后一种（{@code empty_result}）要到真的召回之后才知道。
+     *
+     * <h3>★ 为什么总开关放在这里，而不是放在 {@code ChatServiceImpl} 里</h3>
+     *
+     * <p>{@code ChatServiceImpl.retrievalOptions()} 的职责是「意图 → 哪几种文档」，
+     * 它<b>只声明、不决定要不要真的过滤</b>（那句话就写在那里的注释里）。
+     * 「要不要下推」这个决定一直是本方法的 —— 池子大小和 {@code vector-top-k}
+     * 都在这一层。总开关决定的是同一件事，所以它属于同一层。
+     *
+     * <p>放在这一层还买到两样东西：
+     * <ol>
+     *   <li><b>零签名变更。</b>{@code RetrievalOptions} 是 record，
+     *       给它加一个「被配置关掉了」的分量会动到 20+ 处调用点；
+     *       而放在这里，调用方（聊天路径、{@code probe_kb}）一个字都不用改</li>
+     *   <li><b>一个决策点。</b>「谁声明了」「要不要下推」两件事仍然只有一处交汇，
+     *       不会出现「聊天路径认为关着、探针认为开着」这种两套事实</li>
+     * </ol>
+     *
+     * <p>⚠️ 代价是 {@code probe_kb.py --docTypes} 这个调试手法在关掉时也失效。
+     * 这是刻意的 —— 那个探针的价值就在于「和聊天路径跑同一条检索链路」，
+     * 让它豁免就等于让它在关掉时<b>不再复现聊天路径的行为</b>。
+     * 而它失效时不会报错，只会返回全池结果，所以必须靠
+     * {@link RetrievalTrace.FilterScope.Reason#DISABLED_BY_CONFIG} 把这件事说明白。
      *
      * <p>⚠️ 计数查询在<b>提交两路召回之前</b>发出，它在请求线程上串行执行。
      * 一次 {@code count(*)} 走 {@code idx_kb_chunk_doc_type} 是亚毫秒级，
@@ -333,6 +355,19 @@ public class RetrievalPipeline {
     private RetrievalOptions resolveScope(RetrievalOptions requested,
                                           RetrievalProperties.Retrieve cfg,
                                           RetrievalTrace trace) {
+        // ── ⓪ 总开关（阶段 7 的 A/B 轴之一）──────────────────────
+        // 放在最前面：关掉时下面几条结局【一条都够不着】。
+        // docTypes 如实记录调用方的声明 —— 它确实声明了，只是没被用上。
+        // ★ 不连池子计数一起跳过：那是一次亚毫秒级的 count(*)，而
+        //   「关掉时池子多大」在报告里正好是有用的背景数字。
+        if (!cfg.getByIntent().isEnabled()) {
+            trace.filter(new RetrievalTrace.FilterScope(requested.docTypes(), false,
+                    null, RetrievalTrace.FilterScope.Reason.DISABLED_BY_CONFIG));
+            log.debug("范围过滤已按配置关闭：by-intent.enabled=false，docTypes={}（如实记录但不生效）",
+                    requested.docTypes());
+            return requested.withoutFilter();
+        }
+
         if (!requested.filtered()) {
             // 没声明范围。trace 保持初始的 no_declaration，什么都不用做
             return requested;

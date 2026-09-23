@@ -2,6 +2,7 @@ package com.xbla.rag.ratelimit;
 
 import org.springframework.stereotype.Component;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -61,8 +62,15 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 public class LocalPermitRegistry {
 
-    /** 已被授予名额、正在跑或即将跑的 */
-    private final Set<String> held = ConcurrentHashMap.newKeySet();
+    /**
+     * 已被授予名额、正在跑或即将跑的 —— <b>值是「拿到名额的那一刻」</b>。
+     *
+     * <p>★★ 为什么值不是 {@code boolean}：阶段 7 补的<b>绝对持有上限</b>
+     * （{@link ChatPermitService#renewHeld} 里的那段）需要一个
+     * 「从什么时候开始算」的锚点。没有它，一个卡死的请求会被心跳续到<b>永远</b>——
+     * 2026-09-21 实测：一次跑批里 8 个名额掉到 6 个，而且再也没恢复。
+     */
+    private final Map<String, Long> held = new ConcurrentHashMap<>();
 
     /** 已进入队列、还在等名额的 */
     private final Set<String> waiting = ConcurrentHashMap.newKeySet();
@@ -78,7 +86,12 @@ public class LocalPermitRegistry {
      */
     public void markHeld(String traceId) {
         waiting.remove(traceId);
-        held.add(traceId);
+        // ★★ putIfAbsent 而不是 put —— 这个区别是有后果的。
+        //    本方法是幂等的（重复调用只是续期），而 put 会把「拿到名额的时刻」
+        //    重置成现在；一旦某个请求被反复 markHeld，绝对持有上限就永远够不到，
+        //    那道防线退化成恒真条件（而它看起来还在正常工作）。
+        //    第一个时刻才是这个请求真正的起点。
+        held.putIfAbsent(traceId, System.currentTimeMillis());
     }
 
     /** 标记为「正在排队」。同理，会从 held 里移走 */
@@ -106,7 +119,19 @@ public class LocalPermitRegistry {
      * 拷贝的代价是每次心跳一次数组复制 —— 元素个数就是并发数（个位数到几十），可忽略。
      */
     public Set<String> heldSnapshot() {
-        return Set.copyOf(held);
+        return Set.copyOf(held.keySet());
+    }
+
+    /**
+     * 这个 traceId 是<b>什么时候</b>拿到名额的（epoch 毫秒）。没持有则 {@code null}。
+     *
+     * <p>★ 返回 {@code Long} 而不是 {@code long}：{@code null} 在这里是有含义的 ——
+     * 「快照拿到之后、还没遍历到它，它就被释放了」。填 0 会让调用方把
+     * 「1970 年拿到名额」当成一个合法事实，于是它<strong>看起来持有得最久</strong>，
+     * 恰好会命中绝对上限而被强制回收。<b>一个缺失值在这里必须像缺失值。</b>
+     */
+    public Long holdStartedAt(String traceId) {
+        return held.get(traceId);
     }
 
     public int heldCount() {
@@ -118,7 +143,7 @@ public class LocalPermitRegistry {
     }
 
     public boolean isHeld(String traceId) {
-        return held.contains(traceId);
+        return held.containsKey(traceId);
     }
 
     public boolean isWaiting(String traceId) {

@@ -384,4 +384,76 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
             ORDER BY id
             """)
     List<Long> findIdsByContentAnchor(@Param("anchor") String anchor);
+
+    /**
+     * 全库「切片 → doc_type」的对照表 —— 阶段 7 的<b>过度检索率</b>用。
+     *
+     * <p>评测报告要判的是一条切片有没有越界，而 {@code retrieval_detail} 的
+     * {@code final_top_k} 里只有 id。<b>没有这张对照表，「越界」无从判起。</b>
+     *
+     * <h3>★ 为什么是「全表」而不是「按 id 批量查」</h3>
+     *
+     * <p>看着像 N+1 的懒惰做法，实际不是：
+     * <ul>
+     *   <li>规模是 <b>1640 行 × 两个短字段</b>（2026-09-21 实测），
+     *       一次查询大约十几 KB —— 而它服务的是<b>一整轮报告的几百行</b>；
+     *       按 id 批量查反而要为一轮报告拼一个几百元素的数组参数</li>
+     *   <li>★ 按 id 查会撞上 CLAUDE.md 记的那条坑：
+     *       {@code ANY(#{ids})} 在 PostgreSQL 上会报
+     *       {@code could not determine data type of parameter $1}，
+     *       得靠一层 {@code CAST} 给它类型线索 —— 为一个调试端点引入
+     *       「参数类型推断」这种失败模式，不划算</li>
+     *   <li>全表读的语义是<b>完整</b>的：查不到的 id 一定是「已经不在库里」，
+     *       而不是「这次没传进参数」。归因里这两种要分开（见
+     *       {@code EvalReportService} 里对 {@code docType == null} 的处理）</li>
+     * </ul>
+     *
+     * <p>⚠️ 这条查询的代价随语料增长，而增长的是<b>切片数</b>（千级），
+     * 不是题数。真到十万级切片时该换成按 id 查 —— 那时它也值得配一个 TypeHandler。
+     *
+     * <p>★ {@code deleted = 0}：软删的切片不算。若某条正解切片已被软删，
+     * 它会<b>缺席</b>于这张表，报告端点必须把那种行单独数出来，
+     * 而不是当成「不在期望范围内」—— 那是把「数据没了」读成「检索偏了」。
+     */
+    @org.apache.ibatis.annotations.Select("""
+            SELECT id AS chunk_id, doc_type
+            FROM kb_chunk
+            WHERE deleted = 0
+            ORDER BY id
+            """)
+    List<com.xbla.rag.rag.eval.ChunkDocType> findAllChunkDocTypes();
+
+    /**
+     * 按 id 取切片正文 —— 阶段 7.5 给 RAGAS 还原 {@code retrieved_contexts} 用。
+     *
+     * <p>{@code qa_log.references} 里只有 {@code chunk_id} 和标题路径，<b>没有正文</b>
+     * （同 {@code retrieval_detail} 的约定：正文在 {@code kb_chunk} 里，按 id 取回）。
+     *
+     * <p>★ <b>为什么用 {@code <foreach>} 而不是 {@code ANY(#{ids}::bigint[])}</b>：
+     * 那条路要 MyBatis 把一个 {@code List<Long>} 直接映射成 PG 的 {@code bigint[]}，
+     * 得额外配 TypeHandler 并处理空列表（空列表会让 {@code ANY} 变成
+     * 「匹配不到任何行」—— 那是对的，但 PG 那边会先因为 {@code $N} 的类型推断失败）。
+     * {@code <script>} + {@code <foreach>} 是 MyBatis 的常规路径，没有这些坑。
+     *
+     * <p>⚠️ <b>不在这里截断正文</b>：截断规则属于 {@code RagPromptBuilder}
+     * （它决定模型看到什么）。在 SQL 里再写一遍就是第二个事实来源 —— 见
+     * {@link com.xbla.rag.rag.eval.ChunkContent} 的注释。
+     *
+     * <p>★ <b>不按 {@code deleted} 过滤</b>：这是刻意的。软删的切片仍然存在于
+     * 这一轮评测的历史里，把它查出来交给报告去判「它已经不在了」，
+     * 比在这里静默滤掉（表现为「引用里有这个 id 但取不到正文」）要好 ——
+     * 后者会被读成「这次检索没召回」，而那是另一回事。
+     *
+     * @param ids 切片 id，<b>调用方保证非空</b>（空列表会生成 {@code IN ()} 语法错误）
+     */
+    @org.apache.ibatis.annotations.Select("""
+            <script>
+            SELECT id AS chunk_id, content
+            FROM kb_chunk
+            WHERE id IN
+            <foreach item="id" collection="ids" open="(" separator="," close=")">#{id}</foreach>
+            </script>
+            """)
+    List<com.xbla.rag.rag.eval.ChunkContent> selectContentsByIds(
+            @Param("ids") List<Long> ids);
 }

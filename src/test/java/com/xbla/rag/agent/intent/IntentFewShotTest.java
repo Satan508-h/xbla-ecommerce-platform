@@ -1,6 +1,7 @@
 package com.xbla.rag.agent.intent;
 
 import com.xbla.rag.config.AgentProperties;
+import com.xbla.rag.rag.eval.EvalQuestionLoader;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -17,7 +18,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -308,22 +308,102 @@ class IntentFewShotTest {
     @DisplayName("三、★ 与评测集不相交")
     class Disjointness {
 
-        private static final Pattern QUESTION_LINE =
-                Pattern.compile("^\\s{4}question: (.+?)\\s*$");
-
-        /** 读评测集 YAML 里的全部 question 字段。不依赖 EvalQuestionLoader —— 这是个纯文件检查 */
+        /**
+         * 读 {@code data/eval/} <b>整个目录</b>里全部题目的
+         * <b>「会进分类器的那句话」</b>。
+         *
+         * <p>不依赖 {@code EvalQuestionLoader} —— 这是个纯文件检查
+         * （它甚至不需要数据库在跑）。
+         *
+         * <p>★★ <b>必须是整个目录，不能只读某一个文件。</b> 阶段 7 把题库
+         * 从 1 个文件扩到 3 个之后，只读 {@code baseline-questions.yml}
+         * 的话，这条「少样本不能和考题重合」的护栏会<b>只覆盖 20 道题里的 20 道，
+         * 而另外 150 道一道都不查</b> —— 测试照样是绿的，
+         * 而 ADR-036 想守的那件事已经失守了。
+         *
+         * <h3>★★ 为什么解析 YAML 而不是匹配行文本</h3>
+         *
+         * <p>这里踩过<b>两次</b>同一个坑，两次都是「题库的写法变了，判据没跟着变」：
+         *
+         * <pre>
+         *   第一次  写死 4 个空格缩进 → 多轮题的题面嵌在 turns 列表里，缩进更深
+         *   第二次  写死 question: 这个字段名 → 多轮题那套【没有】question 行
+         * </pre>
+         *
+         * <p>第二次更隐蔽：多轮题的题面写成
+         * {@code turns:} 下面的列表项，一行 {@code - 那还有别的要注意的吗}，
+         * 根本没有键名。按 {@code ^\s*question:} 匹配的话，
+         * <b>那 20 道题一道都不会被检查到</b>，而测试照样是绿的。
+         *
+         * <p>★ 所以这次不再猜「题面写在哪个字段里」，而是把三种写法列全并解析结构：
+         *
+         * <pre>
+         *   question             单轮题的题面
+         *   turns                多轮题的每一轮（★ 每一轮都会【单独】送进分类器）
+         *   standalone_question  追问句的「单独说」版本（跑对照时也会被送进去）
+         * </pre>
+         *
+         * <p>⚠️ 三者都收是刻意的<b>宁可多收</b>：这条护栏问的是
+         * 「有没有哪句用户话既在少样本里、又在考题里」，
+         * 多收不会放过任何东西，少收会。
+         *
+         * <p>★★ 末尾那条断言是防<b>第三次</b>的：每题必须至少产出一句话。
+         * 将来若又出现第四种写法（或者哪个字段被改名），这条会红 ——
+         * 那时补上它，而不是让它第三次悄悄溜过去。
+         */
+        @SuppressWarnings("unchecked")
         private Set<String> evalQuestions() throws IOException {
-            Path path = Path.of("data/eval/baseline-questions.yml");
-            assertThat(path).exists();
+            Path dir = Path.of(EvalQuestionLoader.EVAL_DIR);
+            assertThat(dir).as("题库目录必须存在").exists();
 
             Set<String> questions = new LinkedHashSet<>();
-            for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
-                var m = QUESTION_LINE.matcher(line);
-                if (m.matches()) {
-                    questions.add(m.group(1).trim());
+            try (var stream = Files.list(dir)) {
+                for (Path path : stream.filter(Files::isRegularFile)
+                        .filter(p -> p.getFileName().toString().endsWith(".yml"))
+                        .sorted()
+                        .toList()) {
+                    Map<String, Object> root;
+                    try (InputStream in = Files.newInputStream(path)) {
+                        root = new Yaml().load(in);
+                    }
+                    if (root == null || !(root.get("questions") instanceof List<?> items)) {
+                        continue;
+                    }
+                    for (Object item : items) {
+                        Map<String, Object> node = (Map<String, Object>) item;
+                        // ★★ 判据是「这道题【产出】了几句话」，【不是】「集合变大了几」。
+                        //
+                        //   后者会在题面重复时误报：P-001（单轮「怎么申请售后」）与
+                        //   MT-006 的第一轮是同一句话，重复值不会让 Set 增长 ——
+                        //   于是这个断言把一道【正常】的题判成了「解析不出来」。
+                        //   ⚠️ 修的时候顺手确认了：那道题真的正常，是断言写错了。
+                        int produced = addIfPresent(questions, node.get("question"))
+                                + addIfPresent(questions, node.get("standalone_question"));
+                        if (node.get("turns") instanceof List<?> turns) {
+                            for (Object turn : turns) {
+                                produced += addIfPresent(questions, turn);
+                            }
+                        }
+                        assertThat(produced)
+                                .as("★ %s 里的 %s 题目没有解析出任何一句话 —— "
+                                        + "题库的写法变了而这里的判据没跟上，"
+                                        + "这道题会【静默逃过】少样本重合检查",
+                                        path.getFileName(), node.get("question_no"))
+                                .isGreaterThan(0);
+                    }
                 }
             }
+            assertThat(questions).as("题库里应当有题").isNotEmpty();
             return questions;
+        }
+
+        /** @return 这个字段【是不是一句非空的用户话】（1/0）—— 与「有没有被加进集合」无关 */
+        private static int addIfPresent(Set<String> target, Object value) {
+            if (value instanceof String s && !s.isBlank()) {
+                target.add(s.trim());
+                return 1;
+            }
+            return 0;
         }
 
         /** 读少样本 YAML 里的全部问题 */
@@ -392,6 +472,96 @@ class IntentFewShotTest {
             assertThat(thin)
                     .as("这些目标的样本少于 2 句，模型容易在它们和相邻类别之间摇摆")
                     .isEmpty();
+        }
+
+        /**
+         * ★★ 评测题不得逐字出现在<b>会进分类 prompt 的</b>意图树文本里。
+         *
+         * <h3>为什么需要这一条：ADR-036 只守了一半</h3>
+         *
+         * <p>ADR-036 把意图树拆成两份文件，理由是「树里的 {@code examples}
+         * 不进 prompt，所以它们可以和评测题重合」（下面那条反证测试断言的就是
+         * 「确实重合」）。<b>但这不是全部事实</b> ——
+         * {@code IntentPromptBuilder:81} 拼的是
+         * {@code target.name()} / {@code target.description()}，
+         * 而 {@code description} 是**自由文本**：写题的人把示例句抄进判据正文，
+         * 那句话就进 prompt 了，而两边的护栏都不会报错。
+         *
+         * <p>★ 这是 2026-09-20 实测到的真事（不是假想）：
+         *
+         * <pre>
+         *   COUPON 的 description            优惠券怎么用、能不能叠加、……
+         *   评测题 B-009                      优惠券怎么用          ← 逐字相同
+         *   RULES_AND_PROCESS 的 description  售后流程类问题：……、收到货发现损坏怎么办、……
+         *   评测题 B-016                      收到货发现损坏怎么办     ← 逐字相同
+         * </pre>
+         *
+         * <p>两道题的 gold 正好就是那个叶子 —— <b>prompt 把答案递到它们手上了</b>，
+         * 而 5.2 的 95% 里含着它们。两道题已改写，这一条是防止再犯。
+         *
+         * <p>⚠️ <b>只查 name 和 description</b>，<b>不查 examples</b> ——
+         * examples 不进 prompt（那是 ADR-036 的前提），把它们也拉进来会让
+         * 下面那条反证测试直接失去意义。
+         */
+        @Test
+        @DisplayName("★★ 评测题不得逐字出现在 intent-tree 的 name / description 里（它们进 prompt）")
+        void evalQuestionsNeverLeakIntoPrompt() throws IOException {
+            Set<String> eval = evalQuestions();
+            List<String> promptTexts = promptVisibleTreeTexts();
+
+            assertThat(promptTexts).as("树的判据文本应当被读到").isNotEmpty();
+
+            List<String> leaks = eval.stream()
+                    .filter(q -> promptTexts.stream().anyMatch(t -> t.contains(q)))
+                    .toList();
+
+            assertThat(leaks)
+                    .as("这些评测题逐字出现在【会进分类 prompt 的】意图树文本里 —— "
+                            + "分类器读到它们就等于拿到了答案，而那几道题的准确率"
+                            + "测的是「能不能从 prompt 里照抄」。改评测题的问法，"
+                            + "或者把那句话从判据正文里去掉（★ 别只删 examples，"
+                            + "那不影响 prompt）")
+                    .isEmpty();
+        }
+
+        /**
+         * 收集 {@code intent-tree.yml} 里<b>会进 prompt</b> 的文本。
+         *
+         * <p>与 {@code IntentPromptBuilder} 拼进去的东西对齐：
+         * {@code name} 与 {@code description}（以及 code，但 code 是标识符，
+         * 不可能等于一句话）。
+         *
+         * <p>★ 遍历<b>全部节点</b>（顶层 + 叶子），不做「哪些是分类目标」的筛选 ——
+         * 宁可多收。多收一条只会让漏检少一分；少收一条就是一次静默放行。
+         */
+        @SuppressWarnings("unchecked")
+        private List<String> promptVisibleTreeTexts() throws IOException {
+            Path path = Path.of("data/agent/intent-tree.yml");
+            assertThat(path).exists();
+
+            Map<String, Object> root;
+            try (InputStream in = Files.newInputStream(path)) {
+                root = new Yaml().load(in);
+            }
+            List<String> texts = new ArrayList<>();
+            for (Object item : (List<Object>) root.get("intents")) {
+                collectPromptTexts((Map<String, Object>) item, texts);
+            }
+            return texts;
+        }
+
+        @SuppressWarnings("unchecked")
+        private void collectPromptTexts(Map<String, Object> node, List<String> into) {
+            for (String key : List.of("name", "description")) {
+                if (node.get(key) instanceof String s && !s.isBlank()) {
+                    into.add(s);
+                }
+            }
+            if (node.get("children") instanceof List<?> children) {
+                for (Object child : children) {
+                    collectPromptTexts((Map<String, Object>) child, into);
+                }
+            }
         }
 
         @Test

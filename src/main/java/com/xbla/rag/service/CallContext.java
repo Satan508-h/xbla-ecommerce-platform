@@ -1,5 +1,6 @@
 package com.xbla.rag.service;
 
+import com.xbla.rag.common.EvalMark;
 import com.xbla.rag.common.TraceId;
 
 /**
@@ -15,6 +16,11 @@ import com.xbla.rag.common.TraceId;
  *   queueMs        排了多久
  *   queuePosition  刚入队时前面有几个人
  * </pre>
+ *
+ * <p>★ <b>阶段 7 又加了第四样（{@code eval}），而这一条正是上面那段话的兑现</b>：
+ * 加一个字段没有改任何方法签名。如果当初是「继续加参数」，
+ * 今天要改的就是 {@code askStream} 以及它下游那 6 个私有落库方法的签名 ——
+ * 而每一次传递都是一次「少传一个」的机会。
  *
  * <p>加成三个参数的话，{@code askStream(request, sink, traceId, queueMs, queuePosition)}
  * 会变成五个参数，而这个签名还会被继续往下传给 6 个私有的落库方法 ——
@@ -43,8 +49,11 @@ import com.xbla.rag.common.TraceId;
  * @param traceId       链路 ID，<b>非空</b>
  * @param queueMs       排队等待毫秒；<b>null = 没排队</b>
  * @param queuePosition 刚入队时前面有几个人（0-based）；<b>null = 没进过队列</b>
+ * @param eval          评测运行标记；<b>null = 真实用户的提问</b>（常态）。
+ *                      见 {@link EvalMark} —— 它只被透传进 {@code qa_log}，
+ *                      不参与任何业务判断
  */
-public record CallContext(String traceId, Integer queueMs, Integer queuePosition) {
+public record CallContext(String traceId, Integer queueMs, Integer queuePosition, EvalMark eval) {
 
     /**
      * 没经过排队层的调用（测试、探针、以及 {@code xbla.ratelimit.enabled=false}）。
@@ -53,7 +62,17 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
      * 如果这里填 0，阶段 7 就分不清「没开排队」和「开了但没排队」了。
      */
     public static CallContext fresh(String traceId) {
-        return new CallContext(traceId, null, null);
+        return new CallContext(traceId, null, null, null);
+    }
+
+    /**
+     * 带评测标记、但没经过排队层的调用。
+     *
+     * <p>★ 它存在的场景是<b>测试</b>：走 {@code chatService.ask(...)} 直接验证
+     * 「评测标记落不落库」，不必把排队层拉起来。
+     */
+    public static CallContext fresh(String traceId, EvalMark eval) {
+        return new CallContext(traceId, null, null, eval);
     }
 
     /** 自动生成一个 traceId 的「没排队」上下文 */

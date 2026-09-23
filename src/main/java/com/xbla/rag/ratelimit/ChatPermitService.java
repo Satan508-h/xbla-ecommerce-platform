@@ -70,6 +70,25 @@ public class ChatPermitService {
      */
     private final AtomicLong heartbeatFailures = new AtomicLong();
 
+    /**
+     * 被<b>绝对持有上限</b>强制回收的名额累计次数（阶段 7 补）。
+     *
+     * <p>★★ 它非 0 意味着<b>有请求的线程没能正常结束</b> —— 最可能是出站调用挂死
+     * （`httpClient.send()` 永不返回）。那种情况下那个请求的 {@code finally}
+     * 永远不会执行，名额不释放，而心跳会一直替它续期。
+     * 没有这个上限，它会被续到<b>进程重启为止</b>。
+     *
+     * <p>★ 为什么必须能被看见：这个事件的形状是「<b>容量静默变少</b>」——
+     * 8 个名额掉到 6 个，没有任何异常、没有任何指标、正常请求的延迟也不变
+     * （只是并发上限低了）。它只能靠一个计数器浮出来。
+     *
+     * <p>⚠️ 它和 {@link #heartbeatFailures} 是<b>两件相反的事</b>：
+     * 那个是「我们以为自己持有、其实可能已经失去」（偏向超卖），
+     * 这个是「我们确定还登记着、但那个持有者已经不可能还活着了」（偏向泄漏）。
+     * 混在一起看会得出完全错误的结论。
+     */
+    private final AtomicLong hardCapReclaims = new AtomicLong();
+
     public ChatPermitService(LuaScripts lua,
                              StringRedisTemplate redis,
                              RateLimitProperties props,
@@ -255,9 +274,41 @@ public class ChatPermitService {
 
         long now = System.currentTimeMillis();
         long ttl = props.getPermitTtl().toMillis();
+        long maxHold = props.getMaxHold().toMillis();
         int renewed = 0;
 
         for (String traceId : held) {
+            // ══════════════════════════════════════════════════════════
+            // ★★★ 绝对持有上限 —— 唯一能兜住「线程永久挂住」的机制
+            // ══════════════════════════════════════════════════════════
+            // 前面那些保护（renew.lua 的 ZSCORE、release 的删除顺序）防的都是
+            // 「名额被凭空创建 / 被复活」。它们防不住这一条：持有者【真的还没释放】，
+            // 只是它永远不会释放了 —— 因为它的线程卡在某个永不返回的调用上。
+            //
+            // 而心跳只问一个问题：「本机表里还登记着吗？」登记着就续期。
+            // 「还登记着」和「还在干活」在这个设计里被当成了同一件事，
+            // 它们平时确实等价 —— 直到出现第一种不等价的情况，而那时没有任何东西会报错。
+            //
+            // ⚠️ 这里【不 ZREM】：我们只是「不再续期」，让它在 permit-ttl 后自然过期。
+            //    主动删是另一回事 —— 万一我们对「它死了」的判断是错的（比如一次
+            //    GC 把 30 分钟拉长了），ZREM 就是主动制造超卖。而放任过期最坏也只是
+            //    晚 45 秒回收。两个方向的代价不对称，所以选保守的那个。
+            Long startedAt = registry.holdStartedAt(traceId);
+            if (startedAt != null && now - startedAt > maxHold) {
+                registry.forget(traceId);
+                hardCapReclaims.incrementAndGet();
+                log.warn("名额持有超过 {} 被【强制停止续期】traceId={} 已持有 {}s（累计 {} 次）—— "
+                                + "那个请求的线程没能正常结束（最可能是出站调用挂死）。"
+                                + "名额会在 permit-ttl 后自然过期，这里【不主动 ZREM】："
+                                + "在无法确认它真的死了之前，主动删可能造成超卖",
+                        props.getMaxHold(), traceId, (now - startedAt) / 1000,
+                        hardCapReclaims.get());
+                // ★ forget 之后下一轮心跳就看不到它了 —— 不 forget 的话
+                //   每 15 秒会再打一条同样的 WARN，永远打下去，
+                //   而「一条永远在刷的日志」等于没有日志。
+                continue;
+            }
+
             try {
                 if (lua.renew(keys, traceId, now, ttl) == 1) {
                     renewed++;
@@ -360,6 +411,12 @@ public class ChatPermitService {
         state.put("heldHere", registry.heldCount());
         state.put("waitingHere", registry.waitingCount());
         state.put("heartbeatFailures", heartbeatFailures.get());
+        // ★★ 和上面那个是【相反】的两件事，所以必须分开摆着：
+        //   heartbeatFailures 非 0 → 我们可能已经失去名额却在继续跑（超卖方向）
+        //   hardCapReclaims   非 0 → 有线程卡死了、名额被强制放弃续期（泄漏方向）
+        //   做成一个「异常计数」会让人以为是同一类问题，而它们的排查方向相反。
+        state.put("hardCapReclaims", hardCapReclaims.get());
+        state.put("maxHoldMs", props.getMaxHold().toMillis());
         state.put("enabled", props.isEnabled());
         return state;
     }
@@ -367,6 +424,14 @@ public class ChatPermitService {
     /** 续期失败的累计次数。<b>长时间非 0 意味着我们可能在超卖</b> */
     public long heartbeatFailures() {
         return heartbeatFailures.get();
+    }
+
+    /**
+     * 被绝对持有上限强制停止续期的累计次数。
+     * <b>非 0 意味着有过线程卡死</b>（见 {@link #hardCapReclaims} 的说明）。
+     */
+    public long hardCapReclaims() {
+        return hardCapReclaims.get();
     }
 
     /**

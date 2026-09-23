@@ -152,7 +152,7 @@ class PermitSignalDisabledTest {
 
         RecordingQueueListener recording = new RecordingQueueListener();
         admission.submit(new ChatAdmissionService.Admission(
-                "waiter-with-no-pubsub", "退货要几天", null), recording, NO_WORK);
+                "waiter-with-no-pubsub", "退货要几天", null, null), recording, NO_WORK);
 
         assertTrue(recording.awaitQueued(),
                 "★★ 连排队都没进去 —— 这和 Pub/Sub 无关，说明排队层本身就坏了");

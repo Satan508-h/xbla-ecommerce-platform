@@ -110,7 +110,7 @@ class PermitSignalWakeupEffectTest {
      */
     private RecordingQueueListener submitQueued(String traceId) throws InterruptedException {
         RecordingQueueListener recording = new RecordingQueueListener();
-        admission.submit(new ChatAdmissionService.Admission(traceId, "退货要几天", null),
+        admission.submit(new ChatAdmissionService.Admission(traceId, "退货要几天", null, null),
                 recording, NO_WORK);
 
         assertTrue(recording.awaitQueued(),

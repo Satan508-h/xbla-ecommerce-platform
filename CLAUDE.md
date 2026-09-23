@@ -14,11 +14,14 @@
 面向电商场景（商品咨询、规格对比、促销政策、售后服务）的企业级 **RAG 智能问答平台**。
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**。
 
-**当前阶段**：阶段 6（高可用）—— 6.1 ~ 6.9 已完成 ✅ 2026-09-20，下一步 **阶段 7 评测体系**。
-★ **三条验收标准全部达成**：100 并发无超卖无死锁、位置与 `ZRANK` 逐字相等、名额不永久泄漏。
-★ 真实 10 并发端到端跑通（生产默认配置），`qa_log.queue_ms` / `queue_position` 已落库。
-⚠️ 6.9 的「看门狗」不在原计划里 —— 它是压测**抓到一个真机 bug** 之后补的（`docs/08` ADR-076）。
-路线图与验收记录：`docs/10-开发路线图.md`
+**当前阶段**：阶段 7（评测体系）—— **7.1 ~ 7.5 已完成 ✅ 2026-09-23**，
+剩 **7.6 迭代**（两条轴：`rerank.enabled` on/off、`final-top-k` / `rerank.max-candidates`）与 **7.7 简历数字**。
+★ 测试数 680 → **819**。报告本体 `docs/11-评测报告.md`，设计 `docs/06`，
+路线图与验收记录 `docs/10-开发路线图.md`。
+★★★ **本阶段的产出不是功能，是「可复算的数字」** —— 所以**先读报告 §1 的噪声底**：
+同配置两轮、159 题、配置真差异 = 0，**至少翻一格的题 14.5%**。
+**任何 A/B 结论必须先跟这个数比大小**，否则是在读噪声。
+★ 阶段 6（高可用）已收尾：100 并发无超卖无死锁、位置与 `ZRANK` 逐字相等、名额不永久泄漏。
 
 ---
 
@@ -136,7 +139,7 @@ docker compose exec postgres psql -U xbla -d xbla_rag
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（680 个）
+# 跑测试（819 个）
 # ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
 #   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
 #   ⚠️ 同一个坑 `./mvnw test-compile` 也有（见 docs/10 坑 12）。
@@ -200,6 +203,18 @@ curl -sN "localhost:8080/api/debug/ratelimit/fake-stream?holdMs=3000"    # ★ �
 curl -s -X POST "localhost:8080/api/debug/ratelimit/leak?permits=8"      # 造「占着但没人续期」的僵尸
 curl -s -X POST localhost:8080/api/debug/ratelimit/reset                 # 清空 4 个 key + 本机表 + 信号计数
 docker compose exec -T redis redis-cli ZCARD "xbla:rl:{chat}:slots"      # 直接看 Redis
+
+# ── 阶段 7：评测（★ 除 eval_run 外全部【不花钱】）──
+curl -s -X POST localhost:8080/api/debug/eval/reload?set=stage7 | python -m json.tool
+curl -s "localhost:8080/api/debug/eval/report?runId=20260922-stage7-run2" | python -m json.tool  # 全部指标（纯函数）
+curl -s localhost:8080/api/debug/eval/config | python -m json.tool   # ★ 配置快照，从 Environment 取不是读 yml
+python scripts/eval_run.py --set stage7 --repeat 3      # ★ 跑题，串行 + 对账（花钱）
+python scripts/eval_ragas.py --run <id>                 # RAGAS（走 .venv-eval/，慢，约 2 小时/43 题）
+python scripts/eval_ab.py --a <run1> --b <run2>         # A/B + 翻转矩阵
+python scripts/eval_ab.py --selftest                    # ★ 11 项口径自检
+python scripts/eval_report.py --selftest                # ★ 21 项；--coverage 查报告有没有漏掉指标
+python scripts/eval_report.py                           # 重新生成 docs/11-评测报告.md + 附录
+python scripts/eval_intent_probe.py                     # 高重复意图探针（不经过澄清闸门）
 
 # ── 一次性 / 重建 ──
 python scripts/generate_corpus.py                    # 生成仿真语料（依赖 reportlab python-docx openpyxl）

@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 模型调用失败时抛出的统一异常。
@@ -141,6 +142,13 @@ public class ModelCallException extends RuntimeException {
             kind = ModelErrorKind.CONNECT;
         } else if (e instanceof HttpTimeoutException) {
             // 连上了，但对方迟迟不回（流式场景下 = 首字超时）
+            kind = ModelErrorKind.TIMEOUT;
+        } else if (e instanceof TimeoutException) {
+            // ★★ 我们自己那道闸门（{@code sendAsync(...).get(timeout)}）超时抛的就是它。
+            //    ⚠️ 它【不是】IOException 的子类 —— 不单独认出来会掉进最后的
+            //       UNKNOWN，而在熔断器里 UNKNOWN 和 TIMEOUT 的含义完全不同
+            //       （一个「不知道怎么回事」，一个「对方太慢，可以重试」）。
+            //    它排在这里是因为三条超时判断必须在一起 —— 见上面的顺序说明。
             kind = ModelErrorKind.TIMEOUT;
         } else if (e instanceof ConnectException) {
             kind = ModelErrorKind.CONNECT;

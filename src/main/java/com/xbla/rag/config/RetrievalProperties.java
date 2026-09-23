@@ -72,6 +72,48 @@ public class RetrievalProperties {
          * 两者需求相反，所以在 {@code CjkTokenizer} 里就是两个方法。
          */
         private int maxQueryTokens = 64;
+
+        /**
+         * 「按意图下推 {@code doc_type} 范围」这个机制的总开关（阶段 7 新增）。
+         *
+         * <h3>★ 它存在是为了让一句话变成一次能跑的实验</h3>
+         *
+         * <p>{@code docs/05} 里写着「意图识别把检索范围收窄到该意图声明的
+         * {@code doc_type}」—— 这是一个<b>声明</b>，不是一次<b>测量</b>。
+         * 关掉它，同一套题、同一份配置跑两遍，两轮的差异就是这个机制的全部收益
+         * （或者全部代价）。这是阶段 7 的 A/B 轴之一。
+         *
+         * <h3>★ 关掉它【只】影响范围过滤，不影响别的东西</h3>
+         *
+         * <p>意图分类照跑、{@code qa_log.intent} 照写、澄清闸门照跑、工具路由照跑 ——
+         * 变的只有「检索时要不要 {@code WHERE doc_type IN (...)}」这一件事。
+         *
+         * <p>刻意如此的第二个理由：分类那一侧因此成了 A/B 的<b>不变量检查</b>。
+         * 两轮的「意图准确率」应当逐字相同（同题同 prompt 同模型），
+         * <b>若不同，说明这一轮有噪声或代码真的动到了分类</b> —— 这比读噪声划算。
+         *
+         * <h3>⚠️ 关掉时 {@code probe_kb.py --docTypes} 也一起失效</h3>
+         *
+         * <p>因为开关在 {@code RetrievalPipeline.resolveScope} 里，是<b>所有</b>
+         * 范围下推的唯一出口。所以那个「手敲 {@code docTypes} 看检索」的调试手法
+         * 在关掉时是个空操作 —— 而它<b>不会报错，只会返回全池的结果</b>。
+         *
+         * <p>★ 这正是 {@code FilterScope.Reason} 必须新增
+         * {@code DISABLED_BY_CONFIG} 而不能复用 {@code NO_DECLARATION} 的原因：
+         * 复用的话 trace 会说「调用方没声明范围」，而调用方明明声明了。
+         * 你会去查那个调用方，而问题在配置里。
+         */
+        private ByIntent byIntent = new ByIntent();
+
+        /**
+         * 见 {@link Retrieve#byIntent}。
+         */
+        @Data
+        public static class ByIntent {
+
+            /** 默认开。关掉 = 检索不做范围过滤，全部走全池 */
+            private boolean enabled = true;
+        }
     }
 
     /**

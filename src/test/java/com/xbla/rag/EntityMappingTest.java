@@ -1,5 +1,7 @@
 package com.xbla.rag;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xbla.rag.entity.AppUser;
 import com.xbla.rag.entity.ChatMessage;
 import com.xbla.rag.entity.ChatSession;
@@ -21,6 +23,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -158,17 +161,112 @@ class EntityMappingTest {
         q.setExpectedChunkIds(new Long[]{12L, 45L, 88L});
         q.setExpectedDocIds(new Long[]{3L});
         q.setDifficulty(2);
-        q.setIsBaseline(true);
+        // ★ V11 起 question_set 是 NOT NULL 且【没有 DEFAULT】——
+        //   漏写会 INSERT 失败，而不是被静默填成某一套（见 V11 迁移第三节）。
+        q.setQuestionSet("baseline");
+        // ★ V12 起加的两列（阶段 7 批次 5）：工具题的身份 + 空 gold 声明。
+        //   它们必须真的往返一次 —— DTO/实体的形状「只有真的序列化过才算验证过」
+        //   （ADR-061）。user_id 特意用 8 而不是 1：1 是「看起来像默认值」的值，
+        //   用它测不出「列有没有被真的写入」。
+        q.setUserId(8L);
+        q.setExpectNoRetrieval(true);
 
         evalQuestionMapper.insert(q);
 
         EvalQuestion loaded = evalQuestionMapper.selectById(q.getId());
         assertThat(loaded).isNotNull();
         assertThat(loaded.getExpectedChunkIds()).containsExactly(12L, 45L, 88L);
-        assertThat(loaded.getIsBaseline()).isTrue();
+        assertThat(loaded.getQuestionSet()).isEqualTo("baseline");
+        assertThat(loaded.getUserId()).isEqualTo(8L);
+        assertThat(loaded.getExpectNoRetrieval()).isTrue();
 
         System.out.println("✅ 数组类型正常，expectedChunkIds="
                 + java.util.Arrays.toString(loaded.getExpectedChunkIds()));
+    }
+
+    @Test
+    @DisplayName("★ V13 多轮两列：JSONB 往返（turns 存的是 JSON 字符串）")
+    void insertEvalQuestion_shouldRoundTripMultiTurnColumns() throws Exception {
+        EvalQuestion q = new EvalQuestion();
+        q.setQuestionNo("Q-TEST-MT");
+        // ★ 多轮题的 question 列是【推导】出来的（turns 的最后一轮），不是写进去的
+        q.setQuestion("那还有别的要注意的吗");
+        q.setIntent("USAGE_GUIDE");
+        q.setQuestionSet("stage7-multi");
+        q.setExpectNoRetrieval(false);
+        q.setTurns("[\"星辰 X1 用一会儿就发烫，正常吗\",\"那还有别的要注意的吗\"]");
+        q.setStandaloneQuestion("星辰 X1 还有哪些常见问题要注意");
+
+        evalQuestionMapper.insert(q);
+
+        EvalQuestion loaded = evalQuestionMapper.selectById(q.getId());
+        assertThat(loaded).isNotNull();
+        // ★★ 这一条验的是 pgjdbc 的 String↔JSONB 往返。
+        //   漏了它的话 insert 照样成功（不报错），而读回来可能是 null ——
+        //   和 vector 那个 autoResultMap 的坑是同一种「一半能跑」。
+        //
+        // ★★ 断言必须是【解析后再比】，不能拿文本比 —— 实测 JSONB
+        //     **不是**原样存字符串：PostgreSQL 会重排格式（逗号后补了空格）。
+        //     所以任何「if (turns.equals(原来那串))」的代码都是错的，
+        //     而它平时能跑、只在重新读出来时不对。
+        assertThat(new ObjectMapper().readValue(
+                loaded.getTurns(), new TypeReference<List<String>>() {
+                }))
+                .as("读回来的必须是同一个轮次数组（顺序也要一样）")
+                .containsExactly("星辰 X1 用一会儿就发烫，正常吗", "那还有别的要注意的吗");
+        assertThat(loaded.getStandaloneQuestion())
+                .isEqualTo("星辰 X1 还有哪些常见问题要注意");
+
+        System.out.println("✅ 多轮两列往返成功 turns=" + loaded.getTurns());
+    }
+
+    /**
+     * ★★ 「多轮题必须真的有多轮」不能只靠 Java 里那句 if 成立 ——
+     * 手写 UPDATE、批量补数脚本、将来换个加载器都会绕过它。
+     *
+     * <p>症状对照：只有一轮的多轮题<b>不会报错</b>，它只会让「多轮指标」里
+     * 混进单轮数据（同 vector 维度写错不会炸、只会污染检索）。
+     */
+    @Test
+    @DisplayName("★★ 数据库强制：turns 只有一轮 → 必须被 PostgreSQL 拒绝")
+    void insertEvalQuestion_shouldRejectSingleTurnArray() {
+        EvalQuestion q = new EvalQuestion();
+        q.setQuestionNo("Q-TEST-MT-ONE");
+        q.setQuestion("只有一轮");
+        q.setIntent("USAGE_GUIDE");
+        q.setQuestionSet("stage7-multi");
+        q.setTurns("[\"只有一轮\"]");
+        q.setStandaloneQuestion("只有一轮");
+
+        assertThatThrownBy(() -> evalQuestionMapper.insert(q))
+                .as("一条 CHECK 就该挡住它 —— 而不是等报告出来才发现数字不对")
+                .hasMessageContaining("ck_eval_question_turns_is_array");
+
+        System.out.println("✅ 数据库拒绝只有一轮的「多轮题」");
+    }
+
+    /**
+     * ★★ 第二条 CHECK：{@code turns} 与 {@code standalone_question} 同生同死。
+     *
+     * <p>只有 turns 没有 standalone → 这题<b>没有 gold</b>（不知道按哪句话标）。
+     * 留下这种半成品，每个人都会按自己的理解补一个，
+     * 而每个人补的都不一样。
+     */
+    @Test
+    @DisplayName("★★ 数据库强制：有 turns 却没有 standalone_question → 必须被拒绝")
+    void insertEvalQuestion_shouldRejectTurnsWithoutStandalone() {
+        EvalQuestion q = new EvalQuestion();
+        q.setQuestionNo("Q-TEST-MT-NO-STANDALONE");
+        q.setQuestion("那还有别的要注意的吗");
+        q.setIntent("USAGE_GUIDE");
+        q.setQuestionSet("stage7-multi");
+        q.setTurns("[\"星辰 X1 用一会儿就发烫，正常吗\",\"那还有别的要注意的吗\"]");
+        // 故意不设 standaloneQuestion
+
+        assertThatThrownBy(() -> evalQuestionMapper.insert(q))
+                .hasMessageContaining("ck_eval_question_multi_turn_shape");
+
+        System.out.println("✅ 数据库拒绝「有 turns 没有 standalone_question」的半成品");
     }
 
     @Test

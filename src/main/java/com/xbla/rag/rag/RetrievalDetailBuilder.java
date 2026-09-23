@@ -35,7 +35,9 @@ import java.util.Map;
  *     "fused":        [{"chunk_id":12, "rrf_score":0.032}],
  *     "reranked":     [{"chunk_id":45, "rerank_score":0.95}],
  *     "final_top_k":  [45, 12, 8],
- *     "filter":       {"doc_types":[2,4], "applied":true, "pool_size":67, "reason":"ok"}
+ *     "filter":       {"doc_types":[2,4], "applied":true, "pool_size":67, "reason":"ok"},
+ *     "sizes":        {"vector_hits":20, "keyword_hits":20, "fused":37,
+ *                      "reranked":5, "final_top_k":5}
  *   }
  * </pre>
  *
@@ -43,9 +45,9 @@ import java.util.Map;
  * {@code rerank_score}）—— 这不是笔误，是刻意的：它们的量纲完全不可比，
  * 用同一个名字会诱使后来的人拿它们互相比较。见 {@link RetrievedChunk} 的注释。
  *
- * <p><b>★ {@code filter} 是阶段 5.4 加的第六个 key，也是唯一一次「扩了冻结结构」。</b>
- * 原来那 5 个 key 一个都没动、含义一个都没变，所以阶段 4 的基线脚本
- * （{@code scripts/eval_baseline.py} 按固定路径取 {@code reranked} 等段）
+ * <p><b>★ {@code filter} 是阶段 5.4 加的第六个 key，{@code sizes} 是阶段 7 加的第七个。</b>
+ * 两次都是「扩了冻结结构」，但原来那些 key 一个都没动、含义一个都没变，所以阶段 4 的
+ * 基线脚本（{@code scripts/eval_baseline.py} 按固定路径取 {@code reranked} 等段）
  * <b>不受影响</b>。这是「加法式扩展」而不是「改结构」——
  * 两者的区别是前者不需要重跑历史基线。
  *
@@ -55,9 +57,28 @@ import java.util.Map;
  * <b>写入最频繁</b>的表，而 {@code retrieval_detail} 是一个 JSONB 大字段；
  * 不截断的话，召回条数一调大（阶段 7 很可能这么干），这张表就会迅速膨胀。
  *
+ * <h3>★★ 所以截断这件事本身必须被记下来 —— 那就是 {@code sizes}</h3>
+ *
+ * <p>截断有一个不会报错的后果：<b>「这一段里没有它」和「它被截掉了」在数据上
+ * 长得一模一样</b>。阶段 7 的归因表要回答「正解死在链路哪一步」，而
+ * <pre>
+ *   正解不在 fused 里  →  可能是「融合把它丢了」（该调 RRF 参数）
+ *                        也可能是「融合留下了它，只是排在第 25 名、被记录截掉」
+ *                        （什么都不用调）—— 两个结论相反
+ * </pre>
+ *
+ * <p>没有 {@code sizes} 时，评测脚本只能<b>断言</b>底部那几段没被截到；
+ * 有了它，这件事变成<b>可读出来的事实</b>：某一段的 {@code size} 大于它的
+ * 实际条数，就说明这一段被截过，在它里面的「找不到」必须降级成「不知道」。
+ *
+ * <p>★ 2026-09-21 实测：当时 {@code fused} 每行都是<b>恰好 20 条</b>，而 RRF
+ * 返回的是两路的<b>完整并集</b>（20~40 条）—— 也就是说这个坑当时就在脚下，
+ * 只是恰好没有一个正解落在第 21 名之后（389 道题里 0 道）。
+ * 这种「这次没事」不是安全，是运气。<b>写下来它才从运气变成证据。</b>
+ *
  * <h2>四、★ 字段分两类，判断标准是「它属不属于那五段」</h2>
  *
- * <p><b>恒定存在的 6 个 key</b>（{@code vector_hits} 到 {@code filter}）——
+ * <p><b>恒定存在的 7 个 key</b>（{@code vector_hits} 到 {@code sizes}）——
  * 语义永不改变，<b>永远出现</b>，哪怕值是空数组。
  * 阶段 7 的对比脚本可以按固定路径直接读，不用先判断 key 在不在。
  *
@@ -94,6 +115,7 @@ public class RetrievalDetailBuilder {
         detail.put("reranked", withScore(trace.reranked(), "rerank_score"));
         detail.put("final_top_k", trace.finalChunkIds());
         detail.put("filter", filterSection(trace.filter()));
+        detail.put("sizes", sizesSection(trace));
 
         // ── 以下是附加字段，只在有内容时出现 ──
         List<String> events = trace.events();
@@ -142,10 +164,37 @@ public class RetrievalDetailBuilder {
     }
 
     /**
+     * 每一段<b>在截断之前</b>有多少条（阶段 7）。
+     *
+     * <p>和 {@link #withScore} 读的是<b>同一个 {@code trace}</b> ——
+     * 所以「记录了几条」和「本来有几条」永远不会各自漂移。
+     * ★ 这一点是刻意的：如果 {@code sizes} 由 pipeline 另行汇报，
+     * 那它就是第二个事实来源，而两个来源迟早会说不同的话。
+     *
+     * <p>⚠️ <b>{@code sizes}</b> 这个 key 在 V5 的结构里没有，是阶段 7 新增的。
+     * 已经落库的历史行里<b>没有它</b> —— 读的一方必须把「缺席」解释成
+     * <b>「不知道有没有被截断」</b>，而不是「没被截断」。
+     * 把缺席当成后者，就是拿一个没测过的假设去支撑归因结论。
+     * 报告端点里那段判空就是为此而写。
+     */
+    private static Map<String, Object> sizesSection(RetrievalTrace trace) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("vector_hits", trace.vectorHits().size());
+        out.put("keyword_hits", trace.keywordHits().size());
+        out.put("fused", trace.fused().size());
+        out.put("reranked", trace.reranked().size());
+        out.put("final_top_k", trace.finalChunks().size());
+        return out;
+    }
+
+    /**
      * 把一段结果转成 {@code [{chunk_id, <分值字段名>}]}。
      *
      * <p>只记 id 和分数，<b>不记正文</b> —— 正文在 {@code kb_chunk} 里，
      * 按 id 就能取回。把正文也塞进来会让这个 JSONB 字段的体积再涨一个数量级。
+     *
+     * <p>★ 这里就是截断实际发生的地方。{@code sizes} 记的是<b>传进来的 {@code chunks}
+     * 的长度</b>（截断之前），所以「记录条数 &lt; size」当且仅当这一段被截过。
      */
     private static List<Map<String, Object>> withScore(List<RetrievedChunk> chunks, String scoreField) {
         int size = Math.min(chunks.size(), MAX_ENTRIES_PER_SECTION);

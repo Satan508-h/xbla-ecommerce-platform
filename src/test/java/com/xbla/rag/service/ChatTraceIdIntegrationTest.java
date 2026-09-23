@@ -277,7 +277,7 @@ class ChatTraceIdIntegrationTest {
             String question = uniqueQuestion("退货要几天");
 
             chatService.ask(new ChatAskRequest(null, question, null), null,
-                    new CallContext(GIVEN, 1234, 7));
+                    new CallContext(GIVEN, 1234, 7, null));
 
             QaLog row = logOf(GIVEN);
             assertEquals(1234, row.getQueueMs(),
@@ -317,7 +317,7 @@ class ChatTraceIdIntegrationTest {
             CapturingSink sink = new CapturingSink();
 
             chatService.askStream(new ChatAskRequest(null, question, null), sink,
-                    new CallContext(GIVEN, 4321, 3));
+                    new CallContext(GIVEN, 4321, 3, null));
 
             QaLog row = logOf(GIVEN);
             assertEquals(4321, row.getQueueMs(),
@@ -336,7 +336,7 @@ class ChatTraceIdIntegrationTest {
                     "NEEDS_CLARIFICATION", DESCRIPTOR, null, 10L, "你到底想问哪款？"));
 
             chatService.ask(new ChatAskRequest(null, uniqueQuestion("那个怎么样"), null), null,
-                    new CallContext(GIVEN, 999, 2));
+                    new CallContext(GIVEN, 999, 2, null));
 
             QaLog row = logOf(GIVEN);
             assertEquals(QaLog.STATUS_CLARIFY, row.getStatus());

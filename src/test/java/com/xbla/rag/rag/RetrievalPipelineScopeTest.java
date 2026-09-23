@@ -112,6 +112,98 @@ class RetrievalPipelineScopeTest {
     }
 
     // ============================================================
+    // 〇、★★ 总开关（阶段 7 新增）—— 排在「一」之前，
+    //     因为它在 resolveScope 里就是【最先被判断】的那一格
+    // ============================================================
+
+    @Nested
+    @DisplayName("〇、★★ 总开关：by-intent.enabled=false")
+    class SwitchOff {
+
+        /**
+         * ★★ 正-反对照写【在同一个方法里】，不拆成两个测试。
+         *
+         * <p>拆成两个测试的话，反对照那条会在别的地方被改坏而没人注意 ——
+         * 而它正是「开关确实是那个变量」的唯一证据。
+         * 合在一起，改坏任何一半这个方法都会红。
+         */
+        @Test
+        @DisplayName("★★ 开着→真的下推；关掉→条件从 SQL 里消失、理由变成 disabled_by_config")
+        void disabledByConfig() {
+            when(chunkMapper.countByDocTypes(DOC_TYPES_2_4)).thenReturn(67);
+            stubHits(vectorRetriever, 3);
+            stubHits(keywordRetriever, 2);
+
+            // ── 反对照：开关【开】着，同一份声明 → 过滤真的下推到 SQL ──
+            assertThat(properties.getRetrieve().getByIntent().isEnabled())
+                    .as("★ 默认必须是 true —— 关掉的默认值会让所有历史数字在无人察觉的情况下换口径")
+                    .isTrue();
+            RetrievalTrace on = new RetrievalTrace("t-on");
+            pipeline.retrieve(QUESTION, new RetrievalOptions(20, List.of(2, 4)), on);
+
+            assertThat(on.filter().reason())
+                    .isEqualTo(RetrievalTrace.FilterScope.Reason.OK);
+            assertThat(on.filter().applied()).isTrue();
+            assertThat(optionsSentTo(vectorRetriever).docTypesLiteral())
+                    .as("反对照的落点：开关开着时这条语句【确实】带条件。"
+                            + "没有这一句，下面那条 \"不过滤\" 的断言可能只是"
+                            + "因为别的原因恒真")
+                    .isEqualTo("{2,4}");
+
+            // ── 正照：关掉，同一份声明 → 条件消失 ──
+            properties.getRetrieve().getByIntent().setEnabled(false);
+            RetrievalTrace off = new RetrievalTrace("t-off");
+            pipeline.retrieve(QUESTION, new RetrievalOptions(20, List.of(2, 4)), off);
+
+            assertThat(off.filter().reason())
+                    .as("★★ 必须是 disabled_by_config，【不能】是 no_declaration —— "
+                            + "调用方明明声明了。复用 no_declaration 的后果是："
+                            + "读 trace 的人会去查那个调用方为什么没传 docTypes，"
+                            + "而真正的原因在 application.yml 里。"
+                            + "两件事的修法一个在代码、一个在配置，症状却逐字相同")
+                    .isEqualTo(RetrievalTrace.FilterScope.Reason.DISABLED_BY_CONFIG);
+            assertThat(off.filter().applied()).isFalse();
+            assertThat(off.filter().docTypes())
+                    .as("★ 声明的集合仍然【如实记录】—— 它确实声明了，只是没被用上。"
+                            + "于是「docTypes 非空 且 applied=false」"
+                            + "这个组合本身就是一封信：去看 reason")
+                    .containsExactly(2, 4);
+            assertThat(off.filter().poolSize())
+                    .as("★ 与 no_declaration 那条一样：不打算用这个集合，就不发那次 count 查询。"
+                            + "「关掉时池子多大」在报告里没有用武之地")
+                    .isNull();
+            verify(chunkMapper, times(1))
+                    .countByDocTypes(anyString());   // 只被【开着】的那一次查过
+
+            assertThat(optionsSentTo(vectorRetriever).docTypesLiteral())
+                    .as("★ 关掉 = SQL 里没有条件 = 全池检索。这一条是开关的"
+                            + "全部语义；它不成立的话，A/B 的两轮其实在跑同一个配置，"
+                            + "而差异会全部落进噪声里 —— 且不报错")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("★ 关掉时不看池子大小：池子再小也照样不过滤（顺序证明）")
+        void disabledSkipsThePoolCheckEntirely() {
+            // 池子小到会被 small_pool 拦下 —— 但开关关着，那条规则够不着
+            when(chunkMapper.countByDocTypes(DOC_TYPES_5)).thenReturn(5);
+            stubHits(vectorRetriever, 3);
+            stubHits(keywordRetriever, 2);
+            properties.getRetrieve().getByIntent().setEnabled(false);
+
+            RetrievalTrace trace = new RetrievalTrace("t");
+            pipeline.retrieve(QUESTION, new RetrievalOptions(20, List.of(5)), trace);
+
+            assertThat(trace.filter().reason())
+                    .as("★ 这条测的是【判断顺序】：关掉时 small_pool 那条分支"
+                            + "根本不会被走到。顺序写反的话，两轮的 retrieval_detail"
+                            + "会在不同的 reason 之间飘，A/B 的归因就不可读了")
+                    .isEqualTo(RetrievalTrace.FilterScope.Reason.DISABLED_BY_CONFIG);
+            verify(chunkMapper, never()).countByDocTypes(anyString());
+        }
+    }
+
+    // ============================================================
     // 一、★ 三条正常分支
     // ============================================================
 

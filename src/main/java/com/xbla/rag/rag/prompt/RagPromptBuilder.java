@@ -77,7 +77,15 @@ public class RagPromptBuilder {
      * 正常情况下永远轮不到它。但如果那个配置被改错、或者有人绕过切分器
      * 直接写了一个巨大的切片，这里能保证 prompt 不会被一段话撑爆。
      */
-    private static final int MAX_CHARS_PER_CHUNK = 1000;
+    /**
+     * 单条切片进 prompt 的字符上限。
+     *
+     * <p>★★ <b>阶段 7.5 起是 public</b>：评测要把切片交给 RAGAS 当
+     * {@code retrieved_contexts}，必须按<b>同一个</b>上限截断。
+     * 测试也拿它造边界数据 —— 写成字面量 1000 的话，
+     * 改了这里而没改测试，那条测试会<b>继续绿</b>，只是不再守任何东西。
+     */
+    public static final int MAX_CHARS_PER_CHUNK = 1000;
 
     /** 引用编号的格式：[1] [2] …… 模型被要求用它标注来源 */
     private static final String MATERIALS_HEADER = "【知识库资料】";
@@ -262,8 +270,17 @@ public class RagPromptBuilder {
      * <p>★ <b>不补齐空白</b>。写成 {@code String.format("%-10s", category)}
      * 让冒号对齐看起来更整齐，但那会往 prompt 里塞一堆无意义的空格 token，
      * 而且中文在等宽字体里占两格、{@code %-10s} 按字符数补 —— 补了也对不齐。
+     *
+     * <p>★★ <b>阶段 7.5 起是 public</b>：RAGAS 的 faithfulness 判的是
+     * 「答案有没有被<b>模型当时看到的全部输入</b>支持」，而这个固定段
+     * <b>不在 {@code qa_log.references} 里</b>（实测：{@code MT-005} 的答案说「7 天」，
+     * 它引用的 5 条切片里一个天数都没有）。
+     *
+     * <p>⚠️ 所以评测<b>不能</b>自己再写一遍这个渲染 —— 那就是第二个事实来源，
+     * 它和这里的漂移是<b>静默</b>的：报告里的 faithfulness 会因此偏低，
+     * 而看报告的人会去调一个根本没坏的东西。同 ADR-058 那条「只写一次」。
      */
-    private static String factsSection(StructuredFacts facts) {
+    public static String factsSection(StructuredFacts facts) {
         StringBuilder sb = new StringBuilder(256);
         sb.append(FACTS_HEADER).append('\n');
         sb.append("以下是平台政策库里的结构化字段，是准确值，回答时限时以此为准：\n");
@@ -285,7 +302,15 @@ public class RagPromptBuilder {
         return sb.toString();
     }
 
-    private static String truncate(String content) {
+    /**
+     * 单条切片进 prompt 前的截断。
+     *
+     * <p>★★ <b>阶段 7.5 起是 public</b>：评测要把切片正文交给 RAGAS 当
+     * {@code retrieved_contexts}，而模型看到的是<b>截断后</b>的版本。
+     * 不截断就是让评判标准比被评对象<b>更宽</b> —— 答案里依据了
+     * 第 1001 字之后的内容时，faithfulness 会判它「无依据」。
+     */
+    public static String truncate(String content) {
         if (content == null) {
             return "";
         }

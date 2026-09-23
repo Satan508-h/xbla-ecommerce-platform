@@ -158,6 +158,42 @@ public class QaLog {
      */
     private Integer queuePosition;
 
+    /**
+     * 评测运行 ID（阶段 7）。
+     *
+     * <p>★★ <b>{@code NULL} = 真实用户的提问，是常态。</b>
+     * 阶段 7 的答案质量指标必须跑真实 {@code /api/chat}（唯一的产出答案的路径），
+     * 于是评测记录会写进这张表 —— 没有这一列，两者就<b>永远分不开</b>，
+     * 而「分不开」没有任何症状，只会让真实使用的统计被评测数据主导。
+     *
+     * <p>★ <b>统计真实使用必须写 {@code WHERE eval_run_id IS NULL}</b>；
+     * 统计某轮评测写 {@code WHERE eval_run_id = ?} 并按
+     * {@link #evalQuestionNo} 归题。两条都不加 = 数字被评测数据主导。
+     * 这和「只统计 {@code status = 1}」是同一种形态的纪律：
+     * 一个<b>必须每处都记得</b>的条件。之所以仍然用加列而不是另开一张表，
+     * 是因为它至少可查（{@code GROUP BY eval_run_id} 一眼看出表里混了多少评测数据）。
+     *
+     * <p>⚠️ 与 {@code chat_session.user_id} 那条路无关：走 chat 时它恒为 NULL
+     * （见 {@code ChatServiceImpl.resolveSession}），所以「用 userId 区分评测」
+     * 是走不通的。
+     */
+    private String evalRunId;
+
+    /**
+     * 该轮评测里的题号（阶段 7），对应 {@code eval_question.question_no}。
+     *
+     * <p>★★ <b>它必须是一列，不能让报告端点拿
+     * {@code qa_log.question = eval_question.question} 去 JOIN。</b>
+     * 那种 JOIN 会在<b>真实用户恰好问了同一个问题</b>时把那一行也算进评测统计 ——
+     * 不报错，只是数字偏了（同 ADR-057「一个名字只写一次」的镜像：
+     * 一个事实只存一次）。
+     *
+     * <p>⚠️ 它和 {@link #evalRunId} 应当成对出现。只出现一个的行
+     * <b>既进不了评测统计、又混在真实数据里</b>，两头都不属于 ——
+     * 所以报告端点会把这种行单独数出来报，而不是当它不存在。
+     */
+    private String evalQuestionNo;
+
     // ================================================================
     // status 的四个取值（与 V5 / V7 / V9 的 CHECK 约束一致）
     //

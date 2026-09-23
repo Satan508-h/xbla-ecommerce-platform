@@ -14,6 +14,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -94,12 +98,35 @@ public class OpenAiHttpTransport {
                                 Object body, Duration timeout) {
         HttpRequest request = buildRequest(endpoint, path, body, timeout);
 
+        // ★★★ 为什么是 sendAsync(...).get(timeout) 而不是 send()（阶段 7 补）
+        //
+        // 因为 send() 内部是【不带超时的】future.get()，它把「什么时候放弃」
+        // 整个托付给了 HttpRequest.timeout()。而实测那次托付失败了：
+        //
+        //   2026-09-21 的一次跑批里，两个出站调用挂着不返回，
+        //   HttpRequest.timeout()（180 秒）始终没有触发，
+        //   `answer-5` / `answer-7` 两个线程停在 HttpClientImpl.send() 里
+        //   超过 60 分钟没动 —— 而 .timeout() 确实设了（见 buildRequest）。
+        //
+        // 后果不只是「一次调用慢」：那个线程不结束 → 它的 finally 不执行 →
+        // 名额不释放 → 而心跳一直替它续期 → 8 个名额掉到 6 个，永不恢复。
+        // 链路是「出站调用挂死」→「容量静默变少」，中间隔了四层，
+        // 所以这个根因必须在这里修，不能靠下游兜。
+        //
+        // ★ .get(timeout) 是【我们自己的】闸门：它是 ForkJoinPool.managedBlock
+        //   上的标准等待，到点必抛 TimeoutException，不依赖 JDK 内部的
+        //   定时器还活着。多一道和 .timeout() 同长的闸门不会有副作用 ——
+        //   谁先响都行，两条路最后都归到 ModelErrorKind.TIMEOUT。
+        CompletableFuture<HttpResponse<String>> pending =
+                httpClient.sendAsync(request,
+                        HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
         try {
             log.debug("→ 模型请求 provider={} model={} url={}",
                     endpoint.provider(), modelKey, request.uri());
 
-            HttpResponse<String> response = httpClient.send(
-                    request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpResponse<String> response =
+                    pending.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
 
             log.debug("← 模型响应 provider={} model={} status={} len={}",
                     endpoint.provider(), modelKey, response.statusCode(),
@@ -114,10 +141,32 @@ public class OpenAiHttpTransport {
 
         } catch (ModelCallException e) {
             throw e;
-        } catch (IOException | InterruptedException e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
+
+        } catch (TimeoutException e) {
+            // ★ 我们不等了。但那个请求本身还在飞 —— 取消它是为了让 JDK
+            //   早点把连接和缓冲还回去，否则每次超时都留一份垃圾。
+            //   ⚠️ 取消【不保证】能让对端停下（它只是个本地动作），
+            //      这里也不假装它保证了 —— 我们要的只是「本地有界」。
+            pending.cancel(true);
+            // ★ 用【带原因的那个】异常类：of() 里已经把 TimeoutException 映射成
+            //   ModelErrorKind.TIMEOUT，所以这里不需要再造一个 HttpTimeoutException
+            //   来「骗」分类器 —— 分类规则只有一处，在 ModelCallException.of 里。
+            throw ModelCallException.of(
+                    new TimeoutException("出站调用超过 " + timeout.toSeconds()
+                            + " 秒未返回，调用方主动放弃"),
+                    endpoint.provider(), modelKey);
+
+        } catch (ExecutionException e) {
+            // ★ 拆掉 CompletableFuture 的包装，把【真实原因】交给分类器 ——
+            //   包着 ExecutionException 送进去，所有 IOException 都会被归成 UNKNOWN，
+            //   而 UNKNOWN 在熔断器里的含义和 TIMEOUT/CONNECT 完全不同。
+            throw ModelCallException.of(
+                    e.getCause() == null ? e : e.getCause(),
+                    endpoint.provider(), modelKey);
+
+        } catch (InterruptedException e) {
+            // ★ 中断标志必须还原 —— 吞掉它会让上层的关闭流程失去信号。
+            Thread.currentThread().interrupt();
             throw ModelCallException.of(e, endpoint.provider(), modelKey);
         }
     }
@@ -152,16 +201,38 @@ public class OpenAiHttpTransport {
         HttpRequest request = buildRequest(endpoint, path, body, timeout);
 
         HttpResponse<Stream<String>> response;
+        // ★★ 和 postForString 同一个理由、同一个修法（阶段 7）——
+        //    `send()` 内部的 future.get() 没有超时，什么时候放弃完全交给
+        //    HttpRequest.timeout()，而实测它会不触发。流式这条路一样会
+        //    永久挂住，一样会占着名额不放（挂住的线程不结束，finally 不执行）。
+        //
+        // ⚠️ 注意这里的语义：ofLines() 的 body 是【懒】的，
+        //    所以 get(timeout) 等的是「响应头到达」，不是「回答生成完」。
+        //    这正好对应 request-timeout（15 秒）的文档口径。
+        //    头之后的边读边推由 SseEmitter 的预算管，不在这里。
+        CompletableFuture<HttpResponse<Stream<String>>> pending =
+                httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofLines());
         try {
             log.debug("→ 模型流式请求 provider={} model={} url={}",
                     endpoint.provider(), modelKey, request.uri());
 
-            response = httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+            response = pending.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
 
-        } catch (IOException | InterruptedException e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
+        } catch (TimeoutException e) {
+            // 建连/首字节阶段超时 —— 一个字节都没发给用户，可以安全降级
+            pending.cancel(true);
+            throw ModelCallException.of(
+                    new TimeoutException("流式请求超过 " + timeout.toSeconds()
+                            + " 秒未收到响应头，调用方主动放弃"),
+                    endpoint.provider(), modelKey);
+
+        } catch (ExecutionException e) {
+            throw ModelCallException.of(
+                    e.getCause() == null ? e : e.getCause(),
+                    endpoint.provider(), modelKey);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             // 建连阶段失败 —— 一个字节都没发出去，可以安全降级
             throw ModelCallException.of(e, endpoint.provider(), modelKey);
         }

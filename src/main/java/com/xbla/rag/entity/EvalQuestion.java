@@ -64,13 +64,107 @@ public class EvalQuestion {
     /** 难度：1易 2中 3难 */
     private Integer difficulty;
 
-    /** 是否纳入基线评测集，用于 A/B 对比 */
-    private Boolean isBaseline;
+    /**
+     * 这道题属于哪一套题集（阶段 7）。
+     *
+     * <p>★ 取值（三套）：{@code baseline}（阶段 4 的 20 道反向构造题）/
+     * {@code stage7}（阶段 7 的 ~150 道单轮题）/ {@code stage7-multi}（多轮追问题）。
+     *
+     * <p>★★ <b>三套的口径不同，不能混在一起算指标</b>：
+     * 前两套是单轮的（一题一 gold），多轮那套的「正确答案」依赖上下文。
+     * 报告里每张表都要写清它统计的是哪一套。
+     *
+     * <p>⚠️ 它取代了 V5 的 {@code is_baseline}（boolean，恒为 true）。
+     * 取代的理由写在 V11 迁移里，一句话：<b>boolean 表达不了三套题，
+     * 而一个恒为 true 的列不携带信息</b>。
+     *
+     * <p>★ 列上<b>没有 DEFAULT</b>：漏写会 INSERT 失败，而不是被静默填成某一套。
+     */
+    private String questionSet;
 
-    /** 题目来源（真实提问 / 人工构造） */
+    /**
+     * 这道题<b>是怎么造出来的</b>。
+     *
+     * <p>取值：{@code reverse_constructed}（先看切片、再写问题 —— 阶段 4 的 20 题）/
+     * {@code corpus_driven_manual}（读语料后按用户口吻手写 —— 阶段 7 的 150 题）。
+     *
+     * <p>★ 它必须是一列，因为<b>两种构造方式有各自已知的偏差</b>
+     * （见 {@code docs/06} §2.2），而报告里必须把偏差讲清楚。
+     * 一份读起来很专业的报告如果不写「这些题是怎么来的」，
+     * 它的数字可以被解释成完全不同的东西。
+     */
     private String source;
 
     private String annotatedBy;
+
+    /**
+     * 工具类题目要用哪个用户身份去调 MCP 工具（阶段 7 批次 5）。
+     *
+     * <p>★★ <b>身份只能从这里读，由跑题器写进 {@code X-Xbla-User-Id} 请求头</b> ——
+     * 绝不能变成工具的参数（ADR-054：工具参数是<b>模型填的</b>，
+     * 加一个 {@code user_id} 参数就是模型可控的越权入口）。
+     *
+     * <p>⚠️ <b>可空</b>：知识库题与兜底题不需要身份，给它们填一个值反而是噪声
+     * （并会让人以为「所有题都有用户」）。
+     *
+     * <p>★ 不加这一列的后果<b>不是报错而是静默</b>：工具收到空身份 →
+     * 返回「未登录」→ 模型如实转述 → 报告显示「订单类问题 0% 正确」，
+     * 而真正的原因是评测自身没带身份 —— 与「模型不行」在报告上长得一模一样。
+     */
+    private Long userId;
+
+    /**
+     * ★ 显式声明「这道题<b>本来就没有</b>检索目标」（工具调用 / 兜底 / 澄清）。
+     *
+     * <p>阶段 7 的题库里有 28 道这样的题（工具 15 + 兜底 7 + 澄清 6）——
+     * 它们的正确答案不在知识库里，检索指标的分母里也不该有它们
+     * （docs/06：空 gold 题单独一桶）。
+     *
+     * <p>★★ <b>为什么要单独一列，而不是「{@code expectedChunkIds} 为空即可」</b>：
+     * 「空 gold」与「漏写锚点」在数据上长得一模一样。写题时漏一个
+     * {@code anchors} 段，那道题会<b>静默退出检索指标</b> ——
+     * 题数少一道看不出来、指标也不会错，只是那道题再也不测任何东西了。
+     * 所以加载器要求：没有锚点的题<b>必须</b>显式声明这个字段，
+     * 否则当场报错（见 {@code EvalQuestionLoader#parseOne}）。
+     *
+     * <p>★ 报告端点用 {@code WHERE NOT expect_no_retrieval} 排除它们，
+     * 而不必去猜「空数组是声明的还是写错了」—— <b>让数据自己说清楚</b>。
+     */
+    private Boolean expectNoRetrieval;
+
+    /**
+     * 多轮题的完整轮次（JSON 字符串数组，按时间顺序）。单轮题为 {@code null}。
+     *
+     * <p>数据库列是 {@code JSONB}，Java 侧是 {@code String} ——
+     * 和 {@code qa_log.retrieval_detail} / {@code tool_calls} 同一条约定
+     * （JSONB 存、String 进出）。
+     *
+     * <p>★ <b>最后一轮就是被测量那一轮</b>，加载器把它取出来填进 {@link #question} ——
+     * 所以题库里<b>不写</b> {@code question} 字段（两个都写会加载失败，见
+     * {@code EvalQuestionLoader#parseOne}）。
+     *
+     * <p><b>为什么多轮题要单独一套</b>：分类与检索<b>都</b>只拿到当前这一句
+     * （{@code ChatServiceImpl:177} / {@code :213}），所以「追问轮的意图」
+     * 在单轮口径下不是一个可测量的量。这一列让「上一句话建立起来的那个东西
+     * 还在不在」第一次变成可测量的东西。
+     */
+    private String turns;
+
+    /**
+     * ★ 「把最后一轮单独说该怎么说」—— 本题的 {@code intent} / {@code anchors} /
+     * {@code expectedAnswer} <b>全部按这一句标</b>。
+     *
+     * <p>理由：用户真正想问的是这个意思，追问句只是它在上下文里的一种省略说法。
+     * 若反过来按「分类器看到的那七个字」标 gold，这一套题就退化成单轮题集的副本。
+     *
+     * <p>⚠️ 它是给跑题器读的 <b>gold</b>（「单独问 vs 追问」的对照），不是注释 ——
+     * 所以是列，不是 {@code notes} 里的一段散文。
+     *
+     * <p>★ 与 {@link #turns} <b>同生同死</b>（数据库有一条 CHECK 强制）：
+     * 只有 turns 没有它就是「这题没有 gold」，只有它没有 turns 就是
+     * 「一道写错了字段名的单轮题」。两种半成品都不留。
+     */
+    private String standaloneQuestion;
 
     private OffsetDateTime annotatedAt;
 

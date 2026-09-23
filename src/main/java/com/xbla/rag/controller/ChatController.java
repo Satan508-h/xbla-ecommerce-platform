@@ -1,6 +1,7 @@
 package com.xbla.rag.controller;
 
 import com.xbla.rag.common.ApiResponse;
+import com.xbla.rag.common.EvalMark;
 import com.xbla.rag.common.TraceId;
 import com.xbla.rag.config.RateLimitProperties;
 import com.xbla.rag.dto.ChatAskRequest;
@@ -145,12 +146,42 @@ public class ChatController {
         Long userId = resolveUserId(http);
 
         ChatAskResponse response = admission.submitAndWait(
-                new ChatAdmissionService.Admission(traceId, request.question(), userId),
+                new ChatAdmissionService.Admission(traceId, request.question(), userId,
+                        resolveEvalMark(http)),
                 // ★ 三参重载：沿用排队层那个 traceId，并把 queue_ms / queue_position
                 //   一起带进 ChatService 落进 qa_log。
                 ctx -> chatService.ask(request, userId, ctx));
 
         return ApiResponse.ok(response);
+    }
+
+    /**
+     * 从请求头取评测运行标记（阶段 7）—— <b>没有就是真实用户流量</b>。
+     *
+     * <h3>★ 为什么它和身份走同一套机制（从头上读、一路透传）</h3>
+     *
+     * <p>两者是同一类东西：<b>调用方声明的元信息，不参与任何业务判断</b>，
+     * 唯一的用途是让事后的统计能<b>分得开</b>。
+     *
+     * <h3>⚠️ 它也不是认证 —— 而且这里比身份更无所谓</h3>
+     *
+     * <p>任何人都可以带这个头，把自己的提问标成「评测流量」。
+     * 后果是那一行被排除在「真实使用统计」之外 ——
+     * <b>破坏的是我们自己的报表，不是别人的数据</b>。
+     * （对照：伪造 {@code X-Xbla-User-Id} 能读到别人的优惠券，
+     * 那是真的越权，见 {@code McpToolContext} 的说明。）
+     *
+     * <p>★ 但仍然不能在公网暴露期放开 —— 阶段 8 加认证时这两个头一起处理。
+     *
+     * <h3>★ 为什么要单独一个方法，而不是内联两行</h3>
+     *
+     * <p>两条路（非流式 / 流式）都要读它，而「两条平行路径漏改一条」
+     * 是本项目已经踩过的坑（ADR-047）。抽成一个方法，
+     * 下次加第三个头时只有一处要改。
+     */
+    private static EvalMark resolveEvalMark(HttpServletRequest http) {
+        return EvalMark.of(http.getHeader(EvalMark.HEADER_RUN_ID),
+                http.getHeader(EvalMark.HEADER_QUESTION_NO));
     }
 
     /**
@@ -236,8 +267,10 @@ public class ChatController {
 
         // ★ 身份在这里解析（和 /api/chat 同一个头），带进排队层只为
         //   在被拒绝时能写出一行完整的 qa_log —— 见 Admission 的说明。
+        //   ★ 评测标记走同一个来源（resolveEvalMark），理由见那个方法。
         admission.submit(
-                new ChatAdmissionService.Admission(traceId, question, resolveUserId(http)),
+                new ChatAdmissionService.Admission(traceId, question, resolveUserId(http),
+                        resolveEvalMark(http)),
                 new QueueEventListener(channel, traceId),
                 // ★★ 这段 work 跑在 answer- 线程上，而【名额的释放在它外面的 finally 里】——
                 //    由 ChatAdmissionService 保证，所以这里不需要（也不该）管名额。

@@ -1,6 +1,8 @@
 package com.xbla.rag.ratelimit;
 
+import com.xbla.rag.common.EvalMark;
 import com.xbla.rag.config.RateLimitProperties;
+import com.xbla.rag.service.CallContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -10,6 +12,7 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -58,6 +61,9 @@ class QueueHeartbeatDisabledTest {
     @Autowired
     private StringRedisTemplate redis;
 
+    @Autowired
+    private ChatAdmissionService admission;
+
     private RedisQueueKeys keys() {
         return RedisQueueKeys.from(props);
     }
@@ -104,5 +110,78 @@ class QueueHeartbeatDisabledTest {
 
         assertTrue(keys().allKeys().stream().allMatch(k -> redis.hasKey(k) == false),
                 "等了一秒后 Redis 里出现了 key —— 说明有别的东西在后台跑");
+    }
+
+    // ============================================================
+    // ★★ 阶段 7：评测标记在这条【最容易被漏掉】的路上也要活着
+    // ============================================================
+
+    /**
+     * 关掉排队时，{@code ChatAdmissionService} 走的是<b>另一条分支</b>
+     * （{@code submitWithBudget} 里第一个 if），它自己构造 {@code CallContext}。
+     *
+     * <p>★★ 这条分支是全链路里最容易漏掉评测标记的地方，原因是：
+     *
+     * <pre>
+     *   它【不排队】—— 所以没有任何排队日志、没有任何 SSE 事件、
+     *   探针的 /state 也看不出区别。漏了标记之后一切照常，
+     *   只是那一轮评测的几百行数据全变成了「真实用户」。
+     * </pre>
+     *
+     * <p>★ 而且它只在<b>关掉排队的那个上下文</b>里才跑得到 ——
+     * 别的测试类起的是 enabled=true 的上下文，覆盖不到这里。
+     * 这就是为什么这条断言必须写在这个类里。
+     *
+     * <p>★ 这也是对本类主题的一个旁证：{@code Context} 里的排队两列
+     * 仍然是 null（「没开排队」该有的样子），而评测标记<b>照样在</b> ——
+     * 两件事互不影响，因为它们各自回答的是不同的问题。
+     *
+     * <h3>★ 关掉排队 ≠ 关掉线程池</h3>
+     *
+     * <p>第一版这里写的是「关掉时 {@code submit} 是同步的，返回时 work 一定跑完了」——
+     * <b>实测是错的</b>。{@code submitWithBudget} 的 disabled 分支虽然不排队，
+     * 但它照样把 work 交给 {@code runWithRelease}，而那个方法<b>无论如何都
+     * {@code answerExecutor.execute(...)}</b>（那里是「名额归还的唯一出口」，
+     * 释放绑在 work 的 {@code finally} 上）。
+     *
+     * <p>所以这条路径也是异步的，测试必须等 —— 不等的话会拿到一个 null，
+     * 而失败信息会指向「标记丢了」，指向一个根本没发生的问题。
+     */
+    @Test
+    @DisplayName("★★ 关掉排队时，评测标记仍然要传到 CallContext")
+    void evalMarkSurvivesOnTheDisabledPath() throws Exception {
+        EvalMark mark = EvalMark.of("run-disabled", "X-009");
+        java.util.concurrent.atomic.AtomicReference<CallContext> captured =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+
+        admission.submit(new ChatAdmissionService.Admission(
+                        "t-eval-disabled", "退货要几天", null, mark),
+                new RecordingQueueListener(),
+                ctx -> {
+                    captured.set(ctx);
+                    done.countDown();
+                });
+
+        assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "work 在 5 秒内没有跑 —— 关掉排队时它也是异步的"
+                        + "（交给 answer- 线程池），所以这里必须等");
+
+        CallContext ctx = captured.get();
+        assertNotNull(ctx, "拿到锁存器却拿不到上下文 —— 这条路径的行为变了");
+        assertNotNull(ctx.eval(),
+                "★★ 关掉排队时评测标记被丢了 —— 那一轮评测的每一行都会伪装成真实用户流量，\n"
+                        + "   而这条路径【不排队】，所以没有任何日志或事件能看出它被丢了。\n"
+                        + "   检查 ChatAdmissionService.submitWithBudget 的第一个 if：\n"
+                        + "   它必须走 CallContext.fresh(traceId, admission.eval())，\n"
+                        + "   而不是 CallContext.fresh(traceId)");
+        assertEquals("run-disabled", ctx.eval().runId());
+        assertEquals("X-009", ctx.eval().questionNo());
+
+        // ★ 反对照：排队两列仍然是 null —— 「没开排队」和「评测」是两件事，
+        //   前者不该因为后者而被填上一个值
+        assertTrue(ctx.queueMs() == null,
+                "关掉排队时 queue_ms 必须是 null（不是 0）—— 见 ADR-010 与 V9 的注释");
+        assertTrue(ctx.queuePosition() == null);
     }
 }

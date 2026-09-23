@@ -212,7 +212,11 @@ public class RateLimitProbeController {
                 + (label == null ? "" : " label=" + label);
 
         admission.submit(
-                new ChatAdmissionService.Admission(traceId, question, PROBE_USER_ID),
+                // ★ 评测标记传 null（阶段 7）：探针流量**不是**评测流量。
+                //   两者的区别是「谁在测谁」—— 探针测的是排队层自己（它连
+                //   ChatService 都不调），而评测测的是问答链路。
+                //   把探针标成评测会把「排队层的自检」混进 150 题的统计里。
+                new ChatAdmissionService.Admission(traceId, question, PROBE_USER_ID, null),
                 new QueueEventListener(channel, traceId),
                 ctx -> runFake(channel, traceId, hold, chunks, label));
 

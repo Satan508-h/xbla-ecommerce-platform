@@ -1,5 +1,6 @@
 package com.xbla.rag.ratelimit;
 
+import com.xbla.rag.common.EvalMark;
 import com.xbla.rag.config.RateLimitProperties;
 import com.xbla.rag.entity.QaLog;
 import com.xbla.rag.service.CallContext;
@@ -113,8 +114,17 @@ public class ChatAdmissionService {
      * @param traceId 链路 ID。<b>排队层生成，一路用到 {@code qa_log.trace_id}</b>
      * @param question 用户原话，只为写那一行记录
      * @param userId  身份，可为 null（流式路径目前不带身份）
+     * @param eval    评测运行标记（阶段 7）；<b>null = 真实用户的提问</b>。
+     *                见 {@link com.xbla.rag.common.EvalMark}。
+     *                <p>★ 它在<b>这一层</b>而不是 {@code CallContext} 里就出现，
+     *                是因为被拒绝的请求也要写 qa_log（{@link #rateLimitedLog}），
+     *                而那时还没有 {@code CallContext}。
+     *                <p>⚠️ 它必须被<b>两个</b>下游都带上：
+     *                {@code contextOf}（正常路径）和 {@code rateLimitedLog}（拒绝路径）。
+     *                漏掉后者的话，「评测里有多少题是因为排队被拒的」这个问题
+     *                就永远答不出来 —— 而那些行会伪装成真实用户流量。
      */
-    public record Admission(String traceId, String question, Long userId) {
+    public record Admission(String traceId, String question, Long userId, EvalMark eval) {
     }
 
     /**
@@ -239,7 +249,7 @@ public class ChatAdmissionService {
             //   这正是「没开排队」该有的样子。记 0 的话，阶段 7 分不清
             //   「没开排队」和「开了但没排队」，而那是两个不同的实验条件。
             //   （同 ADR-010「拿不到就记 NULL」、以及 rewritten_question 的处置。）
-            runWithRelease(admission, listener, CallContext.fresh(admission.traceId()), work);
+            runWithRelease(admission, listener, CallContext.fresh(admission.traceId(), admission.eval()), work);
             return;
         }
 
@@ -696,6 +706,15 @@ public class ChatAdmissionService {
         log.setQuestion(admission.question());
         log.setStatus(QaLog.STATUS_RATE_LIMITED);
 
+        // ★ 评测标记也要写在这一行上（阶段 7）。
+        //   这一行**绕过了 baseLog**（它是全项目唯一那样做的落库点），
+        //   所以字段是手写的 —— 漏一个不会报错，只会让「评测里有多少题
+        //   被排队拒了」永远算不出来，且那些行会伪装成真实用户流量。
+        if (admission.eval() != null) {
+            log.setEvalRunId(admission.eval().runId());
+            log.setEvalQuestionNo(admission.eval().questionNo());
+        }
+
         // ════════════════════════════════════════════════════════════
         // ★★★ queue_ms 【不是】「哪一种拒绝」的判据 —— reason 才是
         // ════════════════════════════════════════════════════════════
@@ -764,7 +783,7 @@ public class ChatAdmissionService {
      */
     private static CallContext contextOf(Admission admission, long waited, Integer initialPosition) {
         Integer queueMs = initialPosition == null ? null : (int) waited;
-        return new CallContext(admission.traceId(), queueMs, initialPosition);
+        return new CallContext(admission.traceId(), queueMs, initialPosition, admission.eval());
     }
 
     /** 被限流挡掉的累计次数 —— 出在探针上 */

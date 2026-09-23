@@ -30,15 +30,15 @@ class RetrievalDetailBuilderTest {
     }
 
     // ============================================================
-    // 一、冻结的 6 个 key
+    // 一、冻结的 7 个 key
     // ============================================================
 
     @Nested
-    @DisplayName("一、★ 冻结结构（V5 写死 5 个 + 5.4 加的第 6 个）")
+    @DisplayName("一、★ 冻结结构（V5 写死 5 个 + 5.4 加的第 6 个 + 7.4 加的第 7 个）")
     class FrozenStructure {
 
         @Test
-        @DisplayName("★ key 集合恰好是冻结的那 6 个")
+        @DisplayName("★ key 集合恰好是冻结的那 7 个")
         void hasExactlyFrozenKeys() {
             RetrievalTrace trace = new RetrievalTrace("t");
             trace.vectorHits(List.of(chunk(1, 0.9)));
@@ -51,10 +51,55 @@ class RetrievalDetailBuilderTest {
                     .as("★ 用 hasSameElementsAs 而不是 containsExactly —— "
                             + "JSONB 会把键重排（按 key 长度+字节序），"
                             + "任何「从库里读出来断言 key 顺序」的测试都必然失败。"
-                            + "这里断言的是集合相等，顺序无关")
+                            + "这里断言的是集合相等，顺序无关。"
+                            + "★★ 这条断言红过一次（阶段 7 加 sizes 时）—— 那是它【该红】："
+                            + "扩冻结结构必须是一次【看见了的】决定，"
+                            + "而不是改完没人知道。同 5.4 加 filter 那一次")
                     .hasSameElementsAs(List.of(
                             "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k",
-                            "filter"));
+                            "filter", "sizes"));
+        }
+
+        /**
+         * ★★★ 这一条是 {@code sizes} 存在的<b>全部理由</b>。
+         *
+         * <p>没有它，「这一段里没有正解」和「正解被截掉了」在数据上<b>完全一样</b>——
+         * 而两者的结论相反：前者要去调召回/切分，后者什么都不用调。
+         *
+         * <p>判据就是一条算术：<b>记录条数 &lt; size ⟺ 被截过</b>。
+         * 所以这里造 50 条，断言 size 是 50 而记录是 20 ——
+         * 两个数摆在一起，截断就被读出来了。
+         */
+        @Test
+        @DisplayName("★★ sizes 记的是【截断之前】的条数 —— 记录条数 < size ⟺ 被截过")
+        void sizesRecordsTheLengthBeforeTruncation() {
+            List<RetrievedChunk> fifty = new java.util.ArrayList<>();
+            for (int i = 1; i <= 50; i++) {
+                fifty.add(chunk(i, 1.0 / i));
+            }
+            RetrievalTrace trace = new RetrievalTrace("t");
+            trace.vectorHits(fifty);
+            trace.fused(fifty);
+            trace.finalChunks(List.of(chunk(1, 1.0)));
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sizes = (Map<String, Object>) builder.build(trace).get("sizes");
+
+            assertThat(sizes).containsOnlyKeys(
+                    "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k");
+            assertThat(sizes.get("vector_hits")).isEqualTo(50);
+            assertThat(sizes.get("fused")).isEqualTo(50);
+            assertThat(sizes.get("final_top_k")).isEqualTo(1);
+            assertThat(sizes.get("keyword_hits")).isEqualTo(0);
+
+            // ★★ 反对照：把「记录」和「真实」两个数放在一起，截断才算被读出来
+            assertThat((List<?>) builder.build(trace).get("vector_hits"))
+                    .as("★ 记录只有 " + RetrievalDetailBuilder.MAX_ENTRIES_PER_SECTION
+                            + " 条而 size 是 50 —— 这个不等式【就是】截断的定义。"
+                            + "少了 sizes，读的人只会看到 20 条，然后以为"
+                            + "「向量路召回了 20 条」—— 那个数是假的")
+                    .hasSize(RetrievalDetailBuilder.MAX_ENTRIES_PER_SECTION)
+                    .hasSizeLessThan((Integer) sizes.get("vector_hits"));
         }
 
         @Test
@@ -131,13 +176,21 @@ class RetrievalDetailBuilderTest {
         }
 
         @Test
-        @DisplayName("空 trace 仍然返回 6 个 key，值都是空列表 / 默认的 filter")
+        @DisplayName("空 trace 仍然返回 7 个 key，值都是空列表 / 默认的 filter")
         void emptyTraceKeepsStructure() {
             Map<String, Object> detail = builder.build(new RetrievalTrace("t"));
 
-            assertThat(detail).hasSize(6);
+            assertThat(detail).hasSize(7);
             assertThat(detail.get("vector_hits")).isEqualTo(List.of());
             assertThat(detail.get("final_top_k")).isEqualTo(List.of());
+
+            // ★ sizes 也属于【恒定存在】的那一类：一次没检索过的 trace 里，
+            //   「每一段都是 0 条」也是一个必须能被机器读到的事实
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sizes = (Map<String, Object>) detail.get("sizes");
+            assertThat(sizes).isNotNull();
+            assertThat(sizes.values()).as("空 trace 的每一段都是 0，不是 null")
+                    .containsOnly(0);
         }
 
         @Test
@@ -227,10 +280,10 @@ class RetrievalDetailBuilderTest {
 
             assertThat(detail).containsKey("events");
             assertThat(detail.keySet())
-                    .as("★ 6 个核心 key 必须仍然都在 —— 附加字段不能挤掉任何一个")
+                    .as("★ 7 个核心 key 必须仍然都在 —— 附加字段不能挤掉任何一个")
                     .containsAll(List.of(
                             "vector_hits", "keyword_hits", "fused", "reranked", "final_top_k",
-                            "filter"));
+                            "filter", "sizes"));
             assertThat((List<String>) detail.get("events"))
                     .as("失败事件是【给代码判断用】的结构化列表，不是一段自然语言")
                     .containsExactly("keyword_failed: 连接超时");

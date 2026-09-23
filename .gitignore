@@ -112,6 +112,11 @@ __pycache__/
 venv/
 env/
 ENV/
+# ★ RAGAS 的评测 venv（阶段 7.5）。⚠️ 它和 .venv/ 【不匹配】—— gitignore 里
+#   `.venv/` 只匹配名字恰好是 `.venv` 的目录，`-eval` 后缀不在内。
+#   漏了这一行的症状：`git status` 里冒出几千个第三方包文件，
+#   而第一次 `git add -A` 就会把它们全提交进去（体积几十 MB）。
+.venv-eval/
 
 # 打包产物
 *.egg-info/

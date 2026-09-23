@@ -134,11 +134,15 @@ public class RetrievalTrace {
      * 也是全池的结果。让 {@code applied} 和那几段说的是同一件事，
      * 这个 JSON 才是自洽的：任何一格单独拿出来都能正确解释其他格。
      *
-     * <p>{@code reason} 负责解释「为什么」，把四种情况分开：
+     * <p>{@code reason} 负责解释「为什么」，把五种情况分开：
      *
      * <table border="1">
      *   <caption>reason 取值</caption>
      *   <tr><th>取值</th><th>applied</th><th>含义</th><th>该去查什么</th></tr>
+     *   <tr><td>{@code disabled_by_config}</td><td>false</td>
+     *       <td><b>声明了，但配置把「按意图下推」整个关掉了</b></td>
+     *       <td>{@code xbla.rag.retrieve.by-intent.enabled} ——
+     *           它关着时这里前面几行都够不着</td></tr>
      *   <tr><td>{@code no_declaration}</td><td>false</td>
      *       <td>没给范围（没开意图识别 / 分类失败 / 该意图声明空集）</td>
      *       <td>{@code qa_log.intent} 是 null 还是某个码</td></tr>
@@ -153,8 +157,17 @@ public class RetrievalTrace {
      *       <td>{@code events}，以及 {@code search_text} 覆盖率探针</td></tr>
      * </table>
      *
-     * @param docTypes 意图声明的集合，<b>如实记录</b>（即使最终没用上）。
-     *                 空列表 = 没声明
+     * <p>★ {@code disabled_by_config} 与 {@code no_declaration} 的
+     * {@code applied} 都是 {@code false}、{@code docTypes} 都可能看着「很正常」，
+     * 唯一的分野就是这一格。<b>这就是它必须单独存在、不能被合并的理由</b> ——
+     * 合并之后「调用方没声明」和「配置关掉了」在 trace 上逐字相同，
+     * 而这两件事的修法一个在调用点、一个在 {@code application.yml}。
+     *
+     * @param docTypes 调用方声明的集合，<b>如实记录</b>（即使最终没用上）。
+     *                 ★ 空列表 = 没声明，但这只对 {@code no_declaration} 成立 ——
+     *                 {@code disabled_by_config} 下它<b>通常非空</b>（声明照给，
+     *                 只是没被用），所以「docTypes 空 = 没声明」这个推论
+     *                 必须先看 {@code reason} 才能下
      * @param applied  最终是否真的下推了 {@code WHERE doc_type IN (...)}
      * @param poolSize 该集合在 {@code kb_chunk} 里的切片数；没测量时为 {@code null}
      * @param reason   为什么是现在这个状态
@@ -164,6 +177,11 @@ public class RetrievalTrace {
 
         /** 见 {@link FilterScope} 的表 */
         public enum Reason {
+            /**
+             * ★ 排在最前是因为它<b>最先被判断</b> —— 关掉时后面几种结局根本够不着。
+             * 顺序在这里是文档，不是实现细节。
+             */
+            DISABLED_BY_CONFIG,
             NO_DECLARATION,
             SMALL_POOL,
             OK,

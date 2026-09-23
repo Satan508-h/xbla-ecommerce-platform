@@ -120,7 +120,7 @@ class ChatAdmissionBlockingTest {
     }
 
     private static ChatAdmissionService.Admission admission(String traceId) {
-        return new ChatAdmissionService.Admission(traceId, "退货要几天", SENTINEL_USER_ID);
+        return new ChatAdmissionService.Admission(traceId, "退货要几天", SENTINEL_USER_ID, null);
     }
 
     /**

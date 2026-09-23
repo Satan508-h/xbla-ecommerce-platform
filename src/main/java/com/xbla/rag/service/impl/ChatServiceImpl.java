@@ -1197,6 +1197,21 @@ public class ChatServiceImpl implements ChatService {
         log.setQueueMs(ctx.queueMs());
         log.setQueuePosition(ctx.queuePosition());
 
+        // ★★ 评测标记（V10 新增，阶段 7）—— 同样只在【这一处】填。
+        //
+        //   ctx.eval() 为 null 是【常态】：绝大多数请求是真实用户发的，
+        //   它们两个头都不带。NULL 是「不是评测流量」的诚实表达 ——
+        //   填一个 "" 或 "none" 会让 `WHERE eval_run_id IS NULL`
+        //   这个「只统计真实使用」的筛子**静默漏掉一部分真实行**。
+        //
+        //   ⚠️ 被排队拒绝的那些行【不经过这里】，它们在
+        //      ChatAdmissionService.rateLimitedLog 里手写这两列 ——
+        //      本方法是全项目唯一的落库点，那个方法是唯一的例外。
+        if (ctx.eval() != null) {
+            log.setEvalRunId(ctx.eval().runId());
+            log.setEvalQuestionNo(ctx.eval().questionNo());
+        }
+
         log.setSessionId(session.getId());
         log.setUserId(session.getUserId());
         log.setQuestion(question);

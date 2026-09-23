@@ -81,6 +81,24 @@
 #   不能和 2026-09-19 之前的报告直接比。见 docs/06 §3.2。
 # ============================================================
 
+# ------------------------------------------------------------
+# ★ 文件级声明（阶段 7 起【必填】，缺一个 reload 就失败）
+#
+# question_set  「这道题属于哪一套」—— 阶段 7 有三套（baseline / stage7 /
+#               stage7-multi），★ 三套的口径不同，不能混在一起算指标。
+#               它是「不能混算」这件事的唯一出处。
+# source        「题是怎么造出来的」—— 上面那大段说明的机器可读版本。
+#               报告里必须能读出它，否则同一个数字可以被解释成完全不同的东西。
+# annotated_by  「谁标的、谁核的」。
+#
+# ⚠️ 这三行以前是硬编码在 EvalQuestionLoader 里的（写死了 reverse_constructed），
+#    那意味着阶段 7 那 150 道【不是】反向构造的题会带着阶段 4 的出身进库 ——
+#    而报告正是拿这两列去声明「这批题有已知偏差」的。
+# ------------------------------------------------------------
+question_set: baseline
+source: reverse_constructed
+annotated_by: 阶段4-反向构题，阶段5.1-标注意图
+
 questions:
 
   # ---------- 售后政策（8 题）----------
@@ -198,7 +216,7 @@ questions:
 
   # ---------- 促销政策（4 题）----------
   - question_no: B-009
-    question: 优惠券怎么用
+    question: 券领了之后怎么用
     category: keyword
     difficulty: 1
     intent: COUPON
@@ -310,7 +328,7 @@ questions:
         doc_hint: 以旧换新服务说明
 
   - question_no: B-016
-    question: 收到货发现损坏怎么办
+    question: 签收时发现商品破损怎么办
     category: colloquial
     difficulty: 2
     intent: RULES_AND_PROCESS
