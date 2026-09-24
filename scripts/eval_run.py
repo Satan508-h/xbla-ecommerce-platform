@@ -103,6 +103,11 @@ H_UID = "X-Xbla-User-Id"
 # 应用侧的预算：非流式排队 30 秒 + 回答 180 秒。留点余量
 HTTP_TIMEOUT = 300
 
+# ★★★ 一轮里允许的「模型链路失败」上限（status=2 或 4 的占比）。
+#   超过它整轮作废 —— 见 reconcile() 里那段注释：正常轮这个数是 **0**，
+#   而失败由熔断器成簇触发，活下来的行不是一个无偏的子样本。
+MAX_FAILED_RATIO = 0.05
+
 # ★ 洞 7：切分配置在 xbla.kb.chunking 下。改切分 = 换了一份语料，
 #   跨越那次改动的对比全部无效。把这个前缀写在这里，并在运行时检查它
 #   至少匹配到一个键 —— 匹配不到就说明前缀写错了，而**指纹会静默变成一个常量**。
@@ -355,8 +360,32 @@ def reconcile(run_id: str, submissions: list, question_nos: list,
     #       那是洞 4 的哨兵，必须红。
     ok = not missing and not mismatched and not leaked and ghost_unexplained == 0
 
+    # ★★★ 第四个哨兵：**这一轮根本没跑成**。
+    #
+    #   2026-09-23 实测：轴 2b 那轮，477 条提交里 **408 条是 HTTP 503**
+    #   （`UnresolvedAddressException` → DNS 挂了 → 三个熔断器全跳闸），
+    #   只有 69 条真的答了 —— 而 `ok` 仍然是 **True**，
+    #   因为上面三条判据问的全是「行有没有丢」，**没有一条问「行有没有成」**。
+    #   那一轮的 `complete=True` + `reconcileOk=True`，报告生成器的前置检查
+    #   会放它进去，然后拿 69 道题的样本去算「159 题的指标」。
+    #
+    #   ★ 阈值为什么是 5%：正常轮的这个数是 **0**（三次基线轮全是 0）。
+    #     而失败**不是随机的** —— 它由熔断器成簇触发，所以「活下来的行」
+    #     在时间上、在题目顺序上都偏向某一端，那不是「小一点的全体」。
+    #     留 5% 只是为了让一次偶发的网络抖动不至于废掉 26 分钟的工作。
+    #
+    #   ⚠️ `status=3`（澄清反问）**不算失败** —— 它是设计好的行为，逐题明细里照常进分母。
+    by_status = Counter(str(r["status"]) for r in clean)
+    bad_rows = by_status.get("2", 0) + by_status.get("4", 0)
+    bad_ratio = (bad_rows / len(clean)) if clean else 0.0
+    too_many_failed = bad_ratio > MAX_FAILED_RATIO
+    ok = ok and not too_many_failed
+
     return {
         "ok": ok,
+        "badRows": bad_rows,
+        "badRatio": round(bad_ratio, 4),
+        "tooManyFailed": too_many_failed,
         "submitted": len(submissions),
         "submittedWithTrace": len(submitted),
         "submittedNoTrace": len(no_trace),
@@ -370,7 +399,7 @@ def reconcile(run_id: str, submissions: list, question_nos: list,
         "foreignRows": len(foreign),
         "ghostRows": len(ghost),
         "ghostUnexplained": ghost_unexplained,
-        "rowsByStatus": dict(sorted(Counter(str(r["status"]) for r in clean).items())),
+        "rowsByStatus": dict(sorted(by_status.items())),
         "rowsByQuestion": len({r["eval_question_no"] for r in clean}),
         "costInDb": round(sum(float(r["cost"] or 0) for r in clean), 4),
         "note": "★ 对账不通过 = 整轮数据作废，重跑。"
@@ -586,6 +615,23 @@ def main() -> int:
               "与本轮无关，不计入判定" % rec["foreignRows"])
     print("      库里本轮花费 ≈ %.4f 元（客户端观测 %.4f 元）"
           % (rec["costInDb"], client_cost))
+    # ★★★ 第四个哨兵：这一轮到底跑成了没有。
+    #   上面那三条判据问的全是「行有没有丢」，没有一条问「行有没有成」——
+    #   所以一轮 85% 的行是 503 的时候，对账照样说「通过」。
+    #   ★ 无论好坏都要打印这一行。只在坏的时候打印的话，读的人**分不出**
+    #     「检查跑了、结果是 0」和「检查根本没跑」—— 那正是本项目一直在防的形状。
+    print("      %s 模型链路失败的行                %d / %d = %.1f%%（上限 %.0f%%）"
+          % ("✅" if not rec["tooManyFailed"] else "⚠️",
+             rec["badRows"], rec["rowsInRun"], rec["badRatio"] * 100,
+             MAX_FAILED_RATIO * 100))
+    if rec["tooManyFailed"]:
+        print("         ★★★ **这一轮不可用** —— 失败的行不是随机丢的，"
+              "是熔断器成簇跳闸时整段丢的；")
+        print("             活下来的那些行在时间上和题号顺序上都偏向某一端，"
+              "**不是一个无偏的子样本**。")
+        print("             先查为什么跳闸（`UnresolvedAddressException` = DNS / 网络；"
+              "`curl /actuator/circuitbreakers` 看状态），再重跑。")
+        print("             ⚠️ 别拿它去比 —— 报告里那 159 题的分母会静默变成几十题。")
     if interrupted:
         print("\n      ⚠️ 本轮被中断，对账只覆盖已提交的部分。")
     print("\n" + ("      ★★ 对账通过" if rec["ok"] else "      ★★ 对账【不通过】—— 整轮数据作废，重跑"))

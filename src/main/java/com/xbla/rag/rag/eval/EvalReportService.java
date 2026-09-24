@@ -1339,6 +1339,8 @@ public class EvalReportService {
     private static Map<String, Object> costSection(List<QaLog> rows) {
         BigDecimal cost = BigDecimal.ZERO;
         long tokens = 0;
+        long promptTokens = 0;
+        long completionTokens = 0;
         int rowsWithCost = 0;
         for (QaLog r : rows) {
             if (r.getCost() != null) {
@@ -1348,16 +1350,34 @@ public class EvalReportService {
             if (r.getTotalTokens() != null) {
                 tokens += r.getTotalTokens();
             }
+            if (r.getPromptTokens() != null) {
+                promptTokens += r.getPromptTokens();
+            }
+            if (r.getCompletionTokens() != null) {
+                completionTokens += r.getCompletionTokens();
+            }
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("数据库里的成本合计", cost);
         out.put("token合计", tokens);
+        // ★★ 拆分（T8 新增）。**只给一个 total 是没法审计的** ——
+        //    T8 撞到的具体情形：关掉重排之后 token 只涨 1.6%，成本却涨 9.5%，
+        //    而解释它的那个量（缓存命中的输入 token）**压根不落库**。
+        //    有了这两行，命中数可以从「成本 + 三档定价」反推出来（三档定价在配置快照里）。
+        //    ⚠️ 反推【假定整轮只用一个模型】；有降级行时它不成立，
+        //      所以要连同 provider/model 切片一起读。
+        out.put("prompt_token合计", promptTokens);
+        out.put("输出token合计", completionTokens);
         out.put("有成本的行", rowsWithCost);
         out.put("note", "★ 这是【服务端账本】。跑题器自己clientCost 是另一份，两个数应当接近 —— "
                 + "差得远说明有行没落库（那正是对账要抓的）。"
                 + "⚠️ 它不含【意图分类】和【摘要压缩】的花费："
                 + "前者不进 qa_log 的任何一列，后者是显式例外（见 CLAUDE.md）。"
-                + "所以真实花费【高于】这个数。");
+                + "所以真实花费【高于】这个数。"
+                + "★★ 缓存命中的输入 token（`prompt_cache_hit_tokens`）**参与计费但不落库**："
+                + "ModelCostCalculator 用它算钱，算完就丢掉。"
+                + "所以「成本为什么变了」只能从【成本 + token 拆分 + 三档定价】反推 ——"
+                + "上面那两行就是为这件事加的。");
         return out;
     }
 

@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -1166,24 +1167,49 @@ class EvalReportServiceTest {
             assertEquals("X1: LEAF_UNSORTED[2, 4] → FALLBACK[]", mismatched.get(0));
 
             assertFalse(mismatched.get(0).contains("[4, 2]"),
-                    "★★ 反对照：直接拼 Set 的写法在这里印出的正是 [4, 2]"
-                            + "（Set.copyOf 对两个元素保持列表顺序），"
-                            + "而三个元素时它会变成桶序 —— 也就是说那个顺序"
-                            + "随元素个数改变，它是 JDK 的内部实现，不是我们的承诺。"
+                    "★★ 反对照：直接拼 Set 的写法会印出【一个我们没承诺过的顺序】"
+                            + "（JDK 的桶序，随 JVM 启动时的随机 hash SALT 变）。"
+                            + "★ 注意措辞：它【不保证】印出 [4, 2] —— 实测 20 个独立 JVM，"
+                            + "2 个元素时 30% 恰好也印 [2, 4]。"
+                            + "所以这一条只能保证「报告里的顺序不是从 Set 来的」，"
+                            + "不能保证「不排序就一定看得见」。"
                             + "报告要被跨轮 diff、要被抄进 docs/11，"
                             + "那里的随机差异会让真正的变化淹没");
         }
 
         @Test
-        @DisplayName("★ 反对照的另一半：排序确实改变了那个字符串（不是恒真的断言）")
-        void sortingIsWhatChangedIt() {
-            // 把同一个集合按两种方式渲染 —— 断言它们【不同】。
-            // ★ 没有这一半，上面那条「印成 [2,4]」可能只是因为
-            //   「[4,2] 这个输入本来就不会出现」，而不是因为排序生效了
-            Set<Integer> unsorted = Set.copyOf(List.of(4, 2));
-            assertEquals("[4, 2]", unsorted.toString(),
-                    "★ 这正是「不排序」会印出来的东西 —— 它证明上面那条断言"
-                            + "测的是真实的差异，不是一句恒真的话");
+        @DisplayName("★★ 反对照：不排序会印出 [4, 2] —— 用一个【顺序可控】的集合证明它")
+        void unsortedRenderingReallyDiffers() {
+            // ★★★ 这里原来写的是：
+            //       assertEquals("[4, 2]", Set.copyOf(List.of(4, 2)).toString())
+            //     它把 JDK 的内部桶序当成了我们的承诺。实测 30 个独立 JVM，
+            //     2 个元素时约一半会印成 [2, 4] —— 那条断言【自己】有一半概率红。
+            //     ★ 它守的东西是对的（不能把 Set 的顺序当承诺），
+            //       错的是拿一个不受我们控制的量去下断言。
+            //
+            // ★ 正确的对照物是【顺序可控】的集合：LinkedHashSet 保留插入顺序，
+            //   所以它就是「不排序的样子」的一个确定性样本。
+            Set<Integer> naive = new LinkedHashSet<>(List.of(4, 2));
+            assertEquals("[4, 2]", naive.toString(),
+                    "前提：这个集合确实是倒序的（LinkedHashSet 保留插入顺序）");
+            assertNotEquals("[2, 4]", naive.toString(),
+                    "★ 不排序会印出 [4, 2]，而报告印的是 [2, 4] —— "
+                            + "两者不同，所以上面那条断言测的是真实的差异，不是一句恒真的话");
+
+            // ★★ 另一条确定性判据：Set 的打印顺序与【声明顺序】无关。
+            //    它说明报告里的 [2, 4] 不可能是「原样转述声明顺序」来的。
+            assertEquals(Set.copyOf(List.of(4, 2)).toString(),
+                    Set.copyOf(List.of(2, 4)).toString(),
+                    "同一个集合的两种声明顺序，Set 必须印出同一个串");
+
+            // ⚠️ 残余盲区，记下来别假装它不存在：
+            //    上面那条报告级断言（印 [2, 4]）**不是** 100% 的检测器 ——
+            //    如果哪天 sorted() 被删掉，「直接拼 Set」的写法在
+            //    约 1/4 的 JVM 上会【恰好也印出升序】，那时这条测试仍然绿。
+            //    ★ 这不是测试写坏了，是「直接拼 Set」在那个 JVM 上真的没出错。
+            //    实测 30 个独立 JVM：n=2 约一半、n≥3 稳定在约 1/4 巧合。
+            //    （另有 §检索范围 的一致性判据从另一侧兜底：排序与否不影响
+            //      集合相等，所以那条永不受影响。）
         }
     }
 }

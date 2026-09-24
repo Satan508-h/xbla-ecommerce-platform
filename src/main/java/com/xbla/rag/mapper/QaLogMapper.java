@@ -71,6 +71,36 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
      * <p>⚠️ 它依赖 {@code eval_question_no} 可空这一事实：真实用户的行
      * 这里是 NULL，而 {@code WHERE eval_run_id = ?} 已经把范围限定在评测行上了。
      *
+     * <h3>★★★ 阶段 7.6 又踩了一次 —— 同一个坑，同一个方法</h3>
+     *
+     * <p>T8 为了让<b>缓存命中率可反推</b>，给 {@code costSection} 加了
+     * {@code prompt_tokens} / {@code completion_tokens} 的累加。累加代码是对的，
+     * <b>列清单没跟着加</b> —— 于是每一行的这两个字段都是 {@code null}，
+     * 被 null 判断挡掉，{@code prompt_token合计} 和 {@code 输出token合计}
+     * 恒为 <b>0</b>。
+     *
+     * <p>★★★ <b>它比上一次更难发现</b>：
+     * <ol>
+     *   <li><b>不报错</b> —— 查询成功，返回 460 行；</li>
+     *   <li><b>返回的不是 null 而是 0</b> —— 「少读一列」被 null 判断
+     *       渲染成「这一轮真的没有 token」，而后者是一个合法值；</li>
+     *   <li><b>键在、格式对、旁边那个数还对</b> ——
+     *       {@code token合计} 是 386591（正常），紧挨着的两行是 0，
+     *       而报告把三行并排印出来，看着像「拆分粒度不同」而不是「读漏了」。</li>
+     * </ol>
+     *
+     * <p>★★ 判据（免费且精确，全库 17 轮实测 <b>0 例外</b>）：
+     * {@code prompt_tokens + completion_tokens == total_tokens}。
+     * 只要有 {@code total_tokens}，这两列就都在，且相加恰好相等。
+     * 所以 {@code 0 + 0 ≠ 386591} <b>本身就证明是读路径坏了</b>，
+     * 不可能是数据如此。
+     *
+     * <p>★★ <b>为什么这两次都是同一个方法</b>：显式列清单和
+     * {@code EvalReportService} / {@code EvalAnswerService} 读的字段之间
+     * <b>没有任何东西强制同步</b>。改这个查询时，<b>请把两边的 getter 清单
+     * 拉出来逐个对照</b>，不要靠记忆 —— 两次都是「加新读取忘了加列」，
+     * 而两次的症状都不指向这条查询。
+     *
      * @param runId 评测运行 ID（{@code qa_log.eval_run_id}）
      */
     @Select("""
@@ -80,7 +110,7 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
                    queue_ms, queue_position,
                    retrieval_latency_ms, rerank_latency_ms, llm_latency_ms, total_latency_ms,
                    retrieval_detail, final_answer, "references",
-                   provider, model, total_tokens, cost,
+                   provider, model, prompt_tokens, completion_tokens, total_tokens, cost,
                    created_at
             FROM qa_log
             WHERE eval_run_id = #{runId}

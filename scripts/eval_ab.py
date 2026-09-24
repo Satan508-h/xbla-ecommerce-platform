@@ -29,9 +29,11 @@
 import argparse
 import io
 import json
+import math
 import os
 import re
 import sys
+from collections import Counter
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -40,6 +42,44 @@ ROOT = os.path.dirname(HERE)
 RESULTS = os.path.join(ROOT, "eval_results")
 
 DEFAULT_BASE = "http://localhost:8080"
+
+# ★ 切片纪律：n < 5 的切片不作为结论。
+#   ⚠️ 真身是 Java 的 `EvalReportService.MIN_SLICE_N`；Python 侧只有【这一份】拷贝，
+#      `eval_report.py` 从这里 import（它原来是第二份，已合并）。
+#      值对不上时，报告会给一个 n<5 的切片打上「可信」——
+#      所以 `eval_report.py --selftest` 有一条断言它 == report.json 里的
+#      `★切片可信度纪律.MIN_SLICE_N`。
+MIN_SLICE_N = 5
+
+# ★★★ 一轮里允许的「模型链路失败」占比上限 —— 超过它整轮不可用。
+#   背景：2026-09-23 轴 2b 那轮 477 条里 408 条是 503（DNS 挂了 → 熔断器全跳闸），
+#   而 `complete` 与 `reconcileOk` **都是 True** —— 因为那两条判据问的是
+#   「行有没有丢」，没有一条问「行有没有成」。
+#   ⚠️ 这是第二份拷贝（`eval_run.MAX_FAILED_RATIO` 是生产者那份）。
+#      新轮次由生产者把结论 `tooManyFailed` 直接写进 run.raw.json，
+#      这里只对【旧文件】兜底重算 —— 所以两份值必须一致。
+RECONCILE_MAX_FAILED_RATIO = 0.05
+
+
+def run_usability(raw):
+    """一轮到底跑成了没有 → (可用?, 失败行数, 失败率, 说明)。
+
+    ★ 优先读生产者盖的章（`reconcile.tooManyFailed`）；
+      旧的 run.raw.json 没有那个字段，就从 `rowsByStatus` 现算。
+    ★★ `status=3`（澄清反问）**不算失败** —— 它是设计好的行为。
+    """
+    rec = raw.get("reconcile") or {}
+    by = rec.get("rowsByStatus") or {}
+    total = sum(int(v) for v in by.values())
+    bad = int(by.get("2", 0)) + int(by.get("4", 0))
+    if "tooManyFailed" in rec:
+        return (not rec["tooManyFailed"], bad, rec.get("badRatio", 0.0),
+                "生产者盖章")
+    if not total:
+        return True, 0, 0.0, "没有 status 分布可判（旧文件？）"
+    ratio = bad / total
+    return (ratio <= RECONCILE_MAX_FAILED_RATIO, bad, ratio,
+            "按 %.0f%% 阈值现算" % (RECONCILE_MAX_FAILED_RATIO * 100))
 
 # ================================================================
 # 逐题判据的分类
@@ -295,6 +335,151 @@ def continuous_table(ra, rb, common):
 
 
 # ================================================================
+# ★ 按 category 切片（T8 新增）
+# ================================================================
+
+SLICE_FIELD = "类别"
+
+# 切片里要报的连续量。★ 顺序就是输出的顺序。
+# ⚠️ 这里【不含】延迟：延迟那一段两轮被 status≠1 截掉的条数不同，
+#    比的不是同一个总体（见 §2.5）。切片只会把这个毛病放大，不会修好它。
+SLICE_CONTINUOUS = ["recall@5", "mrr@5", "上下文条数", "越界切片数"]
+
+# `归因` 是分类量，切片里要报的是【分布】不是一个均值 ——
+# 「filtered_out 从 3 道涨到 9 道」是一个句子，「归因均值 1.7」不是
+ATTRIBUTION_BUCKETS = ["ok", "filtered_out", "not_recalled", "rerank_dropped", "fusion_dropped"]
+
+SLICE_LABEL = {
+    "colloquial": "colloquial（口语句）",
+    "keyword": "keyword（关键词句）",
+    "model": "model（型号/规格句）",
+}
+
+
+def slice_of(row, field=SLICE_FIELD):
+    """一题属于哪一片。
+
+    ★ 缺字段返回 None，让它【落不进任何一片】——
+      「没标类别」和「类别恰好是某一类」是两件事，把它们混进同一个桶里，
+      桶的 n 会变大而没人看得出来。
+    """
+    v = row.get(field)
+    return v if isinstance(v, str) and v else None
+
+
+def binom_tail(k, n, p):
+    """P(X >= k | X ~ Binomial(n, p)) —— 纯 stdlib 的单侧尾概率。
+
+    ★★ 为什么不直接比「Δ率 和 噪声率 哪个大」：
+      两只率各自带着自己的样本量。21 道题上翻 1 次 = 4.8%，
+      88 道题上翻 1 次 = 1.1% —— 看起来差四倍，而那纯粹是分母不同。
+      先把两者放进同一个二项模型，把 n 的影响算进去，才谈得上「超过」。
+    """
+    if n <= 0 or k <= 0:
+        return 1.0
+    if p <= 0:
+        return 0.0
+    if p >= 1:
+        return 1.0
+    return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1))
+
+
+def noise_rate(flips, n):
+    """噪声底率 —— ★ 0 次翻转时用「规则三」当上界。
+
+    ★★ 这是本函数存在的唯一理由：噪声对在某一片上恰好 0 次翻转时，
+      直接拿 0 当 p 会让 `binom_tail` 恒为 0，于是【任何】翻转
+      —— 哪怕就 1 道 —— 都被判成「显著超过噪声」。那是假的。
+      规则三：n 次观测里 0 次发生 ⇒ 真实率 95% 单侧上界约 3/n。
+      它保守（让「超过噪声」更难成立），而保守正是这里要的方向。
+    """
+    if n is None or n <= 0:
+        return None
+    return 3.0 / n if flips == 0 else float(flips) / n
+
+
+def _slice_questions(ra, common, c):
+    return [q for q in common if slice_of(ra[q]) == c]
+
+
+def slice_categorical(ra, rb, common):
+    """每片 × 每个分类判据：可比数 + 翻转数。
+
+    ★★ 三态纪律与 `flip_table` 逐字相同：分母 = **两侧都非 None** 的题。
+      把 None 当 false 会让那 15 道工具题的 `意图正确` 在每一轮里都恒为 false
+      —— 它们一格都不翻，于是矩阵看起来完全正常，而真实的口径差异被摊平。
+    """
+    out = {}
+    for c in {slice_of(ra[q]) for q in common} - {None}:
+        qs = _slice_questions(ra, common, c)
+        per = {}
+        for metric in CATEGORICAL:
+            comp = [q for q in qs
+                    if ra[q].get(metric) is not None and rb[q].get(metric) is not None]
+            per[metric] = (len(comp), [q for q in comp
+                                       if ra[q].get(metric) != rb[q].get(metric)])
+        out[c] = per
+    return out
+
+
+def slice_continuous(ra, rb, common):
+    """每片 × 每个连续量：可比数 + A 均值 + B 均值 + Δ。
+
+    ★ 两侧的均值都要报。只报 Δ 会让人读不出「0.97 → 0.80 掉了 17 个点」
+      和「0.10 → 0.00 掉了 10 个点」哪个严重 —— Δ 一样大，处境完全不同。
+      本项目已经因为「一个数旁边挂着错的口径」返工过一次（T4 的 8.78 个点）。
+    """
+    out = {}
+    for c in {slice_of(ra[q]) for q in common} - {None}:
+        qs = _slice_questions(ra, common, c)
+        per = {}
+        for metric in SLICE_CONTINUOUS:
+            vals = [(float(ra[q][metric]), float(rb[q][metric])) for q in qs
+                    if ra[q].get(metric) is not None and rb[q].get(metric) is not None]
+            if not vals:
+                per[metric] = (0, None, None, None)
+                continue
+            va = sum(a for a, _ in vals) / len(vals)
+            vb = sum(b for _, b in vals) / len(vals)
+            per[metric] = (len(vals), va, vb, vb - va)
+        out[c] = per
+    return out
+
+
+def slice_attribution(ra, rb, common):
+    """归因桶在两边的分布。★ 只数非 None 的 —— 那 28 道非检索题没有归因，
+    它们进分母会把每一桶的比例机械地压小。"""
+    out = {}
+    for c in {slice_of(ra[q]) for q in common} - {None}:
+        qs = _slice_questions(ra, common, c)
+        a = Counter(ra[q].get("归因") for q in qs if ra[q].get("归因") is not None)
+        b = Counter(rb[q].get("归因") for q in qs if rb[q].get("归因") is not None)
+        out[c] = (a, b, len([q for q in qs if ra[q].get("归因") is not None]))
+    return out
+
+
+def slice_verdict(flips, noise_flips, n, noise_n, alpha=0.05, min_flips=3):
+    """★ 判据：这一片的翻转数有没有【明显】超过同一片里噪声对的翻转数。
+
+    两道闸门缺一不可：
+      · `min_flips` —— 绝对下限。p 值在 n 小的时候没有分辨力：
+        5 道题翻 1 道，p 可以很小，而它可能就是一格抖动
+      · `alpha` —— 二项尾概率。把两边不同的 n 折算到同一个模型里
+
+    ⚠️ 返回的是【三态】：True（超过）/ False（没超过）/ None（这一片没法判
+      —— 没给噪声对照，或者噪声对照在这一片上一道题都没有）。
+      **不许把 None 当 False** —— 那是「不可判」，不是「没超过」。
+    """
+    if noise_n is None or noise_n <= 0 or n <= 0:
+        return None, None
+    f = noise_rate(noise_flips, noise_n)
+    if f is None:
+        return None, None
+    p = binom_tail(flips, n, f)
+    return (flips >= min_flips and p < alpha), p
+
+
+# ================================================================
 # 渲染
 # ================================================================
 
@@ -418,6 +603,73 @@ def selftest():
     chk("★ 指标表里没有逐题路径", not per_q,
         "残留 %d 个：%s" % (len(per_q), per_q[:3]))
 
+    # ── ⑧ 切片的规则三（T8）────────────────────────────────────
+    # ★★ 这一条守的是一类很容易写反的 bug：
+    #    噪声对照对在某片 0 次翻转时，拿 0 当 p 会让二项尾概率恒为 0，
+    #    于是【任何】翻转都被判成「显著超过噪声」。
+    nr = noise_rate(0, 26)
+    chk("★★ 规则三：噪声 0/26 次翻转 → 率取 3/n = %.4f，不是 0" % nr,
+        nr is not None and nr > 0,
+        "得到 %r —— ★ 取 0 的话下面那条会连带失效" % (nr,))
+    chk("  且它让「26 道题里翻 1 道」【不】显著",
+        binom_tail(1, 26, nr) > 0.05,
+        "p=%.4g —— ★ 若 p<0.05，说明这把尺子太松，"
+        "小切片上的一格抖动会被念成结论" % binom_tail(1, 26, nr))
+    chk("  反对照：同一批数用 p=0 就会判成显著（所以不能取 0）",
+        binom_tail(1, 26, 0.0) == 0.0,
+        "得到 %.4g —— ★★ 这一条是【故意让错的那版成立】："
+        "它证明上面那两条断言不是恒真的" % binom_tail(1, 26, 0.0))
+
+    # ── ⑨ 切片的判据是【三态】（T8）─────────────────────────────
+    ok_none, p_none = slice_verdict(9, 0, 88, 0)
+    chk("★★ 没给噪声对照 → 判据是 None（不可判），不是 False",
+        ok_none is None and p_none is None,
+        "得到 %r —— ★★ 把「不可判」当「没超过」的话，"
+        "报告会印出一句「没超过噪声」，而那一轮根本没测过噪声" % (ok_none,))
+    ok_f, _ = slice_verdict(1, 1, 26, 26)
+    chk("  且「给过、比较后没过」是 False —— 与 None 可区分",
+        ok_f is False,
+        "得到 %r —— ★ 三态塌成两态就分不出这两件事了" % (ok_f,))
+    ok_t, _ = slice_verdict(30, 1, 88, 88)
+    chk("  88 道里翻 30 道 vs 噪声 1/88 → 判成超过", ok_t is True,
+        "得到 %r" % (ok_t,))
+    ok_m, _ = slice_verdict(2, 0, 1000, 1000)
+    chk("★ 绝对下限：1000 道里翻 2 道 → 不判（p 可能很小但样本太小）",
+        ok_m is False,
+        "得到 %r —— ★ min_flips 那道闸门被人拿掉的话这里会变成 True" % (ok_m,))
+
+    # ── ⑩ 切片的分母也是三态（T8）───────────────────────────────
+    rep5 = copy.deepcopy(rep)
+    idx5 = next(i for i, r in enumerate(rep5["逐题"]["行"]) if r["命中@5"] is not None)
+    qid5 = rep5["逐题"]["行"][idx5]["题号"]
+    cat5 = rep5["逐题"]["行"][idx5]["类别"]
+    rep5["逐题"]["行"][idx5]["命中@5"] = None
+    ra5 = {r["题号"]: r for r in rep5["逐题"]["行"]}
+    n_cat_a = slice_categorical(ra, ra, sorted(ra))[cat5]["命中@5"][0]
+    n_cat_b = slice_categorical(ra, ra5, sorted(ra))[cat5]["命中@5"][0]
+    f_cat_b = len(slice_categorical(ra, ra5, sorted(ra))[cat5]["命中@5"][1])
+    chk("★★ 切片分母也是三态：`%s` 这一片 %d → %d（-1），翻转仍 0"
+        % (cat5, n_cat_a, n_cat_b),
+        n_cat_b == n_cat_a - 1 and f_cat_b == 0,
+        "得到 %d / 翻转 %d —— ★ 这是 ③ 的切片版。"
+        "两处分母算法不一致时，指标表说「可比 130」而各片加起来是 131，"
+        "而没有任何东西会报错" % (n_cat_b, f_cat_b))
+
+    # ── ⑪ 缺 `类别` 的题不许落进任何一片（T8）────────────────────
+    rep6 = copy.deepcopy(rep)
+    idx6 = next(i for i, r in enumerate(rep6["逐题"]["行"]) if r.get("类别"))
+    rep6["逐题"]["行"][idx6]["类别"] = None
+    ra6 = {r["题号"]: r for r in rep6["逐题"]["行"]}
+    sum_before = sum(v["命中@5"][0]
+                     for v in slice_categorical(ra, ra, sorted(ra)).values())
+    sum_after = sum(v["命中@5"][0]
+                    for v in slice_categorical(ra6, ra6, sorted(ra6)).values())
+    chk("★ `类别` 为 None 的题不进任何切片（各片可比合计 %d → %d，恰好少 1）"
+        % (sum_before, sum_after),
+        sum_after == sum_before - 1,
+        "得到 %d → %d —— ★ 若把它塞进某个兜底片，那一片的 n 会悄悄变大，"
+        "而屏幕上看不出多了谁" % (sum_before, sum_after))
+
     print("=" * 72)
     bad = 0
     for label, ok, detail in checks:
@@ -446,6 +698,12 @@ def main():
                     help="先从 /api/debug/eval/report 重新生成两份 report.json。"
                          "★ report 的算法改过之后【必须】用它，否则比的是两个版本")
     ap.add_argument("--base", default=DEFAULT_BASE, help="服务地址")
+    ap.add_argument("--noise", default=None,
+                    metavar="A,B",
+                    help="★ 噪声对照对的 runId，形如 `噪声甲,噪声乙`（同配置两轮）。"
+                         "给了它，§3.5 的按 category 切片才带【该片自己的噪声底】"
+                         "与判据列。⚠️ 不给不是「没有噪声」——是【不可判】，"
+                         "表里那一列会印成 `—` 并写明原因")
     ap.add_argument("--out", default=None, help="把 markdown 写进文件（默认只打屏）")
     ap.add_argument("--top", type=int, default=15,
                     help="连续量里最多列几道变化最大的题")
@@ -485,6 +743,11 @@ def main():
         check(tag, bool(raw.get("complete")), "完整 complete=%s" % raw.get("complete"))
         check(tag, bool(raw.get("reconcileOk")),
               "对账 reconcileOk=%s" % raw.get("reconcileOk"))
+        # ★★★ 「行有没有丢」和「行有没有成」是两件事。
+        #   上面两条全绿，一轮仍可能 85% 的行是 503 —— 实测过。
+        usable, bad, ratio, how = run_usability(raw)
+        check(tag, usable,
+              "跑成了（模型链路失败 %d 行 = %.1f%%，%s）" % (bad, ratio * 100, how))
         has_detail = "逐题" in rep and "行" in rep.get("逐题", {})
         check(tag, has_detail, "report.json 有「逐题」段（%s）"
               % ("%d 行" % len(rep["逐题"]["行"]) if has_detail else "缺，--refresh 重新生成"))
@@ -510,6 +773,43 @@ def main():
         ra, rb, common, q_only_a, q_only_b = common_rows(rep_a, rep_b)
     else:
         common, ra, rb = [], {}, {}
+
+    # ── 噪声对照对（可选，T8）───────────────────────────────────
+    # ★★ 只在【切片】里用得着：每一片要跟【同一片】的噪声比，而不是跟全集的比。
+    #    它是额外两轮同配置 run，所以是可选的 —— 不给就是「不可判」，不是「没噪声」。
+    nz_cat = nz_cont = None
+    nz_common = []
+    if args.noise:
+        if not common:
+            print("⚠️ 前置检查没过，噪声对照对不加载")
+        else:
+            parts = [p.strip() for p in args.noise.split(",") if p.strip()]
+            if len(parts) != 2:
+                ap.error("--noise 要写成 `甲,乙` 两个 runId（收到 %d 个）" % len(parts))
+            dn_a, dn_b = resolve_dir(parts[0]), resolve_dir(parts[1])
+            print("读取噪声对照：%s" % parts[0])
+            nraw_a, nrep_a = load(dn_a, args.refresh, args.base)
+            print("读取噪声对照：%s" % parts[1])
+            nraw_b, nrep_b = load(dn_b, args.refresh, args.base)
+            nfp = fingerprint_check(nraw_a, nraw_b)
+            if nfp or not (nraw_a.get("complete") and nraw_b.get("complete")
+                           and nraw_a.get("reconcileOk") and nraw_b.get("reconcileOk")):
+                print("⚠️ 噪声对照对自身的前置检查没过，**当作没给**")
+                for p in nfp:
+                    print("   %s" % p)
+            elif config_diff(nraw_a, nraw_b)[0]:
+                print("⚠️ 噪声对照对【不是同配置】—— 它就不是噪声底了，**当作没给**")
+            else:
+                nra, nrb, ncommon, _, _ = common_rows(nrep_a, nrep_b)
+                # ★ 必须与 A/B 的交集再求交：否则同一片里，
+                #   噪声底的分母和 Δ 的分母是两批题，两个比例不可比
+                nz_common = [q for q in ncommon if q in set(common)]
+                nz_ra = {q: nra[q] for q in nz_common}
+                nz_rb = {q: nrb[q] for q in nz_common}
+                nz_cat = slice_categorical(nz_ra, nz_rb, nz_common)
+                nz_cont = slice_continuous(nz_ra, nz_rb, nz_common)
+                print("  噪声对照：%s ↔ %s，与 A/B 的共同可比 %d 道"
+                      % (nraw_a["runId"], nraw_b["runId"], len(nz_common)))
 
     # ── 1. 配置 diff ───────────────────────────────────────────
     w("")
@@ -731,6 +1031,140 @@ def main():
         for q, va, vb in flips:
             w("| %s | `%s` | `%s` |" % (q, fmt(va), fmt(vb)))
         w("")
+
+    # ── 3.5 按 category 切片（T8）──────────────────────────────
+    w("## 3.5 按 category 切片")
+    w("")
+    if not common:
+        w("（前置检查没过，跳过）")
+        w("")
+    else:
+        cat = slice_categorical(ra, rb, common)
+        con = slice_continuous(ra, rb, common)
+        att = slice_attribution(ra, rb, common)
+        # 按命中@5 的可比数降序 —— 最大的那片排最前，它是结论的主要承重者
+        order = sorted(cat, key=lambda c: -cat[c]["命中@5"][0])
+        has_noise = nz_cat is not None
+
+        w("★★ **为什么这一节必须存在**：合计指标会把「重排救了口语句、完全没影响关键词句」")
+        w("   平摊成一个中间数 —— 于是「重排值不值」这个问题在合计里根本没有答案。")
+        w("")
+        w("★ 分母 = 每一片里【该判据两侧都非 None】的题，与 §3 同一套三态纪律。")
+        w("")
+
+        # ── 命中@5 ──
+        w("### 3.5.1 `命中@5`（主判据）")
+        w("")
+        if not has_noise:
+            w("⚠️ **没有噪声对照（没给 `--noise`）** —— 所以下面【没有判据列】。")
+            w("")
+            w("★ 这不是「没有噪声」，是**不可判**：每一片的翻转率必须跟**同一片**的")
+            w("  噪声比才有意义。拿 159 题的 14.5% 去判 26 道题的一片，")
+            w("  等于用一把刻度比被测物还粗的尺子 —— 读出来的是分辨率，不是信号。")
+            w("")
+        w("| category | n | A 命中 | B 命中 | A 率 | B 率 | Δ率 | 翻转 | "
+              "%s判据 |" % ("噪声翻转 | 噪声率 | p | " if has_noise else ""))
+        w("|---|---|---|---|---|---|---|---|%s" % ("---|---|---|---|" if has_noise else ""))
+        for c in order:
+            n, flips = cat[c]["命中@5"]
+            if n == 0:
+                continue
+            hit_a = sum(1 for q in _slice_questions(ra, common, c) if ra[q].get("命中@5") is True)
+            hit_b = sum(1 for q in _slice_questions(ra, common, c) if rb[q].get("命中@5") is True)
+            ra_rate, rb_rate = hit_a / n, hit_b / n
+            cells = "| %s | %d | %d | %d | %.4f | %.4f | **%+.4f** | %d |" % (
+                SLICE_LABEL.get(c, c), n, hit_a, hit_b, ra_rate, rb_rate,
+                rb_rate - ra_rate, len(flips))
+            if has_noise:
+                nn, nflips = nz_cat.get(c, {}).get("命中@5", (0, []))
+                ok, p = slice_verdict(len(flips), len(nflips), n, nn)
+                nr = noise_rate(len(nflips), nn) if nn else None
+                verdict = ("— **不可判**" if ok is None
+                           else ("★★ **超过噪声**" if ok else "没超过噪声"))
+                if nn < MIN_SLICE_N:
+                    verdict += "（噪声 n=%d < %d）" % (nn, MIN_SLICE_N)
+                cells += " %d | %s | %s | %s |" % (
+                    len(nflips), ("%.4f" % nr) if nr is not None else "—",
+                    ("%.4g" % p) if p is not None else "—", verdict)
+            w(cells)
+        w("")
+        w("★ `Δ率` 为负 = B 的命中率更低。判据只问「超过噪声了吗」，**不问好坏** ——")
+        w("  「命中变多」也不构成变好的证据（洞 1：换一个同样合法的 gold 命中也是 ok/ok）。")
+        w("")
+
+        # ── 连续量 ──
+        w("### 3.5.2 连续量")
+        w("")
+        w("| category | n | recall@5 A | B | Δ | mrr@5 A | B | Δ | 上下文条数 A | B |")
+        w("|---|---|---|---|---|---|---|---|---|---|")
+        for c in order:
+            n, _, _, _ = con[c]["recall@5"] or (0, None, None, None)
+            if not n:
+                continue
+            def pair(metric, digits=4):
+                _, va, vb, d = con[c][metric]
+                return ("%.*f" % (digits, va), "%.*f" % (digits, vb),
+                        "**%+.*f**" % (digits, d))
+            ra1, rb1, d1 = pair("recall@5")
+            ra2, rb2, d2 = pair("mrr@5")
+            ra3, rb3, _ = pair("上下文条数", 2)
+            w("| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                SLICE_LABEL.get(c, c), n, ra1, rb1, d1, ra2, rb2, d2, ra3, rb3))
+        w("")
+
+        # ── 归因桶 ──
+        w("### 3.5.3 `归因` 桶分布")
+        w("")
+        w("★ 这一节回答「**为什么**变了」—— 命中率掉了是没召回到（`not_recalled`）、")
+        w("  被范围过滤掉了（`filtered_out`）、还是被重排+截断挤掉了（`rerank_dropped`）。")
+        w("  ⚠️ 三者**修法完全相反**，所以它们必须分开数。")
+        w("")
+        w("| category | n | A | B |")
+        w("|---|---|---|---|")
+        for c in order:
+            a, b, n = att[c]
+            if n == 0:
+                continue
+            fmtc = lambda cnt: " / ".join(  # noqa: E731
+                "%s %d" % (k, cnt[k]) for k in ATTRIBUTION_BUCKETS if cnt.get(k))
+            w("| %s | %d | %s | %s |" % (
+                SLICE_LABEL.get(c, c), n, fmtc(a) or "—", fmtc(b) or "—"))
+        w("")
+        if has_noise:
+            w("### 3.5.4 噪声对照对在切片里的形状")
+            w("")
+            w("★ 判据列拿的是**这里**的数 —— 把它印出来，是为了让「超过噪声」")
+            w("  可以复核，而不是一个从黑箱里冒出来的结论。")
+            w("")
+            w("| category | n | 噪声对 `命中@5` 翻转 | 噪声率 | 用的是哪条规则 |")
+            w("|---|---|---|---|---|")
+            for c in order:
+                nn, nflips = nz_cat.get(c, {}).get("命中@5", (0, []))
+                if nn == 0:
+                    continue
+                rule = ("规则三上界 3/n（该片 0 次翻转）" if not nflips
+                        else "实测 %.0f/%d" % (len(nflips), nn))
+                w("| %s | %d | %d | %.4f | %s |" % (
+                    SLICE_LABEL.get(c, c), nn, len(nflips), noise_rate(len(nflips), nn), rule))
+            w("")
+            w("★★ **规则三**：n 次观测里 0 次发生 ⇒ 真实率 95% 单侧上界约 `3/n`。")
+            w("  直接拿 0 当 p 会让二项尾概率恒为 0，于是**任何**翻转都被判成显著 ——")
+            w("  那是假的。3/n 保守（让「超过噪声」更难成立），而保守正是这里要的方向。")
+            w("")
+        # 落不进任何一片的题
+        loose = [q for q in common if slice_of(ra[q]) is None]
+        if loose:
+            w("⚠️ **%d 道题没有 `类别` 字段，落不进任何一片**（%s）——"
+              % (len(loose), "、".join(loose[:8])))
+            w("  它们【不参与】上面任何一格，所以各片的 n 加起来小于 %d。"
+              % len(common))
+            w("")
+        small = [c for c in order if cat[c]["命中@5"][0] < MIN_SLICE_N]
+        if small:
+            w("⚠️ **n < %d 的切片不作为结论**：%s"
+              % (MIN_SLICE_N, "、".join("%s(n=%d)" % (SLICE_LABEL.get(c, c), cat[c]["命中@5"][0])
+                                       for c in small)))
+            w("")
 
     # ── 4. 连续量 ──────────────────────────────────────────────
     w("## 4. 连续量（不做翻转计数）")

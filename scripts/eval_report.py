@@ -65,6 +65,13 @@ DEFAULT_ROLES = {
     "multi": "20260921-stage7-multi",
 }
 
+# ★ T8 迭代实验：噪声【链】+ 三条轴。
+#   链上相邻两轮同配置 ⇒ 每对给一个噪声底样本；链尾当三条轴的基线。
+#   ★★ 不写「轴 1 = 重排开关」这种名字 —— 标题由 config_diff 现算，
+#      所以换一期做别的旋钮，这里不用改。
+DEFAULT_T8_NOISE = "20260922-stage7-run2,20260923-t8-noise,20260923-t8-noise2"
+DEFAULT_T8_AXES = ("20260923-t8-rerank-off,20260923-t8-topk8,20260924-t8-mc20")
+
 DEFAULT_RAGAS = os.path.join("20260921-stage7", "ragas-sample43.json")
 DEFAULT_RAGAS_NEG = os.path.join("20260921-stage7", "ragas-negative-control.json")
 
@@ -74,11 +81,13 @@ RAGAS_METRICS = ["faithfulness", "answer_relevancy", "context_recall", "answer_c
 BOOTSTRAP_ITERS = 2000
 BOOTSTRAP_SEED = 20260923
 
-# ★ 切片纪律（和 EvalReportService.MIN_SLICE_N 同值）。
-#   ⚠️ 这里是【第二份】拷贝 —— 报告端不 import Java 常量。
-#      值对不上时，报告会给一个 n<5 的切片打上「可信」。
+# ★ 切片纪律（真身是 Java 的 EvalReportService.MIN_SLICE_N）。
+#   ⚠️ Python 侧原来这里是【第二份】拷贝。T8 把它并进了 eval_ab ——
+#      切片的判据和切片的渲染从此只有一个出处，`eval_ab.slice_verdict`
+#      与报告里的「⚠️ 不作为结论」不会再各自漂移。
+#      值对不上时，报告会给一个 n<5 的切片打上「可信」，
 #      所以 selftest 里有一条断言它 == report.json 里的 ★切片可信度纪律.MIN_SLICE_N。
-MIN_SLICE_N = 5
+MIN_SLICE_N = eval_ab.MIN_SLICE_N
 
 DASH = "—"
 
@@ -1942,6 +1951,657 @@ APPENDIX_COLS = [
 ]
 
 
+# ================================================================
+# §11 迭代实验（T8）
+# ================================================================
+
+def _parse_ts(s):
+    """`2026-09-22T21:59:31+08:00` → datetime。拿不到就 None（不猜）。"""
+    if not s:
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _gap_label(raw_a, raw_b):
+    """两轮之间隔了多久 —— ★ 这个数字是噪声表里唯一能解释
+    「为什么这一对能当噪声底」的东西：同一会话里隔十几分钟，
+    和隔一天，不是同一类对照。
+
+    ⚠️ 「跨日」必须按【日历日】判，不能按小时数 ——
+    22:22 跑完、次日 21:29 再跑，相差 23 小时（不到一天），
+    但它跨了一个日历日，而且中间隔了一整夜的应用重启。
+    按小时数分段会把这一对说成「同日」，而它恰恰是那组跨日对照。
+    """
+    ta, tb = _parse_ts(raw_a.get("finishedAt")), _parse_ts(raw_b.get("startedAt"))
+    if ta is None or tb is None:
+        return "—"
+    mins = abs((tb - ta).total_seconds()) / 60.0
+    if mins < 1:
+        return "接续（< 1 分钟）"
+    if mins < 120:
+        return "**同会话**（%.0f 分钟）" % mins
+    if ta.date() != tb.date():
+        return "**跨日**（%.1f 小时）" % (mins / 60.0)
+    return "同日不同会话（%.1f 小时）" % (mins / 60.0)
+
+
+def _cache_hit_estimate(report, raw):
+    """从「成本 + token」反推缓存命中的输入 token 数 → (命中数, 命中率, 模型, 失败原因)。
+
+    ★★ 为什么要反推：`prompt_cache_hit_tokens` **参与计费但不落库** ——
+      `ModelCostCalculator.costOf` 用它算钱，算完就丢掉，`qa_log` 里没有这一列。
+      于是「成本为什么涨了 9.5%」这个问题，除了反推没有别的办法。
+      ★ 这本身就是一条该修的东西：一个进了计费公式却查不到的量。
+
+    ★ 公式来自 `ModelCostCalculator`（已核实，不是猜的）：
+      cost = miss×input + hit×cacheHitInput + completion×output   （三项都除以百万）
+
+    ⚠️ **它假定整轮只用了一个模型。** 有降级行（P1/P2）时这个数不成立 ——
+      所以下面有一段自检：解出来的命中数落在 [0, 输入 token] 之外就拒绝出数，
+      而不是印一个看起来像模像样的百分比。
+    """
+    props = (raw.get("config") or {}).get("properties") or {}
+    chain = props.get("xbla.llm.chat-chain[0]")
+    if not chain:
+        return None, None, None, "配置快照里没有 chat-chain[0]"
+    pre = "xbla.llm.models.%s.pricing." % chain
+    try:
+        p_in = float(props[pre + "input"])
+        p_hit = float(props[pre + "cache-hit-input"])
+        p_out = float(props[pre + "output"])
+    except (KeyError, TypeError, ValueError):
+        return None, None, chain, "拿不到 `%s` 的三档定价" % chain
+    if p_in == p_hit:
+        return None, None, chain, "input 与 cache-hit-input 同价，反推不出命中数"
+
+    cost = (report.get("成本") or {}).get("数据库里的成本合计")
+    if not isinstance(cost, (int, float)):
+        return None, None, chain, "没有成本合计"
+    # token合计 是 prompt + completion，得把两者拆开 —— 报告里没直接给，用延迟那节的样本数反推不行。
+    # ★ 所以这一项【必须】由成本节点给出；给不出就拒绝出数（不出一个凑出来的百分比）
+    for k in ("prompt_token合计", "输出token合计"):
+        if k not in (report.get("成本") or {}):
+            return None, None, chain, "成本节点里没有 `%s`（加它要到 EvalReportService）" % k
+    pt = report["成本"]["prompt_token合计"]
+    ct = report["成本"]["输出token合计"]
+    # ★★★ 退化输入先判。不判的话公式会解出一个**负数**，而负数的成因
+    #   和下面那句「有降级行」长得完全不像 —— 读者会被指向错误的方向。
+    #   实测撞到过：Java 侧 `selectByEvalRun` 的列清单漏了 `prompt_tokens` /
+    #   `completion_tokens` → 两列都读成 0 → 解出 −372263，
+    #   而那一轮实测 100% deepseek-flash，**一行降级都没有**。
+    #   ★ 证据当时就在那句报错里（上界印的是 `[0, 0]`），只是没人按它去读。
+    if not isinstance(pt, (int, float)) or not isinstance(ct, (int, float)) or pt <= 0:
+        return None, None, chain, (
+            "`prompt_token合计` = %r —— **反推的前提就不成立**（它必须是正数）。"
+            "★ 这不是「有降级行」，是这一轮**读不到**那两个数："
+            "去查 `QaLogMapper.selectByEvalRun` 的列清单里有没有 "
+            "`prompt_tokens` / `completion_tokens`" % (pt,))
+    hit = (pt * p_in / 1e6 + ct * p_out / 1e6 - cost) / ((p_in - p_hit) / 1e6)
+    if not (0 <= hit <= pt):
+        # ★ 只陈述观察，不指认成因 —— 「落在范围外」至少有两个不互斥的可能
+        #   （降级行 / 上游 token 数与定价对不上），而原来那句话写死了前者。
+        return None, None, chain, ("解出命中数 %.0f，落在 [0, %d] 之外 —— "
+                                   "★ 成因未定，**这一条不下结论**" % (hit, pt))
+    return hit, hit / pt, chain, None
+
+
+def _parse_hits(s):
+    """`"[5, 25]/[5, 25]"` → (命中的切片 id 集, 该题的全部正解集)。
+
+    ⚠️ 这个字段是**字符串**不是数组 —— 直接当集合用会得到一个逐字符迭代的
+      结果（`"[5, 25]"` → `{ '[', '5', ',', ...`），而它**不报错**。
+    """
+    if not isinstance(s, str) or "/" not in s:
+        return None, None
+    a, b = s.split("/", 1)
+    grab = lambda t: {int(x) for x in re.findall(r"\d+", t)}  # noqa: E731
+    return grab(a), grab(b)
+
+
+def _containment(ra, rb, common):
+    """命中集合在 B 里相对 A 的包含关系 —— ★★ **结构性论证的实证版**。
+
+    `final-top-k` 调大 ⇒ contexts 是超集 ⇒ `context_recall` / `faithfulness`
+    **结构性不可能下降**；`max-candidates` 调小 ⇒ 重排看到的是子集 ⇒
+    召回**结构性不可能上升**。这两句都是原理，不是数据。
+
+    ★ 但「原理上成立」和「这一轮真成立」是两件事：重排分数有约 3e-4 的漂移，
+      所以边界的切片偶尔会进出。**把这些违例数出来，比宣示一句「超集」有用得多。**
+    """
+    got_a, got_b = {}, {}
+    for q in common:
+        ha, _ = _parse_hits(ra[q].get("命中的正解切片"))
+        hb, _ = _parse_hits(rb[q].get("命中的正解切片"))
+        if ha is None or hb is None:
+            continue
+        got_a[q], got_b[q] = ha, hb
+    sup = [q for q in got_a if got_b[q] >= got_a[q]]     # B ⊇ A
+    sub = [q for q in got_a if got_b[q] <= got_a[q]]     # B ⊆ A
+    eq = [q for q in got_a if got_b[q] == got_a[q]]
+    lost = [q for q in got_a if got_a[q] - got_b[q]]     # A 有、B 没有的
+    return {"n": len(got_a), "sup": sup, "sub": sub, "eq": eq, "lost": lost}
+
+
+def _overrides(raw):
+    """这一轮真正被【运行时覆盖】的配置键 → 值。
+
+    ★★ 判据必须**正面**写：yml 来源的 origin 一律长成 `Config resource ...`，
+      覆盖不长这样。反着写（`'application' not in origin`）会把
+      `spring.application.json` **自己**滤掉 —— 它含 `application` ——
+      于是「覆盖生效了」被判成「没生效」。
+      ★ 本项目已经踩过三次同形的坑：`keyword-weight` 含 `key`（脱敏误伤）、
+      `Map.of` 拒 null、`Set.copyOf` 迭代顺序。**子串匹配不是判据。**
+    """
+    cfg = raw.get("config") or {}
+    origin, props = cfg.get("origin") or {}, cfg.get("properties") or {}
+    return {k: props.get(k) for k, v in origin.items()
+            if not str(v).startswith("Config resource")}
+
+
+def _t8_pairs(noise_runs):
+    """把噪声链拆成相邻两对。★ 链而不是「一对」：
+    N 轮同配置给出 N-1 个独立的噪声底样本，而**底稳不稳定**本身就是要报的事 ——
+    只有一个样本时，「这个数换个时间跑还会不会是这样」没有答案。"""
+    out = []
+    for i in range(len(noise_runs) - 1):
+        a, b = noise_runs[i], noise_runs[i + 1]
+        probs = eval_ab.fingerprint_check(a["raw"], b["raw"])
+        differ = eval_ab.config_diff(a["raw"], b["raw"])[0]
+        # ★ 噪声链上任一轮没跑成，这一对就量不出噪声 —— 它量的是「熔断器什么时候跳的」
+        for r in (a, b):
+            u, bad, ratio, _h = eval_ab.run_usability(r["raw"])
+            if not u:
+                probs.append("  ✗ %s 有 %.1f%% 的行是模型链路失败（%d 行）"
+                             % (r["runId"], ratio * 100, bad))
+        ra, rb, common, _, _ = eval_ab.common_rows(a["report"], b["report"])
+        rows, details = eval_ab.flip_table(ra, rb, common)
+        # ★ `rows` 里第三项是【计数】，题号在 `details` 里 —— 两个都不一样，
+        #   混起来会得到一个永远算不出来的数（或一个静默错掉的数）
+        n_any = len({q for flips in details.values() for q, _, _ in flips})
+        out.append({
+            "a": a, "b": b, "probs": probs, "differ": differ,
+            "common": len(common), "rows": rows, "flipped_any": n_any,
+            "gap": _gap_label(a["raw"], b["raw"]),
+        })
+    return out
+
+
+def render_iterations(t8):
+    """§11 迭代实验（T8）。
+
+    ★★★ 这一节和报告前半的差别在于：前半是「我们现在在哪」，
+      这一节是「**动了什么、然后去了哪**」。路线图的验收标准里
+      「体现迭代过程」指的就是它。
+
+    ★★ 纪律①在这里的具体形态：**没有任何一句「重排很重要」是写死的** ——
+      每一句都从 `slice_verdict` 的返回值里长出来。数据换了句子跟着换。
+    """
+    out = []
+    if not t8 or not t8.get("axes"):
+        # ★★★ 三态，不是两态。原来把「没给」和「给错了」压成同一句话，
+        #   而后者会**静默删掉一整节交付物**（一个写错的 runId 就够了）。
+        reason = (t8 or {}).get("unreadable")
+        if reason:
+            out.append("⚠️⚠️ **本节读不到输入 —— 这不等于「没有做过迭代」。**")
+            out.append("")
+            out.append("报告生成器拿不到这几轮，原因是：")
+            out.append("")
+            out.append("```")
+            out.append(reason)
+            out.append("```")
+            out.append("")
+            out.append("★ **「读不到」是关于我们输入的事实，「没有做过」是关于世界的事实。**"
+                       "把它们渲染成同一句话，会让一个写错的 runId 静默删掉一整节。"
+                       "修法是改正上面的 runId（或 `--t8-noise` / `--t8-axes`）然后重跑。")
+        else:
+            out.append("（这一期没有迭代实验 —— `--t8-noise` / `--t8-axes` 都是空的，"
+                       "**不是**「给了但读不到」）")
+        return out
+
+    axes = t8["axes"]
+    noise_runs = t8.get("noise_runs") or []
+    # ★ 基线 = 【链尾】。它不是随便挑的：三条轴紧跟在它后面跑，
+    #   所以它和三条轴之间的时间间隔最小 —— 拿链首当基线会白白多算一段漂移。
+    base = noise_runs[-1] if noise_runs else None
+    if base is None:
+        out.append("⛔ **没有噪声链 ⇒ 没有基线 ⇒ 这一节不成立。**")
+        return out
+
+    # ── 11.0 这一节在回答什么 ──────────────────────────────────
+    out.append("### 11.0 三条轴与它们的基线")
+    out.append("")
+    out.append("每一次 A/B 都是**只动一个配置键**，其余一字不改（用 "
+               "`SPRING_APPLICATION_JSON` 覆盖，不改 yml 文件 —— 改文件的话"
+               "「这轮跑的到底是哪份配置」就没有证据）。")
+    out.append("")
+    out.append("| 轴 | 配置键 | A | B | 轮次 |")
+    out.append("|---|---|---|---|---|")
+    for ax in axes:
+        differ = eval_ab.config_diff(base["raw"], ax["raw"])[0]
+        if not differ:
+            out.append("| %s | ⚠️ **无配置差异** | — | — | `%s` |"
+                       % (ax["label"], ax["runId"]))
+            continue
+        for k, va, vb in differ:
+            out.append("| %s | `%s` | `%s` | `%s` | `%s` |"
+                       % (ax["label"], k, eval_ab.fmt(va), eval_ab.fmt(vb), ax["runId"]))
+    out.append("")
+    out.append("★★ **配置差异从哪来** —— 每一轮的配置快照都记了每个键的**来源**，")
+    out.append("所以「这一轮真的跑在它的覆盖下」是**证据**，不是信任：")
+    out.append("")
+    out.append("| 轮 | 运行时覆盖的键（来源非文件） |")
+    out.append("|---|---|")
+    for r in (noise_runs + axes):
+        ov = _overrides(r["raw"])
+        out.append("| `%s` | %s |" % (
+            r["runId"],
+            "、".join("`%s`=`%s`" % (k, eval_ab.fmt(v)) for k, v in sorted(ov.items()))
+            or "（无 —— 全走 yml）"))
+    out.append("")
+    out.append("★ 判据是**正面**的：yml 来源的 origin 一律长成 `Config resource ...`，"
+               "覆盖不长这样。反着写会把 `spring.application.json` 自己滤掉。")
+    out.append("")
+
+    # ── 11.1 噪声底：同会话 vs 跨日 ────────────────────────────
+    out.append("### 11.1 噪声链：**先把尺子做出来**")
+    out.append("")
+    out.append("★★★ 这不是脚注，是第一张表。三条轴上任何一个「变了」的结论，"
+               "都必须**先跟同一片里的噪声比大小** —— 否则读的是分辨率，不是信号。")
+    out.append("")
+    if noise_runs:
+        out.append("噪声链是 **%d 轮同配置**：%s。相邻两对各给出一个噪声底样本。"
+                   % (len(noise_runs),
+                      " → ".join("`%s`" % r["runId"] for r in noise_runs)))
+    else:
+        out.append("⚠️ **没给噪声链（`--t8-noise`）** —— 下面所有轴的结论都"
+                   "**没有判据**，只能当参考。")
+    out.append("")
+    pairs = _t8_pairs(noise_runs)
+    if pairs:
+        out.append("| 对 | 相隔 | 配置差异 | 共同可比 | 至少翻一格 | 翻转率 | 可用 |")
+        out.append("|---|---|---|---|---|---|---|")
+        for p in pairs:
+            rate = (p["flipped_any"] / p["common"]) if p["common"] else 0.0
+            out.append("| `%s` ↔ `%s` | %s | %d | %d | **%d** | **%.1f%%** | %s |"
+                       % (p["a"]["runId"], p["b"]["runId"], p["gap"],
+                          len(p["differ"]), p["common"], p["flipped_any"], rate * 100,
+                          "✅" if not p["probs"] else "⛔ **不可用**"))
+        out.append("")
+        broken = [p for p in pairs if p["probs"]]
+        if broken:
+            out.append("⚠️ **上面标 ⛔ 的那些对量不出噪声** —— 它们里面有一轮没跑成。")
+            out.append("  「翻转率」那一列对它没有意义：它量的是熔断器什么时候跳的。")
+            for p in broken:
+                for line in p["probs"]:
+                    out.append("  %s" % line)
+            out.append("")
+            out.append("★ 本节所有的判据都应当改用**没被标 ⛔ 的那一对**。")
+            out.append("")
+        out.append("**逐判据的翻转率（合成一张表，因为要横向比）**")
+        out.append("")
+        out.append("| 判据 | 共同可比 | " + " | ".join(
+            "`%s`↔`%s`" % (p["a"]["runId"].split("-")[-1], p["b"]["runId"].split("-")[-1])
+            for p in pairs) + " |")
+        out.append("|---|---|" + "---|" * len(pairs))
+        for metric in eval_ab.CATEGORICAL:
+            cells, ns = [], None
+            for p in pairs:
+                hit = next(r for r in p["rows"] if r[0] == metric)
+                ns = hit[1] if ns is None else ns
+                cells.append("**%.1f%%**（%d）" % (100.0 * hit[2] / hit[1], hit[2])
+                             if hit[1] else "—")
+            out.append("| `%s` | %d | %s |" % (metric, ns or 0, " | ".join(cells)))
+        out.append("")
+        out.append("★ 括号里是**翻转的题数**，不是比例的分母 —— 分母在第二列。")
+        out.append("")
+        # ★ 用判据说话，不用形容词
+        rates = [(p["flipped_any"] / p["common"] * 100.0) if p["common"] else 0.0
+                 for p in pairs]
+        if len(rates) >= 2:
+            spread = max(rates) - min(rates)
+            out.append("★★ **两组的「至少翻一格」相差 %.1f 个百分点**（%.1f%% vs %.1f%%）—— "
+                       % (spread, rates[0], rates[-1]))
+            if spread < 5:
+                out.append("  这是**噪声底不随日期漂移**的正面证据。它的用处很具体：")
+                out.append("  拿昨天那对当标尺，和拿今天这对当标尺，会得到同一个判断。")
+            else:
+                out.append("  ⚠️ **差别不小** —— 说明「噪声底」本身有个慢漂移的分量，")
+                out.append("  跨日拿旧的底当标尺会低估噪声。")
+            out.append("")
+        seq = next((r for r in pairs[-1]["rows"] if r[0] == "跨次序列变了"), None)
+        hit = next((r for r in pairs[-1]["rows"] if r[0] == "命中@5"), None)
+        if seq and hit and hit[1]:
+            out.append("★ 最大的噪声源仍然是 `跨次序列变了`（%d/%d = %.1f%%），"
+                       % (seq[2], seq[1], 100.0 * seq[2] / seq[1]))
+            out.append("  而 `命中@5` 只翻 %d 道 —— **序列在churn，「有没有命中」几乎不变**。"
+                       % hit[2])
+            out.append("")
+        out.append("★★ **检索侧的噪声底只有 `命中@5` / `归因` 那两个数**（本次 %d/%d）。"
+                   "轴 1、轴 2 都在动检索，所以它们的效果必须高过这个量级。"
+                   % (hit[2] if hit else 0, hit[1] if hit else 0))
+        out.append("")
+
+    # ── 11.2 逐轴 ──────────────────────────────────────────────
+    for ax in axes:
+        out.extend(_render_one_axis(ax, base, noise_runs))
+
+    return out
+
+
+def _render_one_axis(ax, base, noise_runs):
+    """一条轴一节。★★ 所有数字从数据取；所有判据走 eval_ab 的唯一那份实现。"""
+    out = []
+    differ = eval_ab.config_diff(base["raw"], ax["raw"])[0]
+    title = "、".join("`%s` `%s` → `%s`" % (k, eval_ab.fmt(v1), eval_ab.fmt(v2))
+                      for k, v1, v2 in differ) or "⚠️ 无配置差异"
+    out.append("### 11.2.%s %s" % (ax["ordinal"], title))
+    out.append("")
+
+    # 前置检查
+    problems = eval_ab.fingerprint_check(base["raw"], ax["raw"])
+    usable, bad, ratio, _how = eval_ab.run_usability(ax["raw"])
+    ok = (ax["raw"].get("complete") and ax["raw"].get("reconcileOk")
+          and usable and not problems)
+    if not ok:
+        out.append("⛔ **这一轴不成立**：complete=%s reconcileOk=%s "
+                   "跑成了=%s（模型链路失败 %d 行 = %.1f%%）指纹问题=%s"
+                   % (ax["raw"].get("complete"), ax["raw"].get("reconcileOk"),
+                      usable, bad, ratio * 100, problems or "无"))
+        if not usable:
+            out.append("")
+            out.append("★★★ **「对账通过」不等于「这一轮能用」** —— 对账问的是")
+            out.append("「行有没有丢」，它问不出「行有没有成」。失败的行由熔断器成簇触发，")
+            out.append("所以活下来的那些**不是一个无偏的子样本**，拿它算的每个数都偏。")
+        out.append("")
+        return out
+
+    ra, rb, common, qa_only, qb_only = eval_ab.common_rows(base["report"], ax["report"])
+    out.append("- 共同可比 **%d** 道（基线独有 %d、本轮独有 %d）"
+               % (len(common), len(qa_only), len(qb_only)))
+    out.append("- 基线 `%s` 与本轮 `%s`：语料/切分/gold 指纹一致 ✅"
+               % (base["runId"], ax["runId"]))
+    out.append("")
+
+    # ── 延迟（五段）───────────────────────────────────────────
+    out.append("#### 延迟（五段，**别当成相加等于 total**）")
+    out.append("")
+    out.append("| 段 | 基线 n | 基线 p50 | 本轮 n | 本轮 p50 | Δ p50 | 口径 |")
+    out.append("|---|---|---|---|---|---|---|")
+    seg_spec = [
+        ("检索（含重排）", "retrieval_latency_ms", "★ 这里面【含】重排，不是并列项"),
+        ("重排", "rerank_latency_ms", "★★ ⊂ 上面那一行"),
+        ("生成", "llm_latency_ms", "生成那一跳"),
+        ("总计", "total_latency_ms", ""),
+        ("未归类", "★未归类_ms", "★ 含意图分类那一次模型往返（它在【任何一段里都没有】）"),
+    ]
+    for name, path, note in seg_spec:
+        na = get_path(base["report"], "延迟." + path)
+        nb = get_path(ax["report"], "延迟." + path)
+        if not isinstance(na, dict) or not isinstance(nb, dict):
+            continue
+        pa, pb = na.get("p50"), nb.get("p50")
+        if pb is None and pa is not None:
+            delta = "**—（本轮没有发生）**"
+        elif pa is None and pb is None:
+            delta = "—"
+        elif pa is None:
+            delta = "—（基线没有）"
+        else:
+            delta = "**%+d ms**" % (pb - pa)
+        out.append("| %s | %d | %s | %d | %s | %s | %s |"
+                   % (name, na.get("n") or 0, ("%s" % pa) if pa is not None else "—",
+                      nb.get("n") or 0, ("%s" % pb) if pb is not None else "—", delta, note))
+    out.append("")
+    out.append("⚠️ **各段的 n 不同**（被 `status≠1` 截掉的条数不同），"
+               "所以这不是同一个总体 —— 逐段的 Δ 只能作方向性参考。")
+    out.append("")
+
+    # ── 按 category 的检索侧效果 ──────────────────────────────
+    out.append("#### 检索侧效果，按 `category` 切片")
+    out.append("")
+    out.append("★★ **为什么必须切**：合计指标会把「只影响口语句、完全不动关键词句」"
+               "平摊成一个中间数。而重排**预期**的收益恰恰集中在口语句 —— "
+               "关键词句靠词面就能召回，语义重排对它没有增量。")
+    out.append("")
+    cat = eval_ab.slice_categorical(ra, rb, common)
+    con = eval_ab.slice_continuous(ra, rb, common)
+    att = eval_ab.slice_attribution(ra, rb, common)
+    nz = {}
+    nz_con = {}
+    nz_q_hit, nz_hit_a, nz_hit_b = set(), {}, {}
+    if len(noise_runs) >= 2:
+        na, nb = noise_runs[-2], noise_runs[-1]
+        nra, nrb, ncommon, _, _ = eval_ab.common_rows(na["report"], nb["report"])
+        ncommon = [q for q in ncommon if q in set(common)]
+        nz = eval_ab.slice_categorical({q: nra[q] for q in ncommon},
+                                       {q: nrb[q] for q in ncommon}, ncommon)
+        # ★★ 连续量也要尺子。命中率有翻转矩阵当判据，**均值没有** ——
+        #    只印一个 Δ 而不印同片噪声的 Δ，读的人会把 0.007 的抖动当结论。
+        nz_con = eval_ab.slice_continuous({q: nra[q] for q in ncommon},
+                                          {q: nrb[q] for q in ncommon}, ncommon)
+        # 总体的尺子：噪声对在共同可比题上的 `命中@5`。
+        # ⚠️ 分母同样守三态 —— 只数【两侧都非 None】的题，
+        #    否则 29 道非检索题会被当成「没翻」摊进分母，把噪声率压低
+        nz_q_hit = {q for q in ncommon
+                    if nra[q].get("命中@5") is not None
+                    and nrb[q].get("命中@5") is not None}
+        nz_hit_a = {q: nra[q]["命中@5"] for q in nz_q_hit}
+        nz_hit_b = {q: nrb[q]["命中@5"] for q in nz_q_hit}
+
+    order = sorted(cat, key=lambda c: -cat[c]["命中@5"][0])
+    has_noise = bool(nz)
+    out.append("| category | n | 基线命中 | 本轮命中 | 基线率 | 本轮率 | Δ率 | 翻转 |"
+               + (" 噪声翻转 | 噪声率 | p | 判据 |" if has_noise else ""))
+    out.append("|---|---|---|---|---|---|---|---|" + ("---|---|---|---|" if has_noise else ""))
+    verdicts = []
+    for c in order:
+        n, flips = cat[c]["命中@5"]
+        if n == 0:
+            continue
+        qs = [q for q in common if eval_ab.slice_of(ra[q]) == c]
+        ha = sum(1 for q in qs if ra[q].get("命中@5") is True)
+        hb = sum(1 for q in qs if rb[q].get("命中@5") is True)
+        cells = "| %s | %d | %d | %d | %.4f | %.4f | **%+.4f** | %d |" % (
+            eval_ab.SLICE_LABEL.get(c, c), n, ha, hb, ha / n, hb / n,
+            (hb - ha) / n, len(flips))
+        if has_noise:
+            nn, nfl = nz.get(c, {}).get("命中@5", (0, []))
+            v, p = eval_ab.slice_verdict(len(flips), len(nfl), n, nn)
+            nr = eval_ab.noise_rate(len(nfl), nn)
+            verdicts.append((c, n, (hb - ha) / n, v, p, nfl))
+            cells += " %d | %s | %s | %s |" % (
+                len(nfl), ("%.4f" % nr) if nr is not None else "—",
+                ("%.4g" % p) if p is not None else "—",
+                "— **不可判**" if v is None else ("★★ **超过噪声**" if v else "没超过噪声"))
+        out.append(cells)
+    out.append("")
+
+    # ── 判据句（纪律①：写判据的函数，不写死数字）──────────────
+    sig = [x for x in verdicts if x[3] is True]
+    if not has_noise:
+        out.append("⚠️ **没有噪声链 ⇒ 没有判据列。** 这一轴看不出「变了」和「抖了」的区别。")
+    else:
+        # ★★★ 总体判据。**没有它，上面那张表会误导**：
+        #     切到 87/26/17 之后每片的 n 都不够，于是三片全「没超过噪声」，
+        #     而合计起来是显著的 —— 读的人会得出「这个旋钮没效果」的**错结论**。
+        #   这是一个很常见也很危险的形状：**显著的东西被切碎之后不显著**。
+        overall_n = sum(cat[c]["命中@5"][0] for c in order)
+        overall_f = sum(len(cat[c]["命中@5"][1]) for c in order)
+        # ⚠️⚠️ 尺子必须在【同一批题】上取。两个陷阱：
+        #   ① 拿某一片的翻转数当总体 —— 分母不是一回事
+        #   ② 用噪声对的全部可比题 —— 它和上面 overall_n 的题集可能差几道
+        #      （不同的对，两侧有一侧是 None 的题不同）
+        #   它们只差一两道，但那一道会直接挪动 p 值在 0.05 附近的位置。
+        overall_q = {q for c in order
+                     for q in [x for x in common if eval_ab.slice_of(ra[x]) == c]
+                     if ra[q].get("命中@5") is not None and rb[q].get("命中@5") is not None}
+        nz_same = [q for q in overall_q if q in set(nz_q_hit)]
+        floor = eval_ab.noise_rate(
+            sum(1 for q in nz_same if nz_hit_a[q] != nz_hit_b[q]), len(nz_same))
+        p_all = eval_ab.binom_tail(overall_f, overall_n, floor) if floor else None
+        need = None
+        if floor:
+            need = next((i for i in range(1, overall_n + 1)
+                         if eval_ab.binom_tail(i, overall_n, floor) < 0.05), None)
+        nz_f_same = sum(1 for q in nz_same if nz_hit_a[q] != nz_hit_b[q])
+        out.append("★★★ **总体判据（把三片合起来看）**：`命中@5` 翻转 **%d / %d**，"
+                   "噪声链在**两边的交集**上（%d 道）翻 %d 道（率 %.4f），"
+                   "**p = %.4g** → %s"
+                   % (overall_f, overall_n, len(nz_same), nz_f_same, floor or 0,
+                      p_all if p_all is not None else float("nan"),
+                      "★★ **超过噪声**" if (p_all is not None and p_all < 0.05)
+                      else "没超过噪声"))
+        out.append("")
+        if overall_n != len(nz_same):
+            out.append("★ 两个 n 差 %d 道：那是噪声对上不可比（两侧有一侧是 `—`）的题，"
+                       "**不是算错了**。p 值只在交集上算。"
+                       % abs(overall_n - len(nz_same)))
+            out.append("")
+        if need is not None:
+            out.append("★ 门槛：在这个噪声率下，合计要**至少翻 %d 道**才到 p<0.05。" % need)
+            out.append("")
+        if sig:
+            for c, n, d, v, p, nfl2 in sig:
+                out.append("★★ **`%s` 这一片超过噪声**：命中率 Δ **%+.4f**，"
+                           "本片翻转 %d 道，而噪声链在同片上只翻 %d 道（p=%.4g，n=%d）。"
+                           % (eval_ab.SLICE_LABEL.get(c, c), d,
+                              len(cat[c]["命中@5"][1]), len(nfl2), p, n))
+            out.append("")
+        elif p_all is not None and p_all < 0.05:
+            out.append("★★★ **形状是「总体显著、逐片都不显著」** —— 这不是矛盾：")
+            out.append("  切到 87/26/17 之后每一片的 n 都不够，二项检验没有分辨力，")
+            out.append("  而合起来看它是显著的。**正确的读法是：这个旋钮确实有效果，")
+            out.append("  但效果小到按 `category` 切完就指不出它集中在哪一类。**")
+            out.append("  ⚠️ 反过来说：任何「效果集中在某一类」的说法在这一轮**都没有证据**。")
+            out.append("")
+        else:
+            out.append("★ **总体与逐片都没超过噪声** —— 以本轮的样本量和噪声水平，")
+            out.append("  这个旋钮的效果**分辨不出来**。⚠️ 这不等于「没有效果」。")
+            out.append("")
+
+    # 连续量
+    out.append("| category | n | recall@5 Δ | recall@5 噪声 Δ | mrr@5 Δ | mrr@5 噪声 Δ | "
+               "上下文条数 | 越界切片数 Δ | 越界噪声 Δ |")
+    out.append("|---|---|---|---|---|---|---|---|---|")
+    for c in order:
+        n, va, vb, d = con[c]["recall@5"]
+        if not n:
+            continue
+        _, ca0, cb0, _ = con[c]["上下文条数"]
+        _, oa0, ob0, od = con[c]["越界切片数"]
+        nrec = (nz_con.get(c) or {}).get("recall@5", (0, None, None, None))[3]
+        nmrr = (nz_con.get(c) or {}).get("mrr@5", (0, None, None, None))[3]
+        novr = (nz_con.get(c) or {}).get("越界切片数", (0, None, None, None))[3]
+        f = lambda v: ("**%+.4f**" % v) if v is not None else "—"  # noqa: E731
+        out.append("| %s | %d | %s | %s | %s | %s | %.2f → %.2f | %s | %s |"
+                   % (eval_ab.SLICE_LABEL.get(c, c), n, f(d), f(nrec),
+                      f(con[c]["mrr@5"][3]), f(nmrr), ca0, cb0, f(od), f(novr)))
+    out.append("")
+    out.append("★★ **`Δ` 旁边那一列就是该片的尺子**（噪声链在同一片上的 Δ）。")
+    out.append("  命中率有翻转矩阵当判据，**均值没有** —— 只印 Δ 而不印同片噪声的 Δ，")
+    out.append("  读的人会把 0.007 的抖动当成结论。")
+    out.append("")
+    out.append("★ `越界切片数` 是**过度检索**的切片版：进 prompt 的切片里，")
+    out.append("  `doc_type` 不在该题标注范围里的条数。它越大 = 塞进越多无关内容。")
+    out.append("  截断到更少的条数（`final-top-k` 调小）会**同时**降低召回和过度检索 ——")
+    out.append("  这两件事在合计里相互抵消，只有在切片里才分得开。")
+    out.append("")
+
+    # 归因桶
+    out.append("| category | n | 基线归因 | 本轮归因 |")
+    out.append("|---|---|---|---|")
+    for c in order:
+        a, b2, n = att[c]
+        if n == 0:
+            continue
+        f = lambda cnt: " / ".join("%s %d" % (k, cnt[k])  # noqa: E731
+                                   for k in eval_ab.ATTRIBUTION_BUCKETS if cnt.get(k))
+        out.append("| %s | %d | %s | %s |"
+                   % (eval_ab.SLICE_LABEL.get(c, c), n, f(a) or "—", f(b2) or "—"))
+    out.append("")
+
+    # ── 结构性方向：命中集合的包含关系 ────────────────────────
+    ct = _containment(ra, rb, common)
+    if ct["n"]:
+        out.append("#### 结构性方向：命中的正解切片集合怎么变")
+        out.append("")
+        out.append("| 关系 | 题数 | 占比 |")
+        out.append("|---|---|---|")
+        out.append("| B ⊇ A（**只增不减**） | %d | %.1f%% |"
+                   % (len(ct["sup"]), 100.0 * len(ct["sup"]) / ct["n"]))
+        out.append("| B ⊆ A（**只减不增**） | %d | %.1f%% |"
+                   % (len(ct["sub"]), 100.0 * len(ct["sub"]) / ct["n"]))
+        out.append("| B = A（一点没动） | %d | %.1f%% |"
+                   % (len(ct["eq"]), 100.0 * len(ct["eq"]) / ct["n"]))
+        out.append("| **丢了命中的题**（A 有、B 没有） | %d | %.1f%% |"
+                   % (len(ct["lost"]), 100.0 * len(ct["lost"]) / ct["n"]))
+        out.append("")
+        if ct["lost"]:
+            out.append("丢了的题号：%s" % "、".join(ct["lost"][:20]))
+            out.append("")
+        out.append("★★ 用法：**先看原理允许哪个方向，再看这一轮是不是那个方向。**")
+        out.append("")
+        out.append("- `final-top-k` 调**大** ⇒ contexts 是超集 ⇒ 期望 `B ⊇ A` 占压倒多数")
+        out.append("  （`context_recall` / `faithfulness` 因此**结构性不可能下降**）")
+        out.append("- `rerank.max-candidates` 调**小** ⇒ 重排候选是子集 ⇒ 期望 `B ⊆ A`")
+        out.append("  （召回因此**结构性不可能上升**）")
+        out.append("- `rerank.enabled` 开关 ⇒ 两条完全不同的排序 ⇒ **两个方向都不该压倒**")
+        out.append("")
+        out.append("⚠️ 但这个字段是 `report.json` 里的**字符串**（形如 `[5, 25]/[5, 25]`），")
+        out.append("  解析失败时整段静默跳过 —— 所以 n 必须印出来。")
+        out.append("")
+
+    # 成本
+    ca = get_path(base["report"], "成本")
+    cb = get_path(ax["report"], "成本")
+    if isinstance(ca, dict) and isinstance(cb, dict):
+        out.append("**成本**（服务端账本，不含意图分类与摘要压缩）")
+        out.append("")
+        out.append("| 项 | 基线 | 本轮 | Δ |")
+        out.append("|---|---|---|---|")
+        for k in sorted(set(ca) & set(cb)):
+            va, vb = ca[k], cb[k]
+            if not isinstance(va, (int, float)) or isinstance(va, bool) \
+                    or not isinstance(vb, (int, float)) or isinstance(vb, bool):
+                continue
+            out.append("| %s | %s | %s | **%+g** |" % (k, va, vb, vb - va))
+        out.append("")
+        # ── 缓存命中率（反推）──────────────────────────────────
+        ha, ra_, m_a, e_a = _cache_hit_estimate(base["report"], base["raw"])
+        hb, rb_, m_b, e_b = _cache_hit_estimate(ax["report"], ax["raw"])
+        if ha is not None and hb is not None:
+            out.append("★★ **缓存命中率（反推）**：`prompt_cache_hit_tokens` "
+                       "**参与计费但不落库**，所以只能从上面那两行 + 三档定价算回来：")
+            out.append("")
+            out.append("| 轮 | 模型 | 反推命中的输入 tok | 输入 tok | 命中率 |")
+            out.append("|---|---|---|---|---|")
+            for r, h, rr, m in ((base, ha, ra_, m_a), (ax, hb, rb_, m_b)):
+                pt = get_path(r["report"], "成本.prompt_token合计")
+                out.append("| `%s` | `%s` | %.0f | %s | **%.1f%%** |"
+                           % (r["runId"], m, h, pt, rr * 100))
+            out.append("")
+            out.append("| | 命中率 Δ | 元/行 基线 | 元/行 本轮 |")
+            out.append("|---|---|---|---|")
+            ra_cost = ca.get("数据库里的成本合计")
+            rb_cost = cb.get("数据库里的成本合计")
+            na_, nb_ = ca.get("有成本的行"), cb.get("有成本的行")
+            out.append("| | **%+.1f 个百分点** | %.6f | %.6f |"
+                       % ((rb_ - ra_) * 100,
+                          ra_cost / na_ if na_ else 0, rb_cost / nb_ if nb_ else 0))
+            out.append("")
+            out.append("⚠️ 反推**假定整轮只用一个模型**（用 `chat-chain[0]` 的定价）。")
+            out.append("  有降级行时它不成立 —— 要连同 provider/model 切片一起读。")
+        else:
+            out.append("（缓存命中率反推不出来：基线 %s；本轮 %s）"
+                       % (e_a or "—", e_b or "—"))
+        out.append("")
+    return out
+
+
 def render_appendix(runs):
     a, b = runs["noise"], runs["main"]
     ra, rb = a["report"], b["report"]
@@ -2194,6 +2854,80 @@ def selftest():
     check("⑦ eval_ab.common_rows 可调用",
           callable(getattr(eval_ab, "common_rows", None)))
 
+    # ⑧ T8：噪声链的「相隔」必须按【日历日】判，不能按小时数
+    # ★★ 反对照：22:22 跑完、次日 21:29 再跑，相差 23.1 小时（**不到一天**）。
+    #    按小时数分段会说「同日」，而它恰恰是那组跨日对照。
+    cross = _gap_label({"finishedAt": "2026-09-22T22:22:35+08:00"},
+                       {"startedAt": "2026-09-23T21:29:00+08:00"})
+    same = _gap_label({"finishedAt": "2026-09-23T21:50:00+08:00"},
+                      {"startedAt": "2026-09-23T22:05:00+08:00"})
+    check("⑧ 隔夜那对判成「跨日」（23.1 小时，但跨了日历日）",
+          "跨日" in cross)
+    check("⑧ 同日那对【不】判成跨日（反对照）",
+          "跨日" not in same and "同会话" in same)
+
+    # ⑨ T8：切片判据的三态在报告侧也成立
+    # ★ 没有噪声链时判据必须印成「不可判」，不是「没超过噪声」——
+    #   后者是一个结论，而当时根本没测过噪声
+    check("⑨ 没噪声对照 → eval_ab.slice_verdict 返回 (None, None)，不是 (False, …)",
+          eval_ab.slice_verdict(9, 0, 88, 0) == (None, None))
+
+    # ⑩ T8：`命中的正解切片` 是【字符串】，不是数组
+    # ★★ 反对照：直接拿它当集合用会得到一个逐字符的垃圾集（`'[5, 25]'` → 6 个字符），
+    #    而且**不报错** —— 包含关系会变成一句看起来有数的胡话
+    ha, hall = _parse_hits("[5, 25]/[5, 25]")
+    check("⑩ `[5, 25]/[5, 25]` → ({5,25}, {5,25})", ha == {5, 25} and hall == {5, 25})
+    check("⑩ 单元素 + 不等长也能解析", _parse_hits("[6]/[5, 25]") == ({6}, {5, 25}))
+    check("⑩ None 进来 → (None, None)，不抛",
+          _parse_hits(None) == (None, None))
+    check("⑩ 反对照：裸字符串当集合用会得到 6 个字符（所以必须先解析）",
+          len(set("[5, 25]")) == 6 and len(set("[5, 25]")) != len({5, 25}))
+
+    # ── ⑪ 缓存命中反推 + ★★★ 退化输入的守卫 ────────────────────
+    # ★ 定价故意取整，好让期望值一眼能验算：
+    #   pt=1000, ct=100, 命中 500 → cost = (500×1.0 + 500×0.1 + 100×2.0)/1e6 = 0.00075
+    _cfg = {"config": {"properties": {
+        "xbla.llm.chat-chain[0]": "t-model",
+        "xbla.llm.models.t-model.pricing.input": 1.0,
+        "xbla.llm.models.t-model.pricing.cache-hit-input": 0.1,
+        "xbla.llm.models.t-model.pricing.output": 2.0,
+    }}}
+
+    def _rep(pt, ct, cost):
+        return {"成本": {"数据库里的成本合计": cost,
+                         "prompt_token合计": pt, "输出token合计": ct}}
+
+    # ⚠️ 这里【不能】写 `h == 500` —— 全 float 运算给的是 500.00000000000006。
+    #    第一版就是这么红的。凡是从浮点算出来的数，判据必须带容差。
+    h, rate, model, err = _cache_hit_estimate(_rep(1000, 100, 0.00075), _cfg)
+    check("⑪ 正：反推出命中 500、命中率 50%%",
+          h is not None and abs(h - 500) < 1e-6 and abs(rate - 0.5) < 1e-9 and err is None)
+
+    # ★★★ 这条是 T8 真撞到的：Java 侧列清单漏了 prompt_tokens / completion_tokens，
+    #     于是两列都读成 0 —— 而公式会解出一个【负数】，原来那句报错说
+    #     「多半是这一轮有降级行」，把读者指向了完全错误的方向（实测一行降级都没有）。
+    dh, drate, _, derr = _cache_hit_estimate(_rep(0, 0, 0.00075), _cfg)
+    check("⑪ ★ 退化输入（prompt=0）→ 拒绝出数，不印一个凑出来的百分比",
+          dh is None and drate is None and derr)
+    # ⚠️⚠️ 判据【只能看正向】。第一版写的是 `"降级行" not in derr` —— 而那条消息
+    #     正文里就写着「这不是「有降级行」」，子串匹配把它判成命中了。
+    #     ★ 这是子串匹配在本项目第四次咬人（前三次：`key` 撞 `keyword-weight`、
+    #       `application` 撞 `spring.application.json`、裸字符串当集合用）。
+    #     **要问的是「它有没有指向正确的去处」，不是「它有没有出现某个词」。**
+    check("⑪ ★★ 理由要点名【读路径】—— 读者能据此去修",
+          "selectByEvalRun" in derr and "prompt_tokens" in derr)
+    # ★ 反对照：守卫不能把健康输入也拒掉 —— 否则「拒绝出数」本身变成一句恒真的话，
+    #   报告从此永远不印命中率，而没有任何迹象。
+    h2, _, _, err2 = _cache_hit_estimate(_rep(1000, 100, 0.00075), _cfg)
+    check("⑪ 反对照：守卫不误伤健康输入",
+          h2 is not None and abs(h2 - 500) < 1e-6 and err2 is None)
+
+    # 超出范围（真·成因未定）时：拒绝出数，且【只陈述观察】
+    oh, _, _, oerr = _cache_hit_estimate(_rep(1000, 100, 5.0), _cfg)
+    check("⑪ 解出的命中数越界 → 拒绝出数", oh is None and oerr)
+    check("⑪ ★ 越界时只陈述观察（正向判据：说了「不下结论」）",
+          "不下结论" in oerr)
+
     print("selftest: %d 项通过, %d 项失败" % (ok, len(bad)))
     for b in bad:
         print("  ✗ %s" % b)
@@ -2204,7 +2938,7 @@ def selftest():
 # main
 # ================================================================
 
-def build(runs, rag, negctl):
+def build(runs, rag, negctl, t8=None):
     out = []
     out.append("# 阶段 7 · 评测报告")
     out.append("")
@@ -2274,6 +3008,11 @@ def build(runs, rag, negctl):
     out.extend(render_unexplained(runs, rag))
     out.append("")
 
+    out.append("## 11 迭代实验：动了什么，然后去了哪")
+    out.append("")
+    out.extend(render_iterations(t8))
+    out.append("")
+
     out.append("---")
     out.append("")
     out.append("- 逐题全量：`docs/11-附录-逐题.md`")
@@ -2332,12 +3071,20 @@ def main(argv=None):
     for role in DEFAULT_ROLES:
         ap.add_argument("--" + role.replace("_", "-"), dest=role, default=DEFAULT_ROLES[role],
                         help="%s 轮的 runId 或目录（默认 %s）" % (role, DEFAULT_ROLES[role]))
+    ap.add_argument("--t8-noise", default=DEFAULT_T8_NOISE,
+                    help="★ 噪声【链】：同配置 N 轮的 runId，逗号分隔。"
+                         "相邻两对各给一个噪声底样本（NN-1 个）。"
+                         "链尾轮自动当三条轴的基线 —— 它离三条轴最近")
+    ap.add_argument("--t8-axes", default=DEFAULT_T8_AXES,
+                    help="★ 三条轴的 runId，逗号分隔。每条轴与链尾的配置 diff "
+                         "就是它的标题（**不写死轴名** —— 标题从数据长出来）")
     ap.add_argument("--ragas", default=DEFAULT_RAGAS, help="RAGAS 结果 JSON（相对 eval_results/ 或绝对路径）")
     ap.add_argument("--ragas-negctl", default=DEFAULT_RAGAS_NEG, help="RAGAS 负对照 JSON")
     ap.add_argument("--out", default=os.path.join(ROOT, "docs", "11-评测报告.md"))
     ap.add_argument("--appendix-out", default=os.path.join(ROOT, "docs", "11-附录-逐题.md"))
     ap.add_argument("--base", default=eval_ab.DEFAULT_BASE)
-    ap.add_argument("--refresh", action="store_true", help="从端点重新生成 report.json")
+    ap.add_argument("--refresh", action="store_true",
+                    help="从端点重新生成 report.json（★ 只读：不写 docs/11-*）")
     ap.add_argument("--selftest", action="store_true", help="只跑口径自检，不读数据")
     ap.add_argument("--coverage", action="store_true", help="打印未被报告收录的指标路径")
     args = ap.parse_args(argv)
@@ -2358,8 +3105,61 @@ def main(argv=None):
     rag = load_ragas(args.ragas, "主") if args.ragas else None
     negctl = load_ragas(args.ragas_negctl, "负对照") if args.ragas_negctl else None
 
-    lines = build(runs, rag, negctl)
+    # ── T8：噪声链 + 三条轴 ────────────────────────────────────
+    # ★ 某一轮还没跑 / 目录不在时**不当成错误** —— 整节退化成一句「这一期没有」，
+    #   而不是让整个报告生成失败。报告的主体（§0~§10）不该被 T8 拖死。
+    t8 = None
+    t8_noise_specs = [s.strip() for s in (args.t8_noise or "").split(",") if s.strip()]
+    t8_axis_specs = [s.strip() for s in (args.t8_axes or "").split(",") if s.strip()]
+    if t8_noise_specs and t8_axis_specs:
+        try:
+            noise_runs = [load_run(s, args.refresh, args.base) for s in t8_noise_specs]
+            axes = [load_run(s, args.refresh, args.base) for s in t8_axis_specs]
+            for i, ax in enumerate(axes, 1):
+                ax["ordinal"] = str(i)
+                ax["label"] = "轴 %d" % i
+            t8 = {"noise_runs": noise_runs, "axes": axes}
+        except SystemExit as e:
+            # ★★★ 把【真实原因】带进报告，不要换成一个猜测。
+            #   原来这里写 `t8 = None`，§11 就渲染成「这一期没有迭代实验」——
+            #   那是一句关于【世界】的断言，而我们实际知道的只有
+            #   「报告生成器读不到这几个目录」。两者都可能为真，但**不是同一件事**。
+            #   实测代价：`DEFAULT_T8_AXES` 里一个 runId 写错（指向了已删的废轮），
+            #   `--refresh` 就把 §11 整节静默换成了那句话，而 stderr 那行被 `| tail` 吃掉了。
+            print("⚠️ T8 那几轮读不到，§11 退化成一句话：%s" % e)
+            t8 = {"unreadable": str(e)}
+
+    lines = build(runs, rag, negctl, t8)
     text = "\n".join(lines) + "\n"
+
+    # ★★ `--coverage` 是【只读诊断】，不许有副作用。
+    #    它曾经把 docs/11-*.md 覆盖掉 —— 而且是在 T8 那几轮还没跑完时，
+    #    用一份退化到「（这一期没有迭代实验）」的稿子覆盖。
+    #    症状：跑一下「看看有没有漏指标」，回来发现交付物没了。
+    #    同 T4 那条「别信 HTTP 200，看返回值」：一个只读命令写文件是静默的。
+    #
+    # ★★★ `--refresh` 是同一个形状，2026-09-24 咬了一次：
+    #    它的说明是「从端点重新生成 report.json」，**没说要写交付物**，
+    #    但它和普通运行走同一条写盘路径。当时 `DEFAULT_T8_AXES` 里有个
+    #    runId 指向了已删的目录 → §11 整节退化成一句话 →
+    #    「刷一下缓存」回来发现交付物被换成了一份缺一整节的稿子。
+    #    ★ 按坑 16 的先例统一：**带标志的诊断/维护命令一律不写交付物**，
+    #      只有【不带标志】的那一次执行才写。这样「我改了文件吗」永远可预测。
+    if args.coverage or args.refresh:
+        sys.stdout.write(text)     # 让人仍然看得到正文
+        if args.coverage:
+            miss = coverage(runs)
+            sys.stderr.write("\n未被报告收录的指标路径 %d 条：\n" % len(miss))
+            for p in miss:
+                sys.stderr.write("  · %s\n" % p)
+            if not miss:
+                sys.stderr.write("（report.json 的每一个指标路径都在报告里，"
+                                 "或已在 OMITTED_PATHS 里写了理由）\n")
+        sys.stderr.write("★ 只读模式：**没有**写 `%s` / `%s`\n"
+                         "  ★ 要更新交付物，跑不带标志的那一次\n"
+                         % (args.out, args.appendix_out))
+        return 0
+
     if args.out == "-":
         sys.stdout.write(text)
     else:
@@ -2378,14 +3178,6 @@ def main(argv=None):
         sys.stderr.write("已写入 %s（%d 行 / %d 字节）\n"
                          % (args.appendix_out, len(alines), len(atext.encode("utf-8"))))
 
-    if args.coverage:
-        miss = coverage(runs)
-        sys.stderr.write("\n未被报告收录的指标路径 %d 条：\n" % len(miss))
-        for p in miss:
-            sys.stderr.write("  · %s\n" % p)
-        if not miss:
-            sys.stderr.write("（report.json 的每一个指标路径都在报告里，或已在 OMITTED_PATHS 里写了理由）\n")
-    return 0
 
 
 if __name__ == "__main__":

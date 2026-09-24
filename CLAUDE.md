@@ -14,13 +14,15 @@
 面向电商场景（商品咨询、规格对比、促销政策、售后服务）的企业级 **RAG 智能问答平台**。
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**。
 
-**当前阶段**：阶段 7（评测体系）—— **7.1 ~ 7.5 已完成 ✅ 2026-09-23**，
-剩 **7.6 迭代**（两条轴：`rerank.enabled` on/off、`final-top-k` / `rerank.max-candidates`）与 **7.7 简历数字**。
-★ 测试数 680 → **819**。报告本体 `docs/11-评测报告.md`，设计 `docs/06`，
+**当前阶段**：阶段 7（评测体系）—— **7.1 ~ 7.6 已完成 ✅ 2026-09-24**，剩 **7.7 简历数字**。
+★ 测试数 680 → **824**。报告本体 `docs/11-评测报告.md`（§11 = 迭代实验），设计 `docs/06`，
 路线图与验收记录 `docs/10-开发路线图.md`。
 ★★★ **本阶段的产出不是功能，是「可复算的数字」** —— 所以**先读报告 §1 的噪声底**：
-同配置两轮、159 题、配置真差异 = 0，**至少翻一格的题 14.5%**。
+同配置三轮、159 题、配置真差异 = 0，**至少翻一格的题 13.2% ~ 16.4%**。
+★ 实测**噪声不随日期漂移**（同会话 16.4% **不**比跨日 13.2% 小）——
+所以「换个时间重跑」消不掉它，只能把结论跟它比大小。
 **任何 A/B 结论必须先跟这个数比大小**，否则是在读噪声。
+★★ 客户端测的 `总耗时ms` 噪声底是 **±230ms** —— 延迟差异只有**服务端那几列**能判。
 ★ 阶段 6（高可用）已收尾：100 并发无超卖无死锁、位置与 `ZRANK` 逐字相等、名额不永久泄漏。
 
 ---
@@ -212,8 +214,12 @@ python scripts/eval_run.py --set stage7 --repeat 3      # ★ 跑题，串行 + 
 python scripts/eval_ragas.py --run <id>                 # RAGAS（走 .venv-eval/，慢，约 2 小时/43 题）
 python scripts/eval_ab.py --a <run1> --b <run2>         # A/B + 翻转矩阵
 python scripts/eval_ab.py --selftest                    # ★ 11 项口径自检
-python scripts/eval_report.py --selftest                # ★ 21 项；--coverage 查报告有没有漏掉指标
-python scripts/eval_report.py                           # 重新生成 docs/11-评测报告.md + 附录
+python scripts/eval_report.py --selftest                # ★ 34 项口径自检
+# ★★ 三个标志【互不叠加】，且 --refresh / --coverage 是【只读】的（不写 docs/11-*）：
+#    标志拼接会静默短路 —— `--refresh --selftest` 只跑自检，一个字节都不刷（docs/10 坑 17）
+python scripts/eval_report.py --refresh                 # 只从端点刷 report.json，不写交付物
+python scripts/eval_report.py --coverage                # 只查漏，不写交付物
+python scripts/eval_report.py                           # ★ 只有【不带标志】这一次写 docs/11-*
 python scripts/eval_intent_probe.py                     # 高重复意图探针（不经过澄清闸门）
 
 # ── 一次性 / 重建 ──
@@ -263,6 +269,11 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
 - ★ **命中的 ID 序列稳定，但分值有约 3e-4 漂移**（GPU 浮点归约）。别把「结果不稳定」当 bug 查，先看 ID 序列。
 - ⚠️ **`#{docTypes} IS NULL` 会让 PostgreSQL 报 `could not determine data type of parameter $N`。**
   必须写 `CAST(#{docTypes} AS int[]) IS NULL` —— 那层 CAST 唯一的用途是给 PG 类型线索。
+- ★★ **`QaLogMapper.selectByEvalRun` 是【显式列清单】，它和服务的 getter 之间没有强制同步** ——
+  「加一个新读取忘了加列」已经坏了**两次**（7.5 漏 `question`、7.6 漏 `prompt_tokens`/`completion_tokens`）。
+  症状是**一个看起来合法的 0**（null 被 `!= null` 挡掉），**不报错**。
+  改它之前把两边的字段清单拉出来逐个对照；`QaLogMapperProjectionTest` 会拦住漂移。
+  ★ 免费判据：`prompt_tokens + completion_tokens == total_tokens`（全库实测 0 例外）。（`docs/10` 坑 18）
 
 ### 智能体层
 
@@ -394,6 +405,14 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
 - ★★ **凡是会进 Prompt 前缀的 JSON，一律用 `LinkedHashMap`，不用 `Map.of` / `Map.copyOf`** ——
   它们的迭代顺序由 hash 决定，而 JDK 9+ 的 hash 掺了一个**每次 JVM 启动随机**的 SALT。
   实测三个 JVM 三种顺序。代价是前缀缓存整段未命中（差 50 倍）。本项目已踩两次（ADR-058 / 064）。
+- ★★ **同一个 SALT 也会让【测试】变成 flaky** —— 断言 `Set.copyOf([4,2]).toString() == "[4, 2]"`
+  实测**约一半的 JVM 上会红**，而 `n≥3` 时盲区**不随元素个数下降**（稳定在 1/4），
+  所以「多塞几个元素」修不好。**判据只能是「我们承诺过的东西」，不是「观察到的东西」** ——
+  要一个确定的「不排序的样子」，用 `LinkedHashSet`（保留插入顺序）。（`docs/10` 坑 19）
+- ★★ **错误分支只能报告它【核实过】的东西。** 写「多半是 X」和写「X」在报告里长得一样，
+  而前者在你猜错时**会把读者指向反方向**。`except ... as e` 里 `e` 就在手上，别丢成 `None` 再猜一个。
+  实测两次：§11 把「读不到」说成「没做过」（静默删掉一整节交付物）、
+  缓存反推把「读漏了两列」说成「有降级行」。（`docs/10` 坑 20）
 - ★ **别在 surefire 配置里加 `@Tag` 过滤** —— 写错会**静默漏跑**现有测试（文件还在、`mvn test` 还是绿的）。
 - ★ **测试用 `@MockitoBean`**（Boot 3.4+）。`./mvnw test` 只需要 docker postgres，**不花钱**。
 
