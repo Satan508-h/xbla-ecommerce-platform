@@ -1876,17 +1876,39 @@ def render_limits(runs, rag):
 
 def render_unexplained(runs, rag):
     out = []
-    out.append("以下都是**观察到了、但没解释清**的现象。留着比删掉好 —— "
-               "它们标记的是「这条链路里还有我们不知道的东西」。")
+    out.append("以下现象**曾经**没解释清。★ 10.1 已于 2026-09-24 **结案**，"
+               "其余仍未解释 —— 留着比删掉好，它们标记的是「这条链路里还有我们不知道的东西」。")
     out.append("")
-    out.append("### 10.1 `Set.copyOf` 的渲染顺序")
+    out.append("### 10.1 ★ 已结案：`Set.copyOf` 的渲染顺序")
     out.append("")
-    out.append("同一份数据、同一份 `intent-tree.yml`（`doc_types: [1, 5]`），"
-               "旧一轮 `report.json` 印 `[1, 5]`、新一轮印 `[5, 1]`。")
-    out.append("用**同一个 JDK** 单独跑 `Set.copyOf(List.copyOf(new ArrayList<>(List.of(1,5))))` "
-               "得到的是 `[1, 5]` —— **没解释清楚**。")
+    out.append("**现象**：同一份数据、同一份 `intent-tree.yml`（`doc_types: [1, 5]`），"
+               "旧一轮 `report.json` 印 `[1, 5]`、新一轮印 `[5, 1]`。"
+               "当时用**同一个 JDK** 单独跑 `Set.copyOf(List.copyOf(new ArrayList<>(List.of(1,5))))` "
+               "得到的是 `[1, 5]` —— **复现不出来，也就没解释清**。")
     out.append("")
-    out.append("★ 处置不是继续查 JDK，是**不再依赖它**：`Set` 的迭代顺序**根本不是它承诺的东西**。"
+    out.append("**★★★ 2026-09-24 解释清楚了**：")
+    out.append("")
+    out.append("```")
+    out.append("Set.copyOf 走的是 ImmutableCollections.SetN（不是保留插入顺序的 Set12），")
+    out.append("它的迭代顺序是 floorMod(hash ^ SALT, tableSize) ——")
+    out.append("而 SALT 【每次 JVM 启动都随机】（JDK 9+）。")
+    out.append("")
+    out.append("实测 20 个独立 JVM，Set.copyOf(List.of(4, 2)).toString()：")
+    out.append("    [4, 2] 14 次        [2, 4] 6 次")
+    out.append("换成 3 个元素，20 个 JVM 跑出了【5 种不同顺序】。")
+    out.append("```")
+    out.append("")
+    out.append("★ 所以「同一个 JDK 复现不出来」**正是这个机制的表现**：")
+    out.append("**在【单个 JVM 内】它是确定的**（同一个 SALT），换个 JVM 就变 —— "
+               "而当时的复现尝试全都在一个 JVM 里。")
+    out.append("")
+    out.append("★★ 同一个 SALT 还让一个**测试**变成 flaky（约 50% 概率红）："
+               "`EvalReportServiceTest` 里断言 `Set.copyOf([4,2]).toString() == \"[4, 2]\"`，"
+               "而 `n≥3` 时盲区**不随元素个数下降**（稳定在约 1/4）。"
+               "处置见 `docs/10` 坑 19 —— 对照物换成顺序可控的 `LinkedHashSet`。")
+    out.append("")
+    out.append("★ 处置不变，而且现在**有理由**了：不再依赖它 —— "
+               "`Set` 的迭代顺序**根本不是它承诺的东西**。"
                "渲染前排序之后，那两个字符串由我们决定（`EvalReportService.sorted()`）。")
     out.append("")
     out.append("★ **数字不受影响** —— `Set.equals` 与顺序无关，实测两轮检索范围准确率的"
