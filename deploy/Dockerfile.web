@@ -1,0 +1,59 @@
+# ============================================================
+# Web 镜像（Vue 构建产物 + Nginx）—— 阶段 8
+#
+# 【这个容器干三件事】
+#   ① 提供前端静态文件（Vue 构建产物）
+#   ② 反代 /api/* 到应用容器（★ SSE 要关 proxy_buffering，见 nginx.conf）
+#   ③ 白名单提供两张评测报告（/docs/）
+#
+# 【★ 为什么报告是【逐个 COPY】而不是 COPY docs/】
+#   docs/00-项目总览.md 是简历故事线 + 面试讲稿，
+#   它靠 .git/info/exclude 不进公开仓库 —— 但**这个容器的文件系统不含 git**，
+#   拷进去就等于公开了。
+#   ★ 所以这里写的是白名单：只拷两个文件名，一个都不多。
+#     将来加文档必须【显式】加到这个列表里 —— 那是一次被看见的决定。
+# ============================================================
+
+# ------------------------------------------------------------
+# 第一段：构建前端
+# ------------------------------------------------------------
+FROM node:24-alpine AS frontend
+
+WORKDIR /build
+
+# ★ 同上：先拷依赖清单。npm ci 比 npm install 严格 ——
+#   它完全按 package-lock.json 装，不会因为「今天是几号」装到不同版本。
+#   ★ 这就是 package-lock.json 必须进 git 的原因。
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY frontend/ ./
+RUN npm run build
+
+# ------------------------------------------------------------
+# 第二段：Nginx
+# ------------------------------------------------------------
+FROM nginx:1.29-alpine
+
+# ★ 先删掉默认站点配置。
+#   不删的话它会和我们的 server 块抢 80 端口上的默认 server ——
+#   症状是「访问 IP 看到一个 Nginx 欢迎页」，
+#   而那看起来像「前端构建产物没打进去」。
+RUN rm -f /etc/nginx/conf.d/default.conf
+
+COPY deploy/nginx.conf /etc/nginx/conf.d/xbla.conf
+
+# 前端静态文件
+COPY --from=frontend /build/dist /usr/share/nginx/html
+
+# ★★ 白名单：只放行这两个文件（见文件头的说明）
+COPY docs/11-评测报告.md /srv/public-docs/11-评测报告.md
+COPY docs/11-附录-逐题.md /srv/public-docs/11-附录-逐题.md
+
+# ★ Basic Auth 的口令文件【不在镜像里】——
+#   它由 compose 以只读方式挂进来（deploy/.htpasswd，在 .gitignore 里）。
+#   ⚠️ 把 htpasswd 打进镜像等于把口令写进交付物，而且层里删不掉。
+#   这里只建目录，让挂载点存在。
+RUN mkdir -p /etc/nginx/auth
+
+EXPOSE 80

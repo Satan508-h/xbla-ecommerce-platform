@@ -12,6 +12,29 @@
 #   Compose V2 起，version 字段已废弃，写了会报警告。直接省略即可。
 # ============================================================
 
+# ============================================================
+# ★ 日志驱动的统一配置（阶段 8 新增）
+#
+# 【为什么必须限大小】
+#   docker 默认【不限】容器日志的大小。跑久了它会一直长，
+#   直到把宿主机的磁盘写满 —— 而磁盘满了之后，
+#   后端的症状是「所有写操作都失败」（数据库写不进去、日志写不进去），
+#   看起来像数据库坏了。
+#
+#   ★ 10MB × 3 个文件 = 每个容器最多 30MB，三个中间件加起来不到 100MB。
+#     对「最近发生了什么」够用，对「上个月发生了什么」本来也不该靠容器日志
+#     —— 那种需求要看应用自己落盘的那份（application-prod.yml 里的 logging.file）。
+#
+# ★ 用 YAML 锚点（&）而不是给三个服务各抄一遍：
+#   抄三份的话，改的时候漏掉一个不会有任何报错 ——
+#   而同一种「两处各写一份会漂移」的坑本项目已经踩过多次。
+# ============================================================
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   # ----------------------------------------------------------
@@ -39,8 +62,17 @@ services:
       TZ: Asia/Shanghai
       PGTZ: Asia/Shanghai
     ports:
-      # 宿主机 5432 -> 容器 5432。Spring Boot 通过 localhost:5432 连
-      - "5432:5432"
+      # ★★ 只绑回环地址 —— 阶段 8 收紧的。
+      #
+      #   原来写的是 "5432:5432"，那等于绑到 0.0.0.0，
+      #   也就是说**同一局域网里的任何机器**都能直连这个数据库。
+      #   而 docs/02 §29 写着「数据库裸奔在公网上会在几小时内被扫描并被勒索」——
+      #   咖啡厅 WiFi、学校宿舍网，就是那个「公网」的常见形态。
+      #
+      #   ★ 本机的一切用法【完全不受影响】：`mvnw spring-boot:run` 连 localhost、
+      #     DBeaver 连 localhost、`docker compose exec postgres psql` 走容器内。
+      #     变的只有「别的机器连不上了」，而那正是想要的效果。
+      - "127.0.0.1:5432:5432"
     volumes:
       # 命名卷：容器删了数据还在。不挂的话每次 down 都要重新灌数据
       - postgres_data:/var/lib/postgresql/data
@@ -61,6 +93,7 @@ services:
       start_period: 30s  # 启动后给 30 秒宽限期，此期间的失败不计入 retries
     networks:
       - xbla-net
+    logging: *default-logging
 
   # ----------------------------------------------------------
   # Redis
@@ -85,7 +118,11 @@ services:
     environment:
       TZ: Asia/Shanghai
     ports:
-      - "6379:6379"
+      # ★ 同上：只绑回环。
+      #   ⚠️ 这个容器【不设密码】（见上面的注释），所以绑 0.0.0.0 等于
+      #     把整个 Redis 送给同网段的人 —— 而里面存着排队限流的名额表，
+      #     改掉它就能绕过限流。
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -96,6 +133,7 @@ services:
       start_period: 10s
     networks:
       - xbla-net
+    logging: *default-logging
 
   # ----------------------------------------------------------
   # pgAdmin —— PostgreSQL 的网页版管理界面
@@ -123,7 +161,9 @@ services:
       PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
       TZ: Asia/Shanghai
     ports:
-      - "5050:80"
+      # ★ 同上：只绑回环。pgAdmin 的默认口令很弱（见 .env），
+      #   而它连的是整个数据库 —— 它比 5432 本身更值得藏起来。
+      - "127.0.0.1:5050:80"
     volumes:
       - pgadmin_data:/var/lib/pgadmin
     depends_on:
@@ -133,6 +173,133 @@ services:
         condition: service_healthy
     networks:
       - xbla-net
+    logging: *default-logging
+
+  # ----------------------------------------------------------
+  # ★★★ 应用容器（阶段 8 新增）—— 只在 `--profile full` 下启动
+  #
+  # 【★★★ 为什么用 profile 而不是默认启动】
+  #
+  #   这个 compose 文件同时服务两件事：
+  #     ① `docker compose up -d`            → 中间件，供【本地开发】用
+  #        （./mvnw spring-boot:run 要连它们；./mvnw test 也要；
+  #          阶段 7 的 eval_run.py / probe_*.py 全部假设 localhost:8080）
+  #     ② `docker compose --profile full up -d` → 全栈，供【部署演示】用
+  #
+  #   ★ 把 ①② 合并成一条的话，以后每次跑测试、跑探针、日常开发
+  #     都会顺手把应用容器和 Nginx 一起启起来 —— 构建慢、
+  #     而且很容易忘了它们在跑（然后被「8080 到底是谁占着」绕进去）。
+  #
+  #   ⚠️ 代价：路线图的验收标准 2 那句「docker compose up -d 一键拉起」
+  #      要多带一个 `--profile full`。这是【有意的偏离】，理由如上。
+  # ----------------------------------------------------------
+  app:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.app
+    container_name: xbla-app
+    restart: unless-stopped
+    environment:
+      # ★★★ 这一行是 R1 那个风险的全部防线。
+      #
+      #   application.yml 里写的是 `spring.profiles.active: local`（默认值），
+      #   而 7 个 /api/debug/** 控制器都是 @Profile("local") 的 ——
+      #   其中 RateLimitProbeController 带 POST /leak 和 /reset 这类【写操作】，
+      #   ModelProbeController 能【无条件消耗 API 额度】。
+      #
+      #   ★ 环境变量的优先级高于 application.yml，所以这里是【替换】不是追加。
+      #   ⚠️ 忘了这一行的症状：公网上 /api/debug/** 全部可用，
+      #      而且不会有任何报错 —— 验证方式见 docs/07 的验收清单。
+      SPRING_PROFILES_ACTIVE: prod
+
+      # 容器之间用服务名互访（docker 内置 DNS），不是 localhost
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/xbla_rag?stringtype=unspecified
+      POSTGRES_USER: ${POSTGRES_USER:-xbla}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 里设置 POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
+      # ★★ 模型密钥只能从环境变量来。
+      #   application-local.yml 里那份【被 .dockerignore 排除了】——
+      #   两个原因：① 那是密钥，不该进镜像层；② 进了也没用，
+      #   prod profile 下 Spring 根本不会加载 local 那个文件。
+      #
+      #   ⚠️ 所以这两个必须出现在 .env 里（见 .env.example）。
+      #
+      # ★★★ 这里【刻意不用】`:?` —— 那个「必需变量」的强制校验放在
+      #   `application-prod.yml` 里（那边写的是
+      #   `api-key: ${DEEPSEEK_API_KEY:?生产环境必须提供 ...}`）。
+      #
+      #   为什么不让 compose 来管这件事（2026-09-24 实测）：
+      #
+      #       docker compose config        ← 连【只起中间件】都会失败
+      #       error while interpolating services.app.environment.DEEPSEEK_API_KEY
+      #
+      #   ★ Compose 会插值文件里的【所有】服务，**不管 profile**。
+      #     所以写成 `:?` 就等于「想用中间件跑测试的人也必须先配好模型密钥」——
+      #     而那正是选 profile 这个方案要保住的东西。
+      #
+      #   ★ 校验没有消失，只是挪到了消费它的那一层：
+      #     应用容器启动时会因为 application-prod.yml 的 `:?` 直接启动失败，
+      #     错误信息里同样写着缺哪一个。**失败的特性一样，只是位置对了。**
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      SILICONFLOW_API_KEY: ${SILICONFLOW_API_KEY:-}
+
+      TZ: Asia/Shanghai
+    volumes:
+      # ★ 语料目录要挂进去，否则 `POST /api/kb/documents/scan` 找不到文件。
+      #   ⚠️ 挂的是整个 data/（而不是只读挂 data/corpus）：
+      #      xbla.kb.storage-dir 指向 data/uploads，只读挂会让上传功能静默失效。
+      - ./data:/app/data
+      # 应用自己落盘的日志（application-prod.yml 里的 logging.file.name）
+      - app_logs:/var/log/xbla
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # ★★ 这里【故意不写 ports】—— 应用不暴露到宿主机。
+    #
+    #   两个好处：
+    #   ① 宿主机的 8080 留给 `./mvnw spring-boot:run`，
+    #      容器化【不会】把本地开发路径挤掉（阶段 7 的脚本全部依赖它）
+    #   ② 公网隧道只指向 Nginx，应用连宿主机都不暴露，更别说公网
+    #   ★ 容器之间靠 xbla-net 用服务名 app:8080 访问，不需要 ports。
+    networks:
+      - xbla-net
+    logging: *default-logging
+
+  # ----------------------------------------------------------
+  # Nginx（阶段 8 新增）—— 同样只在 --profile full 下启动
+  #
+  #   静态文件 + /api 反代 + ★ SSE 的 proxy_buffering off
+  #   + Basic Auth + 两张白名单报告
+  #   ★ 细节全部在 deploy/nginx.conf 里，那个文件是本容器的核心
+  # ----------------------------------------------------------
+  nginx:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+    container_name: xbla-nginx
+    restart: unless-stopped
+    ports:
+      # ★ 这里绑 0.0.0.0 是【有意的】—— 它是唯一对外的入口。
+      #   穿透工具要连的就是这个端口。
+      #   ⚠️ 但正因如此，Basic Auth 必须开着（见 nginx.conf）。
+      - "80:80"
+    volumes:
+      # ★★ 口令文件【挂进来】而不是打进镜像：
+      #   打进镜像等于把凭据写进交付物，而且镜像层里删不掉。
+      #   只读挂载（:ro）—— 容器没有任何理由改它。
+      - ./deploy/.htpasswd:/etc/nginx/auth/.htpasswd:ro
+    depends_on:
+      - app
+    networks:
+      - xbla-net
+    logging: *default-logging
 
 # ------------------------------------------------------------
 # 命名卷：由 Docker 管理，存在 Docker 的数据目录里
@@ -142,6 +309,11 @@ volumes:
   postgres_data:
   redis_data:
   pgadmin_data:
+  # ★ 应用落盘的日志。用命名卷而不是 bind mount：
+  #   Windows 上 bind mount 的文件权限和 Linux 语义不同，
+  #   而应用以非 root 身份写 /var/log/xbla 时可能失败 ——
+  #   症状是「容器起来了但日志文件没有」。
+  app_logs:
 
 # ------------------------------------------------------------
 # 自定义网络：三个容器在同一个网段里，可以互相用「服务名」访问

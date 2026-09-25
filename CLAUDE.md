@@ -14,12 +14,18 @@
 面向电商场景（商品咨询、规格对比、促销政策、售后服务）的企业级 **RAG 智能问答平台**。
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**。
 
-**当前阶段**：阶段 7（评测体系）—— **7.1 ~ 7.7 全部完成 ✅ 2026-09-24**。
-下一阶段是 **8（前端 + 部署）**。
-★ 测试数 680 → **824**。报告本体 `docs/11-评测报告.md`（§11 = 迭代实验），设计 `docs/06`，
-决策 `docs/08`（**ADR-081~085 是评测的**），路线图与验收记录 `docs/10-开发路线图.md`。
-⚠️ **`docs/01` / `07` / `09` 三个文件还没写**（已写的不多，别照着索引去找）。
-★★★ **本阶段的产出不是功能，是「可复算的数字」** —— 所以**先读报告 §1 的噪声底**：
+**当前阶段**：阶段 8（前端 + 部署）—— **8.1 ~ 8.6 / 8.8 已实现【并实测】✅ 2026-09-24**，
+**8.7（内网穿透）未做**（选型已定 cpolar，但**没有开** —— 开它 = 把服务暴露到公网，是外向动作）。
+★ 测试数 824 → **860**。前端在 `frontend/`（Vue 3 + Vite + Element Plus），部署在 `deploy/`。
+决策 `docs/08`（**ADR-086~090 是阶段 8 的**），部署手册 `docs/07-部署手册.md`（★ 验收记录在里面），
+路线图与验收记录 `docs/10-开发路线图.md`，报告本体 `docs/11-评测报告.md`。
+⚠️ **`docs/01` / `09` 两个文件还没写**（07 已在阶段 8 补上）。
+★ 容器全栈**已经真的跑起来并验过**（13 个迁移从空 schema 建成、端到端问答走通、
+SSE 走 Nginx 首字节 29ms）。验收命令与输出在 `docs/07` §五。
+★★ **干净环境的库是【全空】的** —— Flyway 只建表结构，`SeedRunner` 挂在
+`@Profile("seed")` 上（不是 local）。所以部署后是**两步**：
+`bash scripts/seed.sh` → `python scripts/ingest.py`（顺序不能反）。
+★★★ **阶段 7 的产出不是功能，是「可复算的数字」** —— 引用任何数字前**先读报告 §1 的噪声底**：
 同配置三轮、159 题、配置真差异 = 0，**至少翻一格的题 13.2% ~ 16.4%**。
 ★ 实测**噪声不随日期漂移**（同会话 16.4% **不**比跨日 13.2% 小）——
 所以「换个时间重跑」消不掉它，只能把结论跟它比大小。
@@ -125,29 +131,48 @@ com.xbla.rag
 | `docs/04-数据库设计.md` | 全部表结构、索引、pgvector 列设计 |
 | `docs/05-检索与智能体设计.md` | ★ 意图树、双路召回、RRF、重排、会话记忆、摘要压缩 |
 | `docs/06-评测体系设计.md` | 指标定义与公式、标注集规范、A/B 对比方法 |
-| `docs/07-部署手册.md` | ⏳ **还没写**（阶段 8 的活） |
+| `docs/07-部署手册.md` | ★ **阶段 8 写好了**：拓扑、两条运行方式、验收清单、常见故障 |
 | `docs/08-技术决策记录(ADR).md` | ★ **每个决策的备选方案与被否决原因**（面试利器） |
 | `docs/09-面试问答准备.md` | ⏳ **还没写**（阶段 8/9 的活） |
 | `docs/10-开发路线图.md` | 阶段划分、每阶段验收标准、**坑列表**、进度勾选 |
 | `docs/11-评测报告.md` | ★ 阶段 7 的交付物本体（可复算）；附录 `docs/11-附录-逐题.md` |
 
-> ⚠️ **01 / 07 / 09 三个文件不存在**（2026-09-24 核实）。索引里标了 ⏳ 而不是删掉，
-> 是为了让「该写但没写」和「写了但索引漏了」能分开 —— **别照着一个不存在的路径去找**。
+> ⚠️ **01 / 09 两个文件不存在**（2026-09-24 核实；07 已在阶段 8 补上）。
+> 索引里标了 ⏳ 而不是删掉，是为了让「该写但没写」和「写了但索引漏了」能分开 ——
+> **别照着一个不存在的路径去找**。
+> ⚠️ `docs/00-项目总览.md` **在磁盘上但不在公开仓库**（`.git/info/exclude`）——
+> 它是简历讲稿。★★ **而 docker 不认 git 的排除**：
+> `deploy/Dockerfile.web` 里是**逐个 COPY** 两份 `docs/11-*`，不是 COPY 整个 docs/。
 
 ---
 
 ## 六、常用命令
 
 ```bash
-# 中间件
+# 中间件（★ 只起 postgres/redis/pgadmin —— 这是本地开发那条路，行为没变）
 docker compose up -d
 docker compose ps
 docker compose exec postgres psql -U xbla -d xbla_rag
 
+# ★★ 全栈（中间件 + 应用 + Nginx）—— 部署演示那条路，【必须带 --profile full】
+#    ⚠️ 应用容器【不】映射 8080，所以它和下面 `mvnw spring-boot:run` 能同时跑
+#    ⚠️ 需要 .env 里额外填 DEEPSEEK_API_KEY / SILICONFLOW_API_KEY
+#    ★ 已在 2026-09-24 实测通过，验收命令与输出在 docs/07 §五
+docker compose --profile full up -d --build
+bash deploy/make-htpasswd.sh                 # 生成 Basic Auth 口令（产物已 gitignore）
+# ★★ 灌数据是【两步】，顺序不能反（坑 31）
+bash scripts/seed.sh                         # ① 业务数据（商品/订单/券）
+python scripts/ingest.py --url http://localhost -u xbla:<口令>   # ② 知识库（花钱）
+#    ★ 探针也能打 Nginx 那一侧（验 SSE 有没有被缓冲）：
+python scripts/probe_stage8.py --url http://localhost -u xbla:<口令>
+
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
 
-# 跑测试（819 个）
+# 前端（开发，5173，已配 /api 代理 → 8080）
+cd frontend && npm install && npm run dev
+
+# 跑测试（860 个）
 # ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
 #   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
 #   ⚠️ 同一个坑 `./mvnw test-compile` 也有（见 docs/10 坑 12）。
@@ -227,6 +252,20 @@ python scripts/eval_report.py --refresh                 # 只从端点刷 report
 python scripts/eval_report.py --coverage                # 只查漏，不写交付物
 python scripts/eval_report.py                           # ★ 只有【不带标志】这一次写 docs/11-*
 python scripts/eval_intent_probe.py                     # 高重复意图探针（不经过澄清闸门）
+
+# ── 阶段 8：前端与部署（★ 前 3 项会调模型，其余【不花钱】）──
+python scripts/probe_stage8.py                # ★★ 33 项，含【打印 SSE 原始字节】+ SSE 时序
+python scripts/probe_stage8.py --no-model     # 跳过调模型的 3 项
+python scripts/probe_stage8.py --url http://localhost -u 用户:口令   # ★ 打 Nginx 那一侧
+#   ★ 它验的正是前端解析器的依据：event:/data: 之间没有空行、冒号后没空格、
+#     每帧以空行结束、done.answer 是 null、refs 是真数组
+#   ★★ 而【第 3 项】是验收标准 3 的判据：它按时间量 delta 的到达分布 ——
+#      被 proxy_buffering 攒起来时收到的字节一模一样，只有时序不同。
+#      ★ 实测：首字节 29ms / 总 4291ms / 185 帧、首末间隔 740ms = 在流
+curl -s localhost:8080/api/chat/sessions | python -m json.tool          # 会话列表（★ 已排评测流量）
+curl -s "localhost:8080/api/chat/trace/<traceId>" | python -m json.tool # 技术面板的数据
+curl -s localhost:8080/api/status/ratelimit | python -m json.tool       # ★ 生产也存在的只读状态
+#   ★ 注意 /api/status 和 /api/debug 的区别：后者 @Profile("local")，公网上必须 404
 
 # ── 一次性 / 重建 ──
 python scripts/generate_corpus.py                    # 生成仿真语料（依赖 reportlab python-docx openpyxl）
@@ -407,6 +446,57 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
   登记了就会被同进程心跳续期，于是「测试自己让自己通过」。（ADR-076）
 - ★ **`/reset` 之后 `queue-` 池不会立刻空** —— 在途的等待者要靠下一次重试才发现名额空出来，
   大约 5 秒。**下一组测试必须等它排空**，否则整组会被「池满」拒掉（实测误报过一次）。
+
+### 前端与部署（阶段 8）
+
+- ★★★ **流式路径下 `ChatAskResponse.answer` 恒为 `null`**（`ChatServiceImpl.buildStreamResponse` 里写死的）。
+  正文**只在 `delta` 事件里**。前端若写「收到 `done` 就 `content = payload.answer`」，
+  **每一条回答都会在完成的那一刻整条消失**。⚠️ 非流式那条路 `answer` 是正文 —— 一个字段两条路两个含义。
+- ★★ **会话列表必须排除评测流量**（4022 / 4111 是评测建的）。判据：
+  `NOT EXISTS (qa_log WHERE session_id = s.id AND eval_run_id IS NOT NULL)`。
+  ⚠️ 但**单会话消息接口故意不排** —— 那是精确键查找，回 404 会让人以为数据丢了。（ADR-086）
+- ★★ **`/api/debug/**` 是 `@Profile("local")` 的**（7 个控制器，含 `POST /leak`、`/reset` 这类**写操作**）。
+  对外要用的只读端点必须**新写**，且判据是**白名单**不是黑名单。（ADR-087）
+- ★★★ **`application.yml` 里 `spring.profiles.active: local` 是【默认值】** ——
+  容器化必须显式 `SPRING_PROFILES_ACTIVE=prod`，否则那 7 个 debug 控制器跟着公网一起暴露。
+  ⚠️ profile 是**替换不是追加**：切到 prod 后 `application-local.yml` 的密钥不再加载。
+- ★★ **`selected`/`result` 里的 JSONB 往返会改掉键序和空白**（Postgres 按键名长度重排）——
+  **字节比较是非法判据**，只能比语义。（坑 22）
+- ★ **PostgreSQL 的 `now()` 是【事务开始时间】** —— 同事务里插入的行时间戳完全相同。
+  `ORDER BY 时间` 必须再跟一个单调键（`id`），否则顺序未定义。（坑 23）
+- ★★ **`jsonPath(...).exists()` 分不清「键不存在」和「键存在但是 null」** ——
+  测「字段在不在」要用 `JsonNode.has()`。（坑 24）
+- ★★ **Compose 会插值【所有】服务，不管 profile** ——
+  `:?` 必需变量写在 compose 上会让「只起中间件」也失败。校验要放在**消费它的那一层**。（坑 27 / ADR-088）
+- ★★ **`.dockerignore` 里父目录被排除后，里面的文件用 `!` 放不回来** ——
+  要按**名字**排除（`docs/00-*.md`），不能写 `docs/` 再想放回 `docs/11-*`。（坑 28）
+- ★★★ **容器里的 Maven 不读你本地的 `~/.m2/settings.xml`**（那个文件在用户主目录，COPY 不进去）——
+  于是容器直奔 `repo.maven.apache.org` 而国内连不上，**宿主机却能构建**。
+  修法是 `deploy/maven-settings.xml`（只有阿里云那一个 URL，无凭据）+ `-s`。
+  ★ 报错指向**网络**，会把排查带偏 —— 真正缺的是一个文件。（坑 29）
+- ★ **构建脚本里别加 `-q`** —— 它会把「哪个依赖没下下来」一起吞掉。（坑 29）
+- ★★★ **兜底 `@ExceptionHandler(Exception.class)` 会把 404 变成 500** ——
+  Spring Boot 3.2 起未匹配的路径抛 `NoResourceFoundException`，兜底会接走它。
+  本项目**每一个 404 都曾被渲染成 500**（阶段 8 才发现，因为那之前没有「必须 404」的判据）。
+  已加显式 handler → 404 + DEBUG 级日志。（坑 30）
+  ★ 判据：**任何想要特定状态码的异常都必须显式注册** —— 兜底 handler 的代价。
+- ★★★ **`SeedRunner` 是 `@Profile("seed")`，不是 local** —— 干净环境的库**全空**。
+  部署后必须 `bash scripts/seed.sh` 再 `python scripts/ingest.py`，**顺序不能反**
+  （知识库要从业务表同步出商品和售后政策文档）。（坑 31）
+- ★★ **管道后的 `$?` 是最后一个命令的退出码** —— 加 `grep` 就测不到真退出码了。
+  同「别信 HTTP 200」那类判据错位。（坑 32）
+- ★★ **`.gitignore` / `.git/info/exclude` 管不到 docker** —— 三套机制各自配各自的。
+  `docs/00` 靠 git 的排除不进公开仓库，但它**照样在磁盘上**，容器文件系统里**没有 git**。
+- ★★ **应用容器【不】映射 8080** —— 宿主机那个端口留给 `./mvnw spring-boot:run`。
+  阶段 7 的 `eval_run.py` / `probe_*.py` 全部假设 `localhost:8080`，映射了就把那条链挤掉了。（ADR-089）
+- ★★ **报告放行的白名单有三处，必须一致**：`deploy/Dockerfile.web`（COPY 哪两个）、
+  `deploy/nginx.conf`（注释里点名）、`frontend/vite.config.js`（`PUBLIC_DOCS`）。
+  ⚠️ 开发期如果比生产宽松 = 本地能开、上线 404；更严 = **本地测不出来、上线才发现泄露**。（ADR-090）
+- ★ **前端没有 Pinia / axios** —— 全部用原生 `fetch`（流式非 `fetch` 不可，那就统一一套）。
+  共享状态只有一处，一个 `reactive` composable 就够。
+- ★ **SSE 解析器在 `frontend/src/api.js`**，手写的（ADR-011）。
+  三件必须做对的事：`\n\n` 分帧、`TextDecoder` 带 `{stream:true}`（**中文会被切在 chunk 边界**）、
+  服务端事件名是 `failed` 不是 `error`。
 
 ### 代码风格（本项目强制）
 

@@ -1,0 +1,68 @@
+# ============================================================
+# 构建上下文排除清单（.dockerignore）
+#
+# 【为什么它必须存在，而且必须在第一次 build 之前】
+#
+#   docker build 会把【整个上下文】打包发给守护进程。
+#   不排除的话有两个后果，一个是慢、另一个是事故：
+#
+#   ① 慢：target/ 和 frontend/node_modules/ 加起来几百 MB，
+#      每次 build 都要打包发一遍（即使镜像里根本不用）
+#   ② ★★ 事故：.env 里有数据库密码和 pgAdmin 口令，
+#      application-local.yml 里有 DeepSeek / 硅基流动的 API Key。
+#      它们【会被 COPY . .】带进镜像层 —— 而镜像是要推到 registry、
+#      要发给别人跑的东西。**层里有过的东西，删掉也还在历史里。**
+#
+# ★ 这不是理论风险：这两个文件都在 .gitignore 里，
+#   而 .gitignore 【管不到 docker】—— 两套机制，各自要各自配。
+#   本项目已经在别处踩过「以为一个开关管得住另一件事」的坑。
+# ============================================================
+
+# ── ★★★ 密钥，绝不能进镜像 ──────────────────────────────
+.env
+.env.*
+!.env.example
+**/application-local.yml
+**/application-*-local.yml
+
+# ── 构建产物（镜像里会重新构建，拷进去只会拖慢并可能用到旧的）──
+target/
+frontend/dist/
+*.jar
+
+# ── 依赖目录 ────────────────────────────────────────────
+frontend/node_modules/
+.venv-eval/
+.venv/
+
+# ── 评测数据与报告（报告由 Nginx 挂白名单提供，不需要进构建上下文）──
+eval_results/
+
+# ── 版本控制与 IDE ──────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+*.iml
+
+# ── 文档：★ 按【名字】排除私有的那几份，不是整个目录 ────
+#
+#   ⚠️ 这里不能写 `docs/` 再配 `!docs/11-评测报告.md` 放回来 ——
+#      `.dockerignore` 和 `.gitignore` 一样，
+#      **父目录被排除后，里面的文件就放不回来了**（规范明确写了这一条）。
+#      写了的话症状是构建时 COPY 报 "not found"，
+#      而那句报错不会告诉你「是被 .dockerignore 排掉的」。
+#
+#   ★ docs/00 是简历故事线 + 面试讲稿，靠 .git/info/exclude 不进公开仓库 ——
+#     但那是 git 的机制，**docker 不认**。两套机制，各自配各自的。
+docs/00-项目总览.md
+docs/00-*.md
+
+# ── 本地杂项 ────────────────────────────────────────────
+*.log
+target-*.log
+scripts/__pycache__/
+**/__pycache__/
+.DS_Store
+Thumbs.db

@@ -5,6 +5,7 @@ import com.xbla.rag.client.ModelErrorKind;
 import com.xbla.rag.common.ApiResponse;
 import com.xbla.rag.config.RateLimitProperties;
 import com.xbla.rag.ratelimit.QueueRejectedException;
+import com.xbla.rag.service.ResourceNotFoundException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -13,6 +14,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.stream.Collectors;
 
@@ -117,6 +119,51 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 「按某个键去查，但那条记录不存在」—— 阶段 8 的只读回看接口。
+     *
+     * <h3>★ 注册在【基类】上，所以新增一个子类就自动被覆盖</h3>
+     *
+     * <p>它现在覆盖两个：{@code ChatSessionNotFoundException}（会话号找不到）
+     * 和 {@code ChatTraceNotFoundException}（traceId 找不到）。
+     * 如果每个子类各写一个 handler，那么「加一个新的 not-found 场景」
+     * 就变成了「记得也加一个 handler」—— 而忘了加的症状是那个接口回
+     * <b>500「服务内部错误」</b>。挂一个会漂移的钩子，不如挂一个不会的。
+     *
+     * <h3>★★ 这个 handler 存在的唯一理由是：兜底 handler 会把它吃掉</h3>
+     *
+     * <p>如果不注册这一条，{@code ResourceNotFoundException}（一个
+     * {@code RuntimeException}）会一路落到下面那个
+     * {@code @ExceptionHandler(Exception.class)}，变成
+     * <b>HTTP 500「服务内部错误」</b>。
+     *
+     * <p>★ 顺带说明一件容易被误会的事：<b>换成 Spring 自带的
+     * {@code ResponseStatusException(HttpStatus.NOT_FOUND)} 也没用</b>。
+     * Spring 解析异常的顺序是
+     * {@code ExceptionHandlerExceptionResolver}（本类的
+     * {@code @ExceptionHandler}）→ {@code ResponseStatusExceptionResolver}
+     * → {@code DefaultHandlerExceptionResolver}，所以自带 404 语义的异常
+     * <b>在到达 Spring 自己的解析器之前就被兜底分支接走了</b>。
+     * 想要特定状态码，只能显式注册。
+     *
+     * <h3>为什么是 404</h3>
+     *
+     * <p>见 {@link ResourceNotFoundException} 的类注释 ——
+     * 一句话：<b>不能把「没有这条记录」和「这条记录是空的」
+     * 渲染成同一个响应</b>，因为这两件事的修法完全相反。
+     *
+     * <p>★ 这里 {@code ApiResponse} 的 {@code code} 用 <b>404</b> 而不是
+     * {@code CODE_SUCCESS}（那是 0）。两个数字都要对：
+     * HTTP 状态码给网关和监控看，body 里的 code 给前端看，
+     * <b>只对一个的接口会让其中一方得出相反的结论</b>。
+     */
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleResourceNotFound(ResourceNotFoundException e) {
+        log.warn("{}不存在: {}", e.getKind(), e.getId());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.fail(HttpStatus.NOT_FOUND.value(), e.getMessage()));
+    }
+
+    /**
      * 排队被拒绝 —— 队列满了，或者等太久了（阶段 6.7）。
      *
      * <h3>★ 为什么是 503 而不是 500</h3>
@@ -213,14 +260,80 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 请求了一个<b>不存在的路径</b> —— 回 404，不是 500。
+     *
+     * <h3>★★★ 这个 handler 守的是一个「404 全被渲染成 500」的真 bug</h3>
+     *
+     * <p>2026-09-24 阶段 8 实测（容器里打不存在的路径）：
+     *
+     * <pre>
+     *   $ curl -u user:pw http://host/api/debug/ratelimit/state
+     *   500
+     *
+     *   ERROR GlobalExceptionHandler : 未预期的异常
+     *   org.springframework.web.servlet.resource.NoResourceFoundException:
+     *       No static resource api/debug/ratelimit/state.
+     * </pre>
+     *
+     * <p>机制：Spring Boot 3.2 起，<b>未匹配的路径不是「机械地回 404」</b>，
+     * 而是抛 {@code NoResourceFoundException}（静态资源处理器是链上最后一个，
+     * 它用异常报告「找不到」）。而下面的兜底
+     * {@code @ExceptionHandler(Exception.class)} 把它接走了 → 500。
+     *
+     * <p>★★ <b>后果有三条，都不是「功能坏了」而是「信号坏了」</b>：
+     *
+     * <pre>
+     *   ① 任何拼错的 URL 都回 500 —— 客户端分不清「没有这个接口」和「服务炸了」
+     *   ② 每一次扫描器探测都写一行 ERROR 级日志（"未预期的异常" + 堆栈）
+     *      → ★ 而本项目刚刚在【上面那段注释里】说过：
+     *        「用户关页面和数据库连不上长得一模一样，而前者每天几千次」
+     *        —— 这里正在制造同一个问题
+     *   ③ 监控按 ERROR 计数时，错误率被探测流量污染
+     * </pre>
+     *
+     * <p>★ 它还是<b>验收判据的一部分</b>：阶段 8 要证明
+     * 「公网访问 <code>/api/debug/**</code> 返回 404」——
+     * 而 500 让那条判据<b>无法成立</b>（你没法区分「控制器没注册」和「注册了但炸了」）。
+     *
+     * <h3>★ 这是本项目的【第三次】同一个形态</h3>
+     *
+     * <p>{@code handleClientDisconnected} 的注释里写着「已经踩过两次」：
+     * 阶段 6.7 的 {@code ExecutionException} 包装、以及客户端断开。
+     * 这是第三次，而且这一次是<b>兜底 handler 自己在制造它</b> ——
+     * 那一大段解释为什么「别把预期内的事归到未预期」的注释，
+     * 正贴在造成第三个反例的代码上面。
+     *
+     * <h3>为什么记 DEBUG 而不是 ERROR</h3>
+     *
+     * <p>因为「有人请求了一个不存在的路径」是<b>完全正常</b>的事 ——
+     * 浏览器要 favicon、爬虫扫路径、用户拼错地址。
+     * 它和 {@code handleClientDisconnected} 是同一类：<b>不该告警的事件。</b>
+     *
+     * <p>⚠️ 真正想看的「有没有人在扫我的站」应该来自 Nginx 的访问日志
+     * （那里有 IP、User-Agent、扫描模式），不是靠 Spring 的异常处理器。
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNoResource(NoResourceFoundException e) {
+        log.debug("请求了不存在的路径（正常事件）: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.fail(HttpStatus.NOT_FOUND.value(), "接口不存在"));
+    }
+
+    /**
      * 兜底。
      *
      * <p>★ 对外只回一句笼统的话，<b>不返回异常堆栈或原始消息</b> ——
      * 那些可能泄露内部实现细节（表名、类名、第三方服务地址）。
      * 完整信息在日志里，靠时间戳和前面的请求日志去对。
+     *
+     * <p>⚠️ <b>挂在这里的每一条都要能说出「为什么它真的不可预期」</b>。
+     * 上面那个 {@link #handleNoResource} 就是反例：一个完全预期的条件
+     * 在这里待了很久，把 ERROR 日志刷成了噪声。
      */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiResponse<Void>> handleOther(Exception e) {
+        // ★ 走到这里说明有一条【真的没想过】的异常。这句话本身就该被看见，
+        //   而不是和「404」混在一起 —— 那正是上面那个 handler 存在的理由。
         log.error("未预期的异常", e);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(ApiResponse.fail("服务内部错误，请稍后重试"));

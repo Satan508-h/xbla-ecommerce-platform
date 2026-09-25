@@ -380,13 +380,13 @@ public class ChatPermitService {
         state.put("channel", keys.channel());
 
         long now = System.currentTimeMillis();
-        Long slots = redis.opsForZSet().zCard(keys.slots());
-        Long queue = redis.opsForZSet().zCard(keys.queue());
         Long alive = redis.opsForZSet().zCard(keys.alive());
 
-        state.put("permitsInUse", slots == null ? 0 : slots);
+        // ★ 这两个数走下面那两个【类型化】的取值口，而不是在这里各写一次 zCard ——
+        //   于是「在读什么」只有一处定义，probe 和对外状态端点不会漂移。
+        state.put("permitsInUse", permitsInUse());
         state.put("permitLimit", props.getPermits());
-        state.put("queueSize", queue == null ? 0 : queue);
+        state.put("queueSize", queueSize());
         state.put("queueLimit", props.getMaxQueue());
         state.put("aliveSize", alive == null ? 0 : alive);
         state.put("seq", redis.opsForValue().get(keys.seq()));
@@ -403,6 +403,35 @@ public class ChatPermitService {
         state.put("nowMs", now);
 
         return state;
+    }
+
+    /**
+     * 当前<b>在用</b>的名额数 —— 直接读 Redis 的 {@code slots} 有序集合。
+     *
+     * <p>★ 为什么要有这个类型化的取值口，而不是让调用方去
+     * {@link #redisState()} 返回的 map 里取 {@code "permitsInUse"}：
+     * 那样「键名」就成了一个<b>没有任何强制同步的契约</b>，
+     * 改个名字（或者 map 换了实现）只会让调用方静默拿到 null，
+     * 而 {@code null} 在一张状态页上渲染出来就是「名额 0 个在用」——
+     * 一个看起来很正常的错数。同 {@code QaLogMapper} 那条「显式列清单会漂移」。
+     *
+     * <p>★ 权威值在 Redis，不在本机登记表 —— 理由见 {@link #redisState()}。
+     */
+    public long permitsInUse() {
+        Long slots = redis.opsForZSet().zCard(keys.slots());
+        return slots == null ? 0L : slots;
+    }
+
+    /**
+     * 当前排队人数 —— 直接读 Redis 的 {@code queue} 有序集合。
+     *
+     * <p>⚠️ {@code ZCARD} <b>包含已过期但还没被清理的成员</b>，所以它可能略大于
+     * 「真正在等的人」。要不要清理由 {@code acquire.lua} 里那行
+     * {@code ZREMRANGEBYSCORE} 负责，见 {@code docs/08} ADR-075。
+     */
+    public long queueSize() {
+        Long queue = redis.opsForZSet().zCard(keys.queue());
+        return queue == null ? 0L : queue;
     }
 
     /** 本 JVM 侧的登记表状态 —— 和 {@link #redisState()} 对照着看 */

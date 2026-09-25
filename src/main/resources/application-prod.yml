@@ -1,0 +1,112 @@
+# ============================================================
+# prod profile —— 容器化部署（阶段 8）
+#
+# 【怎么激活】
+#   容器里设环境变量：
+#       SPRING_PROFILES_ACTIVE=prod
+#   ★ 环境变量的优先级高于 application.yml 里的
+#     spring.profiles.active: local，所以它是【替换】不是追加。
+#
+# 【★★★ 这个文件存在的第一目的：把「忘了设」变成启动失败】
+#
+#   application.yml 里那些 ${VAR:} 的写法带了【空默认值】——
+#   这对本地开发是对的（密钥在 application-local.yml 里），
+#   但在生产上意味着：容器能正常启动，然后在第一次调模型时才失败，
+#   日志里是一句模型侧的 401。那时你已经不知道是「密钥没设」
+#   还是「密钥过期」还是「供应商挂了」。
+#
+#   ⇒ 这里用 ${VAR:?提示} 重新声明一遍。它的语义是
+#     「没有这个变量就别启动」，提示语直接写在错误里。
+#     同 docker-compose.yml 里 POSTGRES_PASSWORD 的写法。
+#
+# 【★ 这里不写任何密钥】—— 这是个会提交进 git 的文件。
+#   它只写「变量名 → 配置项」的对应关系。
+#
+# 【★ 这个文件里【不】需要写「关掉调试探针」】
+#   7 个 /api/debug/** 控制器都是 @Profile("local") 的，
+#   profile 换成 prod 之后它们【根本不会被注册】——
+#   不是「注册了但不让访问」。所以这里没有对应的开关，
+#   验证方式是公网访问真的返回 404（见 docs/07 的验收清单）。
+# ============================================================
+
+spring:
+
+  # ----------------------------------------------------------
+  # 数据库
+  #
+  # ★ host 是 postgres（compose 的服务名），不是 localhost ——
+  #   容器之间靠自定义网络 xbla-net 用服务名互相访问。
+  #   （application.yml 里那句 localhost 是给「宿主机上跑 mvnw」那条路的，
+  #     环境变量在这里把它覆盖掉。）
+  # ★ stringtype=unspecified 不能丢，理由见 application.yml 里的长注释。
+  # ----------------------------------------------------------
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:?生产环境必须提供数据库 URL（形如 jdbc:postgresql://postgres:5432/xbla_rag?stringtype=unspecified）}
+    username: ${POSTGRES_USER:?生产环境必须提供数据库用户名}
+    password: ${POSTGRES_PASSWORD:?生产环境必须提供数据库密码}
+
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
+      # ★ 允许为空：本项目的 Redis 只挂在 compose 的内部网络上，
+      #   公网隧道只转发 Nginx 的 80，够不到 6379。
+      #   ⚠️ 但这条边界是「网络拓扑」保证的，不是「认证」保证的 ——
+      #   哪天把 6379 发布到宿主机之外，就必须同时设密码。见 docs/07。
+      password: ${REDIS_PASSWORD:}
+
+# ------------------------------------------------------------
+# 反向代理
+#
+# ★ 应用跑在 Nginx 后面，请求的 scheme / host / 客户端 IP 都在
+#   X-Forwarded-* 头里。不打开这个开关的话，应用看到的是
+#   「http + 容器 IP」，任何基于请求构造绝对地址的地方都会错。
+# ★ framework 表示交给 Spring 自己处理（读取并包装请求），
+#   不需要另写 Filter。前端不直接依赖它，但它是「部署正确」的一部分。
+# ------------------------------------------------------------
+server:
+  forward-headers-strategy: framework
+
+# ------------------------------------------------------------
+# 模型密钥 —— ★ 同样用 :? 强制提供
+#
+# 注意 provider 名（deepseek / siliconflow）必须和
+# application.yml 里 xbla.llm.providers 下的键【逐字一致】。
+# 写错一个字母的症状是「这一档没有 key」，
+# 而它不会报错，只会在降级链上静默少一档。
+# ------------------------------------------------------------
+xbla:
+  llm:
+    providers:
+      deepseek:
+        api-key: ${DEEPSEEK_API_KEY:?生产环境必须提供 DEEPSEEK_API_KEY}
+      siliconflow:
+        api-key: ${SILICONFLOW_API_KEY:?生产环境必须提供 SILICONFLOW_API_KEY}
+
+# ------------------------------------------------------------
+# 日志
+#
+# ★ 生产要落盘。只输出到 stdout 的话，容器一重建日志就没了，
+#   而「阶段 6 那次名额泄漏」正是靠翻历史日志才定位到的。
+#
+# ★ 级别用 info，不开 debug：本项目的 debug 日志里有完整的链路细节，
+#   量很大。要看细节时用环境变量临时开，不用改文件：
+#       LOGGING_LEVEL_COM_XBLA_RAG=debug
+#
+# ★ 滚动策略必须写。不写的话日志会一直长到把磁盘写满，
+#   而「磁盘满」的症状是「所有写操作都失败」——
+#   看起来像数据库坏了。⚠️ 容器层还有一道 json-file 的限大小
+#   （compose 里配），两道都要有：这一道管容器内的文件，
+#   那一道管 docker 收集的 stdout。
+# ------------------------------------------------------------
+logging:
+  level:
+    root: info
+    com.xbla.rag: info
+  file:
+    name: ${XBLA_LOG_FILE:/var/log/xbla/app.log}
+  logback:
+    rollingpolicy:
+      max-file-size: 50MB
+      max-history: 7
+      total-size-cap: 500MB

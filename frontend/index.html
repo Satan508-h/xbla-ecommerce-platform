@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>休伯利安 · 电商导购与售后问答</title>
+    <!--
+      ★ lang="zh-CN" 和 meta charset 都要有：
+        前者让浏览器选对字体（不然中文会用日文字形渲染，某些字看着别扭），
+        后者决定表单提交和 JS 字符串的默认编码。
+      ★ 这里【不】引 CDN 上的字体或图标库 —— 这是个要挂公网的演示站，
+        多一个外部依赖就多一个「对方挂了我也挂」的可能。
+    -->
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

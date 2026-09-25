@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================
+  Maven 设置 —— 给【容器内构建】用（阶段 8）
+  ============================================================
+
+  【★★★ 为什么必须有这个文件：一个「我机器上能跑」的实例】
+
+  2026-09-24 实测，容器构建失败：
+
+      Failed to read artifact descriptor for
+        com.baomidou:mybatis-plus-spring-boot3-starter:jar:3.5.17
+      ... from/to central (https://repo.maven.apache.org/maven2):
+          repo.maven.apache.org:443 failed to respond
+
+  而【同一个仓库、同一份 pom.xml，在宿主机上构建是好的】。
+
+  原因不在代码：
+      宿主机 Maven 读 ~/.m2/settings.xml → 里面配了阿里云镜像 → 走阿里云
+      容器里的 Maven 【没有】那个文件 → 直奔 Maven Central → 在国内连不上
+
+  ★ 关键点：~/.m2/settings.xml 在【用户主目录】，**不在构建上下文里** ——
+    所以 COPY 不进去，docker build 默认也看不到它。
+    这不是「网络不好」，是「容器的构建环境和开发者的构建环境不是同一个」。
+    而那种不对称的典型症状就是「本地能跑、容器不行」，且报错指向别处。
+
+  【为什么可以提交进 git】
+
+  ★ 阿里云的公共仓库是【匿名】的 —— 这个文件里**没有任何凭据**。
+    对比：如果用的是公司的私服，那份 settings.xml 里会有账号密码，
+    那就绝不能进仓库，只能走 docker build 的 secret 挂载。
+
+  【不用阿里云 / 在墙外 / 有自己的私服】
+
+  改下面那一个 <url> 就行，或者删掉整个 <mirrors> 块
+  （默认行为就是走 Maven Central）。这是**一行**的改动，不是架构改动。
+
+  【★ 和宿主机的 settings.xml 是两份，会漂移吗】
+
+  会，但漂移的后果是「容器构建慢一点」而不是「错」——
+  因为两者的作用都是「指向一个能用的仓库」，产物由 pom.xml 决定。
+  这与「密钥有两份拷贝」（docs/07 §3.1 那条）的性质不同：那个漂移会**出错**。
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              https://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+    <mirrors>
+        <!-- 阿里云公共仓库：代理了 Maven Central，国内下载的主力。
+             ★ mirrorOf=central 表示「凡是请求 central 的，都改走这里」。 -->
+        <mirror>
+            <id>aliyun-public</id>
+            <name>Aliyun Public Repository</name>
+            <url>https://maven.aliyun.com/repository/public</url>
+            <mirrorOf>central</mirrorOf>
+        </mirror>
+    </mirrors>
+
+</settings>

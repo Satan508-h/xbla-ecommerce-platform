@@ -32,10 +32,11 @@ import java.util.Map;
  * 业务编排全部在 {@link ChatService} 里。这里唯一稍微复杂的东西是
  * SSE 的线程调度 —— 那属于 Web 层职责，不该下沉到 service。
  *
- * <h3>两个接口</h3>
+ * <h3>三个接口</h3>
  * <ul>
  *   <li>{@code POST /api/chat} —— 非流式，一次拿回完整回答</li>
- *   <li>{@code GET /api/chat/stream} —— 流式，打字机效果</li>
+ *   <li>{@code POST /api/chat/stream} —— 流式，<b>正式前端走这条</b>（阶段 8 新增）</li>
+ *   <li>{@code GET /api/chat/stream} —— 流式，<b>命令行与探针脚本的口子</b>，不要删</li>
  * </ul>
  */
 @Slf4j
@@ -232,24 +233,66 @@ public class ChatController {
     // ============================================================
 
     /**
-     * 流式问答。
+     * 流式问答（GET）—— 给 {@code EventSource}、命令行和探针脚本用。
      *
-     * <h3>为什么用 GET 而不是 POST？</h3>
-     * 因为浏览器原生的 {@code EventSource} 只支持 GET。
-     * 用 GET 能让前端演示页只有十几行代码，把注意力放在「打字机效果」
-     * 这个真正要验证的东西上。
+     * <h3>为什么留着它，而不是被 POST 取代</h3>
      *
-     * <p>代价是问题文本要放进 URL query，受长度限制（中文会被百分号编码成
-     * 3 倍字节）。阶段 2 的问题是短句，够用。
-     * <b>生产环境应该换成 POST + fetch + ReadableStream 手写解析</b>，
-     * 这个取舍已记录在 {@code docs/08-技术决策记录(ADR).md}。
+     * <p>因为<b>它上面挂着阶段 2–7 的整条工具链</b>：
+     * {@code CLAUDE.md} 里的 {@code curl -N -G .../chat/stream}、
+     * {@code scripts/probe_*.py}、以及 {@code static/chat.html} 演示页。
+     * 把 {@code @GetMapping} 直接改成 {@code @PostMapping} 会让它们
+     * <b>编译照过、测试照绿、运行时才 405</b> —— 又一个静默断链。
+     *
+     * <p>所以是<b>加一条</b>，不是换一条。
+     *
+     * @see #chatStreamPost 正式前端走的那条
      */
     @GetMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter chatStream(@RequestParam("question") String question,
                                  @RequestParam(value = "sessionNo", required = false)
                                  String sessionNo,
                                  HttpServletRequest http) {
+        return stream(new ChatAskRequest(sessionNo, question, null), http);
+    }
 
+    /**
+     * 流式问答（POST）—— <b>正式前端走这条</b>（阶段 8）。
+     *
+     * <h3>★ 为什么必须有它：GET 装不下长问题</h3>
+     *
+     * <p>GET 把问题塞进 URL query，而中文会被百分号编码成 <b>3 倍字节</b>。
+     * 「一句话」还好，但一个粘贴进来的售后描述、或者带表格的提问，
+     * 会直接撞上 URL 长度上限 —— 而且不同浏览器、不同代理的上限还不一样，
+     * <b>症状是「有时候能发、有时候发不出去」</b>，最难查的那一类。
+     *
+     * <p>客户端用 {@code fetch} + {@code ReadableStream} 手写解析（约 40 行）。
+     * 代价是解析要自己写，收益是问题长度不再是个变量。
+     * 这个取舍在阶段 2 就写进了 {@code docs/08} ADR-011。
+     *
+     * <h3>★ 校验在排队【之前】</h3>
+     *
+     * <p>和 {@link #chat} 同一个理由：{@code @Valid} 由 Spring 在进入方法体之前执行，
+     * 所以一个长度超 2000 字的请求<b>不会占用任何队列位置</b>。
+     *
+     * <p>⚠️ GET 那条<b>没有</b>这层校验（query 参数不适合挂校验注解），
+     * 所以两条路的入参强度不同。这是刻意的：GET 是内部工具链的口子，
+     * POST 才是对外的那个门。
+     */
+    @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter chatStreamPost(@Valid @RequestBody ChatAskRequest request,
+                                     HttpServletRequest http) {
+        return stream(request, http);
+    }
+
+    /**
+     * 两条流式路径<b>共用的</b> SSE 调度。
+     *
+     * <p>★ 抽出来的理由不是「代码复用」那么泛 —— 是<b>排队、traceId、身份、评测标记
+     * 这四件事必须两条路完全一致</b>。复制一份出来的话，
+     * 下次只改了 POST 那一份，症状是「评测跑出来的行没有 eval_run_id」，
+     * 而这正是 ADR-081 记的那个静默错误。
+     */
+    private SseEmitter stream(ChatAskRequest request, HttpServletRequest http) {
         // ★★ 超时参数不能省 ★★
         //    Tomcat 的异步请求超时默认是 30 秒。不显式指定的话，
         //    任何超过 30 秒的流式回答都会在中间被无声掐断，
@@ -263,13 +306,12 @@ public class ChatController {
         //    因为排队比问答先发生，而排队期间推给前端的位置事件里就得有它。
         //    同一个 id 一路用到 qa_log.trace_id，见 TraceId 类注释。
         String traceId = TraceId.newId();
-        ChatAskRequest request = new ChatAskRequest(sessionNo, question, null);
 
         // ★ 身份在这里解析（和 /api/chat 同一个头），带进排队层只为
         //   在被拒绝时能写出一行完整的 qa_log —— 见 Admission 的说明。
         //   ★ 评测标记走同一个来源（resolveEvalMark），理由见那个方法。
         admission.submit(
-                new ChatAdmissionService.Admission(traceId, question, resolveUserId(http),
+                new ChatAdmissionService.Admission(traceId, request.question(), resolveUserId(http),
                         resolveEvalMark(http)),
                 new QueueEventListener(channel, traceId),
                 // ★★ 这段 work 跑在 answer- 线程上，而【名额的释放在它外面的 finally 里】——

@@ -186,3 +186,8 @@ $RECYCLE.BIN/
 *.bak
 *.swp
 *~
+
+# ★ 阶段 8：Nginx Basic Auth 的口令文件 —— 【凭据，绝不提交】
+#   它是公网隧道上唯一的访问控制，提交等于把门钥匙放进公开仓库。
+#   生成方式：bash deploy/make-htpasswd.sh
+deploy/.htpasswd

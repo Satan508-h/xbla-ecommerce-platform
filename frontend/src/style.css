@@ -1,0 +1,117 @@
+/*
+ * 全局样式 —— 只有三件事，其余都交给 Element Plus。
+ *
+ * ★ 刻意保持小：一个演示站不需要自建设计系统，
+ *   而每一行自定义 CSS 都是将来要维护的东西。
+ */
+
+:root {
+  /*
+   * ★ 中文字体栈要显式写。
+   *   不写的话浏览器会用自己的默认字体，而不同系统的默认中文字体差别很大
+   *   （Windows 是微软雅黑、macOS 是苹方），同一份代码在两台机器上看起来不一样。
+   *   "PingFang SC" / "Microsoft YaHei" 放在最前面，后面的 sans-serif 只是兜底。
+   */
+  --xbla-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --xbla-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--xbla-font);
+  background: #f5f7fa;
+  color: #303133;
+  /*
+   * ★ 不要给 body 加 overflow: hidden —— chat 页面靠它自己滚动，
+   *   而 report 页面是一整篇长文档，需要浏览器原生滚动条。
+   *   一刀切禁掉的话，报告页会滚不动。
+   */
+}
+
+/* 代码块和数字对齐用等宽字体 —— 报告页里有大量表格和数字 */
+code,
+pre,
+.xbla-mono {
+  font-family: var(--xbla-mono);
+}
+
+/* ------------------------------------------------------------------
+ * 报告页的 Markdown 排版
+ *
+ * ★ 这是【全局】样式而不是组件内 scoped 的：`v-html` 渲染出来的节点
+ *   拿不到 scoped 属性，写在组件里会静默不生效 ——
+ *   而症状是「样式写了但没效果」，很容易被当成优先级问题去查。
+ * ------------------------------------------------------------------ */
+.xbla-markdown {
+  line-height: 1.75;
+  font-size: 14px;
+  word-wrap: break-word;
+}
+.xbla-markdown h1 {
+  font-size: 24px;
+  border-bottom: 2px solid #dcdfe6;
+  padding-bottom: 8px;
+}
+.xbla-markdown h2 {
+  font-size: 19px;
+  border-bottom: 1px solid #ebeef5;
+  padding-bottom: 6px;
+  margin-top: 32px;
+}
+.xbla-markdown h3 {
+  font-size: 16px;
+  margin-top: 24px;
+}
+.xbla-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 12px 0;
+  /* ★ 宽表格要能横向滚动，否则窄屏上会把整个页面撑破 */
+  display: block;
+  overflow-x: auto;
+}
+.xbla-markdown th,
+.xbla-markdown td {
+  border: 1px solid #dcdfe6;
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+.xbla-markdown th {
+  background: #fafafa;
+  font-weight: 600;
+}
+.xbla-markdown code {
+  background: #f5f7fa;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 13px;
+}
+.xbla-markdown pre {
+  background: #f5f7fa;
+  padding: 12px;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+.xbla-markdown pre code {
+  background: none;
+  padding: 0;
+}
+.xbla-markdown blockquote {
+  margin: 12px 0;
+  padding: 4px 12px;
+  border-left: 3px solid #dcdfe6;
+  color: #606266;
+  background: #fafafa;
+}
