@@ -82,6 +82,7 @@ class IntentPromptBuilderTest {
                     description: 需要查实时数据的那一类
                     answer_style: 只陈述查到的
                     retrieval: TOOL
+                    tools: [query_order_status]
                     children:
                       - code: TOOL_LEAF
                         name: 工具叶子

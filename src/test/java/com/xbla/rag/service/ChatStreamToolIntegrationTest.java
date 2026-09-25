@@ -286,6 +286,12 @@ class ChatStreamToolIntegrationTest {
 
             // 反对照：正文确实在 delta 里存在过（否则上面那条断言恒真）
             assertThat(sink.body.toString()).isNotEmpty();
+
+            assertThat(sink.done.references())
+                    .as("★ 纯工具轮没有检索，就没有引用 —— "
+                            + "写成空数组会让「没检索」和「检索了但没召回」分不开（ADR-041），"
+                            + "所以这里必须是 null")
+                    .isNull();
         }
     }
 

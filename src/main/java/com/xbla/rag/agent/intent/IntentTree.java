@@ -432,11 +432,45 @@ public class IntentTree {
             }
         }
 
+        // ---------- tools（阶段 9.3，可选）----------
+        //
+        // ★★ 它合法的位置只有一处：【分类的落点】。而落点由 retrieval 决定 ——
+        //    KB 类意图分类到叶子（classificationTargets 会展开 children），
+        //    TOOL / NONE 类意图分类到顶层（不展开，见那条「行为相同的不区分」）。
+        //
+        //    所以顶层这一格：【只有 TOOL 类该写】。写在 KB / NONE 上不是
+        //    「暂时没生效」，是【永远读不到】—— 没有日志、没有异常，
+        //    症状是「我明明配了，模型怎么不用」。
+        //    同 structured_facts 那条「声明了一个永远不生效的东西就启动即崩」。
+        List<String> tools = parseTools(node, code, problems);
+        if (!tools.isEmpty()) {
+            if (retrieval != null && retrieval != Retrieval.TOOL) {
+                // ⚠️ 这里【刻意】不单独判 role != BUSINESS。理由：
+                //   上面已经强制「非业务分支必须是 retrieval=NONE」，
+                //   而 NONE 这一支本来就拒绝 tools —— 再写一条 role 分支，
+                //   它永远不会命中（前一条先报），是一段看起来有意义的死代码。
+                //   实测就是这么发现的：写了 role 分支之后，
+                //   「NONE 顶层不许带工具」这条断言永远走不到。
+                problems.add(prefix(code) + "retrieval=" + retrieval
+                        + " 却在【顶层】声明了 tools=" + tools + " —— "
+                        + (retrieval == Retrieval.KB
+                        ? "KB 类意图的分类落点是【叶子】，工具清单要写在需要它的那个叶子下"
+                        : "NONE 类意图不调任何工具（RetrievalGate 的 NONE 分支"
+                                + "【根本不读】工具清单，那是刻意的「不可表达」；"
+                                + "role != BUSINESS 的两个分支都属于这一类）"));
+            }
+        } else if (retrieval == Retrieval.TOOL) {
+            problems.add(prefix(code) + "retrieval=TOOL 却没有可用的 tools —— "
+                    + "这一类问题的答案【全部】来自实时工具，白名单为空等于这条路必然答不出，"
+                    + "而模型会退回去拿知识库里的通用规则编一个出来（ADR-044）");
+        }
+
         if (code == null || name == null || description == null
                 || answerStyle == null || retrieval == null) {
             return null;
         }
-        return new TopIntent(code, name, description, answerStyle, retrieval, role, children);
+        return new TopIntent(code, name, description, answerStyle, retrieval, role, children,
+                List.copyOf(tools));
     }
 
     /** 解析一个叶子。有问题就记进 {@code problems} 并返回 {@code null} */
@@ -529,11 +563,66 @@ public class IntentTree {
             }
         }
 
+        // ---------- tools（阶段 9.3，可选）----------
+        //
+        // ★ 叶子上写 tools 只有一个合法场景：**混合轮** —— 这个 KB 叶子
+        //   检索完知识库之后，还允许模型调这几个实时工具（今天只有 SCENARIO_PICK）。
+        //
+        // ⚠️ 父顶层是 TOOL / NONE 的叶子写它【启动即崩】：那两类的分类落在顶层，
+        //   叶子上这一格永远读不到。同上面 structured_facts 那条一模一样的理由 ——
+        //   「声明了一个不会生效的东西」是配置类错误，没有合理的回落值。
+        List<String> tools = parseTools(node, code, problems);
+        if (!tools.isEmpty() && docTypesForbidden) {
+            problems.add(prefix(code) + "声明了 tools=" + tools + "，但它所属的 "
+                    + parentCode + " 是 retrieval=" + parentRetrieval
+                    + " —— 那类意图的分类落点是【顶层】，写在叶子上永远读不到");
+        }
+
         if (code == null || name == null || description == null) {
             return null;
         }
         return new Leaf(code, name, description, List.copyOf(docTypes),
-                List.copyOf(examples), note, structuredFact);
+                List.copyOf(examples), note, structuredFact, List.copyOf(tools));
+    }
+
+    /**
+     * 解析一个节点的 {@code tools} 字段（阶段 9.3）。
+     *
+     * <p>★ 它只校验<b>形状</b>（是不是字符串列表、有没有重复），
+     * <b>不校验工具名是否存在</b> —— 那要拿注册表比，而注册表在 {@code mcp} 包。
+     * 让意图树依赖注册表会糊掉「意图树只描述用户想干什么」这条边界，
+     * 所以那一半在 {@code IntentToolBindingValidator}（它同时看得见两边）。
+     *
+     * <p>⚠️ 这个分工的代价必须说清楚：<b>只跑 IntentTree 的单测发现不了拼错的工具名</b>。
+     * 所以那条校验必须是<b>启动期</b>的，而不是「跑起来之后第一次调到才发现」——
+     * 后者会让一个拼写错误安静地活到线上。
+     */
+    private static List<String> parseTools(Map<?, ?> node, String context, List<String> problems) {
+        Object raw = node.get("tools");
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            problems.add(prefix(context) + "tools 必须是列表，例如 "
+                    + "[search_products, compare_prices]");
+            return List.of();
+        }
+        List<String> tools = new ArrayList<>();
+        for (Object item : list) {
+            String name = stringOrNull(item);
+            if (name == null) {
+                problems.add(prefix(context) + "tools 里有空白项：" + item);
+                continue;
+            }
+            if (tools.contains(name)) {
+                // ★ 重复不改变行为，但它是复制粘贴留下的痕迹 ——
+                //   而复制粘贴正是「两份清单一改一漏」的源头，值得一条报错
+                problems.add(prefix(context) + "tools 里 " + name + " 出现了两次");
+                continue;
+            }
+            tools.add(name);
+        }
+        return List.copyOf(tools);
     }
 
     /** 报错时列全可选值 —— 写错的枚举值最容易的修法就是照着这句话改 */
@@ -679,10 +768,22 @@ public class IntentTree {
      *                    详见那个枚举的注释 —— 关键是它<b>不参与</b>
      *                    {@link Tree#classificationTargets()}，
      *                    所以给叶子加它不会动分类 prompt、不会影响 5.2 的准确率基线
+     * @param tools       ★ 阶段 9.3：这个叶子在<b>检索之外</b>还允许模型调用的工具白名单。
+     *                    空列表 = 纯知识库问答，这是绝大多数叶子的情形。
+     *                    ⚠️ 它只能写在<b>分类落点</b>上 —— KB 意图的分类落点是叶子
+     *                    （所以写在 {@code Leaf} 上是对的），TOOL / NONE 意图落点是顶层
+     *                    （写在叶子上<b>启动即崩</b>，因为永远读不到）。
+     *                    见 {@link Tree#toolsOf}。
+     *                    ★ 它是<b>白名单</b>不是「建议」：{@code ToolLoop} 只按它
+     *                    <b>过滤</b>，不重排、更不能放大（放大会让工具意图退化成裸聊）。
      */
     public record Leaf(String code, String name, String description, List<Integer> docTypes,
                        List<String> examples, String note,
-                       StructuredFact structuredFact) {
+                       StructuredFact structuredFact, List<String> tools) {
+
+        public Leaf {
+            tools = List.copyOf(tools);
+        }
     }
 
     /**
@@ -693,12 +794,18 @@ public class IntentTree {
      *             的 {@code expected_chunk_ids} 只能是空集），要么根本不是「意图」
      *             （{@code CLARIFY} 是问题质量的问题，不是用户想要什么）。
      *             混在一起会让 7.2 的指标承载性质相反的错
+     * @param tools ★ 阶段 9.3：这一类的工具白名单。<b>只有 {@code retrieval = TOOL}
+     *              的顶层该有它，而且必须有</b> —— 见 {@code parseIntent} 里那两条校验。
+     *              ⚠️ {@code retrieval = KB} 的顶层写它<b>启动即崩</b>：KB 类的分类落点是
+     *              叶子（{@link Tree#classificationTargets()}），顶层这一格永远读不到。
      */
     public record TopIntent(String code, String name, String description, String answerStyle,
-                            Retrieval retrieval, Role role, List<Leaf> children) {
+                            Retrieval retrieval, Role role, List<Leaf> children,
+                            List<String> tools) {
 
         public TopIntent {
             children = List.copyOf(children);
+            tools = List.copyOf(tools);
         }
 
         /**
@@ -852,6 +959,34 @@ public class IntentTree {
                 }
             }
             return StructuredFact.NONE;
+        }
+
+        /**
+         * 一个分类目标这次允许模型调用的工具白名单（阶段 9.3）。
+         *
+         * <p>★★ 它和 {@link #retrievalOf} 一样<b>必须同时接受两种粒度</b>，
+         * 理由也完全相同：分类结果是两种。KB 类意图分类到叶子，
+         * TOOL / NONE 类意图分类到顶层。只查叶子会让 {@code ORDER_LOGISTICS}
+         * 查不到 → 拿到空列表 → <b>模型手上一件工具都没有</b>，
+         * 而症状是「工具题答得跟裸聊一样」，不是报错。
+         *
+         * <p>查不到这个 code 时返回<b>空列表</b>而不是 null —— 同
+         * {@link #structuredFactOf}：调用方要的是「这次能用哪些工具」，
+         * 而「分类失败」已经由上游的 {@code isClassified()} 表达过了。
+         *
+         * <p>★ 空列表的含义是「这次不调工具」，<b>不是</b>「工具不可用」。
+         * 「拉不到工具清单」是另一件事（部署问题），由 {@code ToolLoop} 表达 ——
+         * 两者在日志和给模型的提示上完全不同，不能合并。
+         */
+        public List<String> toolsOf(String code) {
+            if (code == null) {
+                return List.of();
+            }
+            Optional<TopIntent> top = findTop(code);
+            if (top.isPresent()) {
+                return top.get().tools();
+            }
+            return findLeaf(code).map(Leaf::tools).orElseGet(List::of);
         }
 
         /**

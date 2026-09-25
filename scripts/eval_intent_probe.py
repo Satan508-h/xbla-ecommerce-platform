@@ -83,6 +83,24 @@ sys.stdout.reconfigure(encoding="utf-8")
 #      ★ 判据：先打一发 /api/debug/agent/intent-prompt，看头两行是不是你期望的文案。
 BASE = "http://localhost:8080"
 
+# ★★ 早停阈值（2026-09-25 加，起因见下）
+#
+# 那天跑 stage7（159 题 × 8 次 = 1272 次调用）时，上游 deepseek 官方在
+# 第 88 题附近开始连接失败（19 次 connect_error）。后续的事不是「慢一点」：
+#   connect_error → 熔断器 failureRate>50% → 三个 provider 的 breaker 全开
+#   → 之后每一次调用都【秒拒】，一个请求都没发出去
+# 结果是 570/1272 失败、71 道题整题废掉、1064 秒和 0.52 元买回来一个
+# 印着「52%」的垃圾数字 —— 而那个 52% 看起来完全像一个准确率。
+#
+# ★ 所以：**宁可让一轮早停，也不要跑完 159 题再告诉人这轮没用。**
+#   判据只能是「失败率」，因为成功了的那部分看起来一切正常。
+#
+# ⚠️ 这两个数不是调优参数，是「这轮还算不算数」的门槛：
+#   低于 ABORT_AFTER 时样本太小，抖一下就会误停；
+#   超过 ABORT_ERROR_RATE 时，剩下的题已经不能代表题库了。
+ABORT_AFTER = 40
+ABORT_ERROR_RATE = 0.20
+
 
 def post_reload():
     """拉题库（含人工标注的 intent）。reload 是幂等的 upsert，重复调用无害。"""
@@ -155,10 +173,13 @@ def main():
     print("意图分类复测  set=%s  题数=%d  每题 %d 次" % (args.set, len(questions), args.repeat))
     print("=" * 72)
 
-    correct, swing = 0, []
-    unstable = []          # 非全票一致的题（含 6:2 这种有众数的）
+    # ★ 聚合量【不在这里累加】—— 最后统一走 stats_of(results)，
+    #   因为它还要能对「干净子集」再算一遍。见那段注释
     cost = 0.0
     errors = 0
+    calls_done = 0
+    results = []           # (题, 票列表) —— 早停之后要靠它算【干净子集】
+    aborted = None
     t0 = time.time()
 
     for i, q in enumerate(questions, 1):
@@ -167,25 +188,18 @@ def main():
             vote, c = classify_safely(q["question"])
             picked.append(vote)
             cost += c
+            calls_done += 1
             if vote.startswith("ERROR:"):
                 errors += 1
-
-        votes = Counter(picked)
-        top, n = votes.most_common(1)[0]
-        ok = top == q["intent"]
-        if ok:
-            correct += 1
+        results.append((q, picked))
 
         # ★ 两个都算、都报，但**地位不同**（2026-09-21 定）：
         #   swing    = 无唯一众数（1:1:1）—— 诊断信息。实测两轮各 8 次都是 0 道，
         #              因为真实的不稳定长成 6:2 / 7:1，几乎不会恰好打平
         #   unstable = 非全票一致（2:1 / 6:2 / 7:1…）—— ★★ 主指标
         # 只报 swing 会得出「所有题都稳」的结论，而那是假的。
-        tied = len([c for c in votes.values() if c == n]) > 1
-        if tied:
-            swing.append((q["questionNo"], q["question"], q["intent"], dict(votes)))
-        if len(votes) > 1:
-            unstable.append((q["questionNo"], q["intent"], top, dict(votes)))
+        # ★ 判定走 judge()，和最后汇总同一份实现 —— 见那个函数
+        top, ok, tied = judge(q, picked)
 
         flag = "✅" if ok else "❌"
         mark = "  ⚠️无众数" if tied else ""
@@ -193,13 +207,50 @@ def main():
               % (flag, i, len(questions), q["questionNo"], q["intent"], top,
                  " ".join(picked), mark))
 
+        # ★★ 早停 —— 见 ABORT_AFTER 那段注释。
+        #   ⚠️ 判据放在【一整题跑完之后】，不是每张票之后：
+        #      分类本身有噪声（±5%），逐票判会在正常波动上误停
+        if calls_done >= ABORT_AFTER and errors / calls_done > ABORT_ERROR_RATE:
+            aborted = ("上游从第 %d 题附近开始大面积失败（%d/%d = %.0f%%）"
+                       % (i, errors, calls_done, 100.0 * errors / calls_done))
+            print()
+            print("★★ 早停：%s" % aborted)
+            print("   继续跑只是在给一个已经作废的数字添行 —— 熔断器开了之后")
+            print("   后面的调用【一个请求都不会发出去】，那部分数据 100% 是坏的，")
+            print("   而且没法事后剔除干净（失败可能从中间某道题开始）。")
+            break
+
     dt = time.time() - t0
     print("=" * 72)
+
+    # ★★ 有失败票时换口径（2026-09-25 加，起因见 ABORT_AFTER 那段注释）
+    #
+    #   失败票的字符串里带着 traceId，所以每一张都是【独立的键】：
+    #   8 张里坏 3 张时 Counter 仍然是「5 票有效 + 3 个各 1 票的键」，
+    #   众数可能照样是对的 —— 看起来一切正常。
+    #   但「非全票一致」那一栏会被失败票灌满（实测 80 道，而正常是 3 道）。
+    #   ★ 于是一个被污染的数字和一个真实的数字【长得一模一样】。
+    #
+    #   ⇒ 只要失败率不为 0，就【只报干净子集】，并把它自己的分母写出来。
+    clean = [(q, picked) for q, picked in results
+             if not any(v.startswith("ERROR:") for v in picked)]
+    report = clean if errors else results
+    r_correct, r_swing, r_unstable = stats_of(report)
+
+    if aborted:
+        print("★★ 本轮【作废】—— %s" % aborted)
+    if errors:
+        print("★★ 口径：%d/%d 张票失败 —— 下面三个数【只统计 %d 道干净题】"
+              % (errors, calls_done, len(clean)))
+        print("   ⚠️ 干净子集在题号上通常是连成一片的前缀（题库按意图分类排），")
+        print("      所以它【有偏】，不能当整份题库的准确率 ——")
+        print("      只能这样用：和【同一批题号】的历史结果比。")
+
     # ⚠️ 这个标签以前写死成「3 次取众数」—— 而 --repeat 是可配的。
     #    写死之后，用 --repeat 8 跑出来的数会带着「3 次」的标签进报告。
     #    ★ 一个数字旁边的口径如果是错的，那个数字就不可解释（同 ADR-080）。
     print("Top-1 意图准确率（%d 次取众数）          %d/%d = %.0f%%"
-          % (args.repeat, correct, len(questions), 100.0 * correct / len(questions)))
+          % (args.repeat, r_correct, len(report), 100.0 * r_correct / max(1, len(report))))
 
     # ★★ 真正该看的是这个：**没有全票一致的题**。
     #    只报「摇摆（无众数）」会漏掉最常见的那种不稳定 —— 6:2、7:1 都有明确众数，
@@ -207,25 +258,60 @@ def main():
     #    实测（2026-09-20，baseline 20 题 × 8 次）：3 道非全票一致，
     #    其中 2 道众数是错的 —— 而旧的「19/20 = 95%」正是在这种题上蒙对了一次。
     print("（诊断）无唯一众数的题                  %d 道 —— ★ 这个数恒为 0 是正常的，别盯它"
-          % len(swing))
-    for no, txt, gold, votes in swing:
+          % len(r_swing))
+    for no, txt, gold, votes in r_swing:
         print("   %-8s gold=%-20s %s   %s" % (no, gold, votes, txt))
     # ★★ 非全票一致 = 这题的分数换个时间跑就可能翻。它比「准确率」本身更值得看：
     #    准确率是一个点估计，而这张表告诉你那个估计有多稳。
     #    ★ 报告里报准确率时，必须同时报这个数 —— 否则读者会把 90% 当成一个确定的量。
-    print("★★ 主指标：非全票一致的题               %d 道（分数可能随时翻）" % len(unstable))
-    for no, gold, top, votes in unstable:
+    print("★★ 主指标：非全票一致的题               %d 道（分数可能随时翻）" % len(r_unstable))
+    for no, gold, top, votes in r_unstable:
         print("   %-8s gold=%-20s 众数=%-20s %s" % (no, gold, top, votes))
     # ★ 调用失败率必须报出来 —— 它会让准确率偏低，而偏低的原因不是模型不行。
     #   写进报告时它和「分类错了」必须分开读。
-    print("调用失败（超时等）                      %d / %d 次"
-          % (errors, len(questions) * args.repeat))
+    print("调用失败（超时等）                      %d / %d 次" % (errors, calls_done))
     print("耗时 %.1fs   本次花费 ≈ %.4f 元" % (dt, cost))
     print()
     print("★ 分母是这 %d 道【人工标注】的题，不是线上分布。" % len(questions))
     print("★ 单次有 ±5% 波动（temperature=0 不等于确定性）—— 报数字时必须带这句。")
     print("★ 检索范围准确率【不在这里】—— 它要用 IntentTree.docTypesOf，")
     print("  在 Python 里重写会造出第二个事实来源。那一半见 T4 的报告端点。")
+
+
+def judge(q, picked):
+    """
+    一道题的判定：众数是哪个、对不对、有没有并列众数。
+
+    ★ 逐题打印和最后汇总都走这里 —— <b>一份实现</b>。
+      写两份的话，「屏幕上那行 ✅」和「汇总里的正确数」可能对不上，
+      而那时候你没法知道该信哪个。
+    """
+    votes = Counter(picked)
+    top, n = votes.most_common(1)[0]
+    tied = len([c for c in votes.values() if c == n]) > 1
+    return top, top == q["intent"], tied
+
+
+def stats_of(pairs):
+    """
+    一组 (题, 票列表) 的三个聚合量：正确数 / 无众数 / 非全票一致。
+
+    ★ 抽成函数是为了让「全量」和「干净子集」用【同一个实现】——
+    写两份的话，两份在口径上迟早会漂移，而漂移的症状是
+    「两个数都印出来了，但它们量的是不一样的东西」。
+    """
+    correct = 0
+    swing, unstable = [], []
+    for q, picked in pairs:
+        top, ok, tied = judge(q, picked)
+        if ok:
+            correct += 1
+        votes = dict(Counter(picked))
+        if tied:
+            swing.append((q["questionNo"], q["question"], q["intent"], votes))
+        if len(votes) > 1:
+            unstable.append((q["questionNo"], q["intent"], top, votes))
+    return correct, swing, unstable
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ class IntentTreeStructuredFactsTest {
             .append("    description: 要查实时数据\n")
             .append("    answer_style: 只陈述查到的数据\n")
             .append("    retrieval: TOOL\n")
+            .append("    tools: [query_order_status]\n")
             .append("    children:\n")
             .append("      - code: LEAF_TOOL\n")
             .append("        name: 工具叶子\n")

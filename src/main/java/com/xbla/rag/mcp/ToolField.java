@@ -43,11 +43,26 @@ import java.util.Map;
  */
 public record ToolField(String name, Type type, boolean required, String description) {
 
-    /** JSON Schema 的 {@code type}。只支持这三种 —— 多一种就要多一份校验代码 */
+    /**
+     * JSON Schema 的 {@code type}。只支持这两种 —— 多一种就要多一份校验代码。
+     *
+     * <p>★ 阶段 9.3 <b>删掉了原来的第三个值 {@code BOOLEAN}</b>。它从 5.7 起就躺在这里，
+     * 但两条腿都是断的：
+     * <ul>
+     *   <li>没有任何工厂造得出它（只有 string / int 那四个）</li>
+     *   <li>{@link McpArguments} 里也没有对应的读取器</li>
+     * </ul>
+     * 于是它成了一个<b>存在但不可达</b>的枚举值。下一个人照着写
+     * {@code new ToolField("x", Type.BOOLEAN, ...)} 时编译器<b>不会拦他</b> ——
+     * 类型是对的 —— 要等到 {@code toSchemaProperty()} 产出一份模型能照着发、
+     * 而我们读不出来的 schema 才会暴露。
+     *
+     * <p>★ 判据：<b>删除是编译期可见的，留着是给下一个人埋雷。</b>
+     * 真需要布尔参数时再加，那时连工厂和读取器一起加。
+     */
     public enum Type {
         STRING("string"),
-        INTEGER("integer"),
-        BOOLEAN("boolean");
+        INTEGER("integer");
 
         private final String jsonSchemaType;
 

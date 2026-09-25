@@ -225,7 +225,8 @@ class IntentTreeTest {
             // 真实树里 ORDER_LOGISTICS 的三个叶子写的是 doc_types: []
             String yaml = validTree()
                     .replace("    retrieval: KB\n" + LEAF_1_SUBTREE,
-                             "    retrieval: TOOL\n" + LEAF_1_SUBTREE)
+                             "    retrieval: TOOL\n    tools: [query_order_status]\n"
+                                     + LEAF_1_SUBTREE)
                     .replace("        doc_types: [1, 2]\n", "        doc_types: []\n");
 
             IntentTree.Tree tree = parse(yaml);
@@ -351,7 +352,8 @@ class IntentTreeTest {
             // 只把 TOP_1 改成 TOOL，它的叶子还留着 doc_types: [1, 2]
             assertThatThrownBy(() -> parse(validTree()
                     .replace("    retrieval: KB\n" + LEAF_1_SUBTREE,
-                             "    retrieval: TOOL\n" + LEAF_1_SUBTREE)))
+                             "    retrieval: TOOL\n    tools: [query_order_status]\n"
+                                     + LEAF_1_SUBTREE)))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("自相矛盾");
         }
@@ -689,6 +691,163 @@ class IntentTreeTest {
                             .isEmpty();
                 }
             }
+        }
+    }
+
+    // ============================================================
+    // ★ 阶段 9.3：tools 的【合法位置】
+    // ============================================================
+
+    /**
+     * ★★ 这一组测的不是「tools 怎么解析」，而是<b>它能写在哪一层</b>。
+     *
+     * <p>规则只有一条，而它完全由「分类落在哪一层」决定：
+     *
+     * <pre>
+     *   retrieval=TOOL  分类落点是【顶层】→ tools 写在顶层
+     *   retrieval=KB    分类落点是【叶子】→ tools 写在叶子
+     *   写在别处 = 那一格【永远读不到】 = 启动即崩
+     * </pre>
+     *
+     * <p>为什么是崩而不是 WARN：一个读不到的声明<b>没有任何可观测的症状</b>。
+     * 用户看到的是「我明明在树里配了，模型怎么不用」——
+     * 而那时候已经过了最容易排查的阶段（配置加载）。
+     * 同 {@code structured_facts} 那条「声明了一个永远不生效的东西就启动即崩」。
+     */
+    @Nested
+    @DisplayName("★ 阶段 9.3 · tools 只能写在【分类的落点】上")
+    class ToolPlacement {
+
+        /** 把 TOP_1 整个改成 TOOL 类。{@code toolsLine} 为 null 表示不写 tools */
+        private String withToolTop(String toolsLine) {
+            return validTree()
+                    .replace("    retrieval: KB\n" + LEAF_1_SUBTREE,
+                            "    retrieval: TOOL\n"
+                                    + (toolsLine == null ? "" : toolsLine)
+                                    + LEAF_1_SUBTREE)
+                    .replace("        doc_types: [1, 2]\n", "        doc_types: []\n");
+        }
+
+        /** 在 LEAF_1 的 doc_types 后面插一行 —— 用来把 tools 放到【叶子】上 */
+        private String withLeafTools(String toolsLine) {
+            return validTree().replace("        doc_types: [1, 2]\n",
+                    "        doc_types: [1, 2]\n" + toolsLine);
+        }
+
+        // ---------- 合法：两个位置各一个 ----------
+
+        @Test
+        @DisplayName("✅ TOOL 的顶层写 tools → 通过，toolsOf 读得到")
+        void acceptsToolsOnToolTop() throws IOException {
+            IntentTree.Tree tree = parse(withToolTop("    tools: [query_order_status]\n"));
+
+            assertThat(tree.toolsOf("TOP_1")).containsExactly("query_order_status");
+            // ★ 同一个 TOOL 类意图的【叶子】上读不到 ——
+            //   那是对的：那一类不按叶子分类，叶子这一格本来就没人读
+            assertThat(tree.toolsOf("LEAF_1")).isEmpty();
+        }
+
+        @Test
+        @DisplayName("✅ KB 的叶子写 tools → 通过（这就是【混合轮】）")
+        void acceptsToolsOnKbLeaf() throws IOException {
+            IntentTree.Tree tree = parse(withLeafTools(
+                    "        tools: [search_products, recommend_products]\n"));
+
+            assertThat(tree.toolsOf("LEAF_1"))
+                    .containsExactly("search_products", "recommend_products");
+            // ★ 反面：它的兄弟叶子没写，就必须是空的 ——
+            //   否则「按意图裁剪」会变成「整个顶层一起裁剪」
+            assertThat(tree.toolsOf("LEAF_2")).isEmpty();
+            // ★ 而顶层码上读不到东西：KB 类意图没有顶层工具清单
+            assertThat(tree.toolsOf("TOP_1")).isEmpty();
+        }
+
+        // ---------- 非法：三处写错位置 ----------
+
+        @Test
+        @DisplayName("❌ KB 的顶层写 tools → 崩（KB 类分类落在叶子，这一格读不到）")
+        void rejectsToolsOnKbTop() {
+            assertThatThrownBy(() -> parse(withTopToolsOnKbTop()))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("分类落点是【叶子】");
+        }
+
+        private String withTopToolsOnKbTop() {
+            return validTree().replace("    retrieval: KB\n    children:\n",
+                    "    retrieval: KB\n    tools: [search_products]\n    children:\n");
+        }
+
+        /**
+         * ★★ 这一条<b>同时覆盖两个非业务分支</b>（{@code OUT_OF_SCOPE} 和
+         * {@code CLARIFY}）—— 它们写的是同一段 YAML，所以 {@code replace} 一次改两个。
+         *
+         * <p>⚠️ 断言里那句「role != BUSINESS 的两个分支都属于这一类」不是装饰：
+         * 最初这里写了两条独立的检查（一条判 role、一条判 retrieval），
+         * 而 role 那条总是先命中，于是「NONE 顶层不许带工具」这条<b>永远走不到</b>。
+         * 是这条测试挂掉才发现的 —— 一段看起来有意义的死代码。
+         */
+        @Test
+        @DisplayName("❌ NONE 的顶层写 tools → 崩（两个非业务分支都属于这一类）")
+        void rejectsToolsOnNoneTop() {
+            String yaml = validTree().replace(
+                    "    retrieval: NONE\n    children: []\n",
+                    "    retrieval: NONE\n    tools: [query_my_coupons]\n    children: []\n");
+
+            // ★ 前-后对照：改之前这两块都合法，改之后两块都要被拒
+            assertThat(yaml).isNotEqualTo(validTree());
+            assertThatThrownBy(() -> parse(yaml))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("NONE 类意图不调任何工具")
+                    .hasMessageContaining("role != BUSINESS 的两个分支都属于这一类");
+        }
+
+        @Test
+        @DisplayName("❌ TOOL 的【叶子】写 tools → 崩（那类意图的分类落点是顶层）")
+        void rejectsToolsOnLeafUnderToolTop() {
+            String yaml = withToolTop("    tools: [query_order_status]\n")
+                    .replace("        doc_types: []\n",
+                            "        doc_types: []\n        tools: [query_inventory]\n");
+
+            assertThatThrownBy(() -> parse(yaml))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("那类意图的分类落点是【顶层】");
+        }
+
+        @Test
+        @DisplayName("❌ TOOL 的顶层【不写】tools → 崩（那类问题的答案全部来自工具）")
+        void rejectsToolTopWithoutTools() {
+            // ★ 和上面「TOOL 顶层写 tools → 通过」只差那一行 —— 正-反对照
+            assertThatThrownBy(() -> parse(withToolTop(null)))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("却没有可用的 tools");
+        }
+
+        // ---------- 形状 ----------
+
+        @Test
+        @DisplayName("❌ tools 不是列表 → 崩")
+        void rejectsToolsThatIsNotAList() {
+            assertThatThrownBy(() -> parse(withLeafTools("        tools: search_products\n")))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("tools 必须是列表");
+        }
+
+        @Test
+        @DisplayName("❌ tools 里有重复 → 崩（复制粘贴留下的痕迹）")
+        void rejectsDuplicateTools() {
+            assertThatThrownBy(() -> parse(withLeafTools(
+                    "        tools: [search_products, search_products]\n")))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("出现了两次");
+        }
+
+        @Test
+        @DisplayName("toolsOf 对不存在的 code 返回空表，不抛也不返回 null")
+        void toolsOfUnknownCodeIsEmpty() throws IOException {
+            IntentTree.Tree tree = parse(validTree());
+
+            assertThat(tree.toolsOf("MODEL_MADE_THIS_UP")).isEmpty();
+            assertThat(tree.toolsOf(null)).isEmpty();
         }
     }
 }

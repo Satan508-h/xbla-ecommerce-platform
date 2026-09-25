@@ -185,19 +185,25 @@ class RetrievalGateIntegrationTest {
 
         @Test
         @DisplayName("★★ intent_plan 的六格全都在，且 shape 被记下来")
-        void planHasAllSixFields() throws Exception {
+        void planHasAllSevenFields() throws Exception {
             classifyAs("OUT_OF_SCOPE", jsonPlan(true));
             scriptPlainAnswer();
 
             var response = chatService.ask(new ChatAskRequest(null, "帮我写首诗", null), null);
             Map<String, Object> plan = planOf(qaLogOf(response.traceId()));
 
-            // ★ 六格一个都不能少 —— 每一格都对应一个事后必须能回答的问题
+            // ★ 七格一个都不能少 —— 每一格都对应一个事后必须能回答的问题
+            //   （第 7 格 tools 是阶段 9.3 加的，v 同时从 1 升到 2）
             assertThat(plan)
-                    .containsKeys("v", "intent", "retrieve", "gate", "missing", "shape")
-                    .containsEntry("v", 1)
+                    .containsKeys("v", "intent", "retrieve", "gate", "tools", "missing", "shape")
+                    .containsEntry("v", 2)
                     .containsEntry("intent", "OUT_OF_SCOPE")
                     .containsEntry("gate", RetrievalGate.REASON_NONE_INTENT);
+            // ★ OUT_OF_SCOPE 的工具清单必须是空的：它既不检索也不调工具。
+            //   非空会让「按意图裁剪」在这一类上静默失效
+            assertThat(plan.get("tools"))
+                    .as("NONE 类意图的工具清单必须是空数组，不能是 null 也不能有东西")
+                    .isEqualTo(List.of());
             // ★ 模型说的是 true（我们就是这么桩的），而生效的是 false ——
             //   这一对差别正是「记结论而不是记原话」的证据
             assertThat(plan.get("retrieve"))

@@ -84,6 +84,7 @@ class RetrievalGateTest {
                     description: 需要查实时数据
                     answer_style: 只陈述查到的
                     retrieval: TOOL
+                    tools: [query_order_status]
                     children:
                       - code: TOOL_LEAF
                         name: 工具叶子
@@ -153,7 +154,7 @@ class RetrievalGateTest {
             RetrievalGate.Decision d = gate.decide(noPlan("TOP_5"));
 
             assertThat(d.path()).isEqualTo(RetrievalGate.Path.TOOLS);
-            assertThat(d.shouldUseTools()).isTrue();
+            assertThat(d.hasTools()).isTrue();
             assertThat(d.shouldRetrieve()).isFalse();
         }
 

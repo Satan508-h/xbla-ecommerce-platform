@@ -153,7 +153,11 @@ public class IntentProbeController {
             gateView.put("path", gate.path().name());
             gateView.put("reason", gate.reason());
             gateView.put("willRetrieve", gate.shouldRetrieve());
-            gateView.put("willUseTools", gate.shouldUseTools());
+            // ★ 9.3：报【生效的清单】，不只是个布尔量。
+            //   混合轮上 path 是 RETRIEVE 而 hasTools() 是 true ——
+            //   只看 path 会让人以为这次没有工具可用
+            gateView.put("tools", gate.tools());
+            gateView.put("willUseTools", gate.hasTools());
             response.put("gate", gateView);
         }
         return response;
@@ -229,6 +233,13 @@ public class IntentProbeController {
             // ★ 算出来的，不在 YAML 里 —— 5.4 用的是叶子级的 docTypes，
             //   这个并集是给人「看全局」用的
             m.put("docTypesUnion", top.docTypesUnion());
+            // ★ 阶段 9.3：工具的合法落点是「分类落点」—— TOOL 类在【顶层】、
+            //   KB 类在【叶子】（见 IntentTree 的加载期校验）。
+            //   所以这一格要显示出来，而不是只留在 YAML 里让人去数缩进 ——
+            //   「这个叶子挂了哪些工具」是排查「模型手上为什么没有工具」的第一站
+            if (!top.tools().isEmpty()) {
+                m.put("tools", top.tools());
+            }
 
             List<Map<String, Object>> leaves = new ArrayList<>();
             for (IntentTree.Leaf leaf : top.children()) {
@@ -237,6 +248,10 @@ public class IntentProbeController {
                 lm.put("name", leaf.name());
                 lm.put("docTypes", leaf.docTypes());
                 lm.put("exampleCount", leaf.examples().size());
+                // ★ 同上。★ 一个 KB 叶子带了工具 = 混合轮（先检索、再给工具）
+                if (!leaf.tools().isEmpty()) {
+                    lm.put("tools", leaf.tools());
+                }
                 // ★ 阶段 5.9：只有非 NONE 时才出现这一格。
                 //   不写成「永远出现、值为 NONE」是因为 5 个顶层里绝大多数叶子
                 //   都是 NONE，全列出来会把真正的声明淹掉 ——

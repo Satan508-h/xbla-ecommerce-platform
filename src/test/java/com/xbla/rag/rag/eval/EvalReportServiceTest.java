@@ -88,17 +88,23 @@ class EvalReportServiceTest {
                 new IntentTree.TopIntent("KB_TOP", "知识库类", "d", "s",
                         IntentTree.Retrieval.KB, IntentTree.Role.BUSINESS, List.of(
                         new IntentTree.Leaf("LEAF_A", "叶子A", "d", List.of(2, 4),
-                                List.of(), null, IntentTree.StructuredFact.NONE),
+                                List.of(), null, IntentTree.StructuredFact.NONE, List.of()),
                         new IntentTree.Leaf("LEAF_B", "叶子B", "d", List.of(3),
-                                List.of(), null, IntentTree.StructuredFact.NONE))),
+                                List.of(), null, IntentTree.StructuredFact.NONE, List.of())),
+                        // ★ 9.3 起 tools 是 TopIntent / Leaf 的最后一个分量。
+                        //   这里一律传空 —— 本类测的是报告指标的口径，不涉及工具绑定
+                        List.of()),
                 new IntentTree.TopIntent("TOOL_TOP", "工具类", "d", "s",
                         IntentTree.Retrieval.TOOL, IntentTree.Role.BUSINESS, List.of(
                         new IntentTree.Leaf("TOOL_LEAF", "工具叶子", "d", List.of(),
-                                List.of(), null, IntentTree.StructuredFact.NONE))),
+                                List.of(), null, IntentTree.StructuredFact.NONE, List.of())),
+                        List.of()),
                 new IntentTree.TopIntent("FALLBACK", "兜底", "d", "s",
-                        IntentTree.Retrieval.NONE, IntentTree.Role.OUT_OF_SCOPE, List.of()),
+                        IntentTree.Retrieval.NONE, IntentTree.Role.OUT_OF_SCOPE, List.of(),
+                        List.of()),
                 new IntentTree.TopIntent("CLARIFY_TOP", "澄清", "d", "s",
-                        IntentTree.Retrieval.NONE, IntentTree.Role.CLARIFY, List.of())));
+                        IntentTree.Retrieval.NONE, IntentTree.Role.CLARIFY, List.of(),
+                        List.of())));
     }
 
     /** 切片 1~10 的类型：1-4 是 2，5-8 是 3，9 是 4，10 是 1。★ 手算得出的对照表 */
@@ -1142,7 +1148,8 @@ class EvalReportServiceTest {
                     new IntentTree.TopIntent("KB_TOP", "知识库类", "d", "s",
                             IntentTree.Retrieval.KB, IntentTree.Role.BUSINESS, List.of(
                             new IntentTree.Leaf("LEAF_UNSORTED", "倒序声明", "d", List.of(4, 2),
-                                    List.of(), null, IntentTree.StructuredFact.NONE)))));
+                                    List.of(), null, IntentTree.StructuredFact.NONE, List.of())),
+                            List.of())));
         }
 
         @SuppressWarnings("unchecked")

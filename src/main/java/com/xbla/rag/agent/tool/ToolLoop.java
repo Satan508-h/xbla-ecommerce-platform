@@ -16,8 +16,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * <b>模型 ⇄ 工具 的多轮往返</b> —— 阶段 5.8 的核心，也是「智能体」这三个字
@@ -97,8 +100,20 @@ import java.util.Map;
 @Component
 public class ToolLoop {
 
-    /** 单条工具结果进 Prompt 的字符上限 —— 见 {@link #toolResultText} */
-    private static final int MAX_TOOL_RESULT_CHARS = 4000;
+    /**
+     * 单条工具结果进 Prompt 的字符上限 —— 见 {@link #toolResultText}。
+     *
+     * <p>★★ <b>它是工具作者预算正文字数用的【契约】，不是可以随手调优的旋钮。</b>
+     * 每个工具类里都有一个「最坏情况下正文多少字」的算术，算的就是它。
+     * 改小它 = 让那些算术当场失效，而症状是末尾被静默截掉 ——
+     * 模型看到的是「前几个完整、后面的凭空消失」。
+     *
+     * <p>所以 {@code ToolResultBudgetTest} 会拿这个常量当上限，
+     * 对每个工具【按 schema 上限造的最坏数据】断言正文不超过它。
+     * 这个常量因此不能是 private —— 测试要读它，而不是抄一个字面量
+     * （抄字面量的话，把它调小到 2000 就没有任何东西会红）。
+     */
+    public static final int MAX_TOOL_RESULT_CHARS = 4000;
 
     private static final TypeReference<Map<String, Object>> ARGUMENTS_TYPE = new TypeReference<>() {
     };
@@ -107,6 +122,19 @@ public class ToolLoop {
     private final ChatModelRouter router;
     private final AgentProperties properties;
     private final ObjectMapper objectMapper;
+
+    /**
+     * 已经报过「意图树声明了服务端没有的工具」的工具名。
+     *
+     * <p>★ 这是本类唯一的可变状态，而它<b>不是业务状态</b>，只是一份日志去重表 ——
+     * 记的是「这条 WARN 我发过了」，丢了最多是重复几行日志。
+     * 所以它可以是单例字段：和 ADR-065 禁的那件事
+     * （把<b>身份</b>放进单例字段，于是 A 看到 B 的数据）性质完全不同。
+     *
+     * <p>用 {@code ConcurrentHashMap.newKeySet()}：本类会被多个请求线程并发调用。
+     * 元素个数上界 = 意图树声明过的工具名个数（个位数），不会无限增长。
+     */
+    private final Set<String> warnedMissingTools = ConcurrentHashMap.newKeySet();
 
     public ToolLoop(McpToolGateway gateway,
                     ChatModelRouter router,
@@ -137,9 +165,21 @@ public class ToolLoop {
      * @param userId       身份。★ <b>为 null 表示没有身份</b> ——
      *                     这时不调模型，直接回一句诚实的话。
      *                     见 {@link Result#toolsAvailable()}
+     * @param allowedTools ★ 阶段 9.3：<b>这一次允许模型调用的工具白名单</b>，
+     *                     来自 {@code RetrievalGate.Decision.tools()}（最终来自意图树）。
+     *                     ★ 它是<b>白名单不是建议</b>：本类只按它过滤，不重排、不放大。
+     *                     ⚠️ 调用方只在 {@code gate.hasTools()} 为真时才进这里，
+     *                     所以它正常不为空；真为空时本类退化成「不带工具问一轮」。
+     * @param kbContextPresent ★ 阶段 9.3：{@code systemPrompt} 里是不是<b>已经装了
+     *                     知识库切片</b>（= 这次是混合轮）。它只有一处用途：
+     *                     决定「工具不可用」时加不加 {@code unavailableNote}。
+     *                     理由见 {@link #run} 里那一处的注释 ——
+     *                     给一个手上已经有资料可读的模型塞一句「不要根据通用规则推测」，
+     *                     会把它唯一的素材也一起否掉。
      */
     public record Input(String systemPrompt, List<ChatRequest.Turn> history,
-                        String question, Long userId) {
+                        String question, Long userId,
+                        List<String> allowedTools, boolean kbContextPresent) {
     }
 
     /**
@@ -168,7 +208,12 @@ public class ToolLoop {
      * @param toolsAvailable ★ 这次问答<b>工具这条路是通的吗</b>。
      *                      false 时 {@code answer} 里那句「查不到」是
      *                      <b>我们的系统状态</b>导致的，不是工具查过之后说的。
-     *                      这个区分对阶段 7 的归因很重要
+     *                      这个区分对阶段 7 的归因很重要。
+     *                      ⚠️ 9.3 起它<b>不再等价于「这次没回答出东西」</b>：
+     *                      混合轮里工具挂了但知识库切片在，{@code answer}
+     *                      仍然可能是一份有依据的好回答。要判断
+     *                      「这次到底有没有数据」，看的是
+     *                      {@code calls} 和调用方的知识库切片，不是这一位
      */
     public record Result(String answer, List<CallRecord> calls, int rounds,
                          boolean toolsAvailable) {
@@ -194,8 +239,8 @@ public class ToolLoop {
      */
     public Result run(Input input, ModelCallTrace trace) {
 
-        // ── ① 拿到工具清单（或确认拿不到）──
-        Toolbox toolbox = resolveToolbox(input.userId());
+        // ── ① 拿到工具清单（或确认拿不到），并按这一次的白名单裁剪 ──
+        Toolbox toolbox = resolveToolbox(input.userId(), input.allowedTools());
 
         // ★ 没有身份：不调模型，直接回一句实话。
         //   理由见 AgentProperties.Tool.noIdentityText —— 用户没带身份头时，
@@ -215,9 +260,9 @@ public class ToolLoop {
         //   它进了模型请求的最前面，而 DeepSeek 的上下文缓存是前缀匹配。
         //   中间改一次，之后每一轮的输入都整段未命中（差 50 倍）。
         //   所以「工具不可用」这件事必须在【循环之前】就决定要不要加进 prompt
-        String systemPrompt = toolbox.available()
-                ? input.systemPrompt()
-                : input.systemPrompt() + "\n\n" + properties.getTool().getUnavailableNote();
+        String systemPrompt = needsUnavailableNote(toolbox, input)
+                ? input.systemPrompt() + "\n\n" + properties.getTool().getUnavailableNote()
+                : input.systemPrompt();
 
         List<CallRecord> calls = new ArrayList<>();
         String question = input.question();
@@ -229,8 +274,11 @@ public class ToolLoop {
         // ★ 循环的退出条件是「模型给了不带工具调用的回答」，不是轮次。
         //   轮次上限只限制【能带工具的轮数】—— 超过之后还有最后一轮（不带工具），
         //   保证一定有答案。见 AgentProperties.Tool.maxToolRounds
+        // ★ 判据是「这次手上有工具」而不是「服务端连得上」——
+        //   白名单过滤之后可能一个都不剩（意图树拼错了工具名），
+        //   那时带一个【空 tools 数组】去问模型没有意义，不如让它直接作答
         for (int round = 1; ; round++) {
-            boolean mayUseTools = round <= maxToolRounds && toolbox.available();
+            boolean mayUseTools = round <= maxToolRounds && !toolbox.specs().isEmpty();
             rounds = round;
 
             response = callModel(systemPrompt, working, question,
@@ -263,11 +311,36 @@ public class ToolLoop {
             question = null;
         }
 
-        log.info("工具往返结束 rounds={} 工具可用={} 调用 {} 次 {} answer={} 字",
-                rounds, toolbox.available(), calls.size(),
+        log.info("工具往返结束 rounds={} 工具可用={} 本次可用 {} 个 调用 {} 次 {} answer={} 字",
+                rounds, toolbox.available(), toolbox.specs().size(), calls.size(),
                 calls.isEmpty() ? "" : calls, textLength(response.content()));
 
         return new Result(response.content(), List.copyOf(calls), rounds, toolbox.available());
+    }
+
+    /**
+     * 「工具不可用」那段说明，这次该不该加。
+     *
+     * <p>★★ 判据是<b>「模型手上确实什么都没有」</b>，而不是「工具这条路断了」——
+     * 9.3 引入混合轮之后这两件事不再等价：
+     *
+     * <pre>
+     *   混合轮 + 工具挂了    知识库切片已经在 prompt 里  → 【不加】
+     *                       那段说明的最后一句是「绝对不要根据通用的售后规则
+     *                       去推测某笔具体订单的状态」。而这一次它唯一的素材
+     *                       【就是】通用规则 —— 加进去等于一边把资料递给它、
+     *                       一边叫它别用，症状是它反过来跟用户说「我查不到」
+     *   纯工具轮 + 工具挂了   什么都没有                   → 【加】 ✅ 这正是 ADR-044 那个坑
+     *   纯工具轮 + 白名单空   什么都没有                   → 【加】 同上
+     * </pre>
+     *
+     * <p>★ 第三条在 9.2 之前不存在，它是 9.3 新造出来的状态：
+     * 「服务端有工具，但白名单里的名字一个都没匹配上」（意图树拼错了）。
+     * 它的表现和「工具挂了」一模一样 —— 模型手上空空如也 ——
+     * 所以判据只能落在 {@code specs} 上，落在 {@code available} 上会漏掉它。
+     */
+    private static boolean needsUnavailableNote(Toolbox toolbox, Input input) {
+        return toolbox.specs().isEmpty() && !input.kbContextPresent();
     }
 
     // ============================================================
@@ -317,6 +390,34 @@ public class ToolLoop {
      * 比「让调用方处理异常」在这里更合适。见类注释第二节的表。
      */
     private ToolOutcome invoke(ToolCall call, long userId, Toolbox toolbox) {
+
+        // ── ⓪ 白名单：模型叫的这个工具，这一次是不是允许它调 ──
+        //
+        // ★★ 这不是多余的防御，而是那条不变式的【另一半】：
+        //    请求里那个 tools 数组只是「告诉模型有什么」——
+        //    服务端并不知道「这一次只允许这三个」，它只拒绝【不认识的名字】。
+        //    所以模型只要吐出一个【注册过、但不在白名单里】的名字，
+        //    那条调用就会被真的执行 ——
+        //    例如在「挑礼物」这一轮里叫 query_my_coupons / query_order_status
+        //    （这些名字好猜，而且它们拿的是这个用户的真实数据）。
+        //    结果是「按意图裁剪」在最后一步静默失效，而没有任何指标会红。
+        //
+        // ★ 它和 ADR-054 是同一个家族：身份不能被模型控制；
+        //   同理，**这一轮能碰哪些工具**是我们在服务端定的，不是模型说了算。
+        //   （意图树里那句话写的是「tools 只能缩小不能放大」——
+        //     没有这一道，它就只能靠模型的自觉。）
+        //
+        // ★ 处理方式是喂回一条【工具结果】，不抛异常、不让问答失败
+        //   （ADR-062）。isError 是 true：这个工具【没能】给出答案（ADR-056）。
+        if (!toolbox.allows(call.name())) {
+            log.warn("★ 模型调用了不在本次白名单里的工具 tool={} —— 已拒绝。本次可用：{}",
+                    call.name(), toolbox.allowedNames());
+            return ToolOutcome.failed(toolbox.available()
+                    ? "本轮不能调用 " + call.name() + "：这次问答里你可以用的工具只有 "
+                            + toolbox.allowedNames() + "。请只用这些，"
+                            + "或者直接用你已经拿到的信息回答用户。"
+                    : "实时查询服务当前不可用，这次没能查到数据。");
+        }
 
         // ── ① 参数：模型给的是一段 JSON 字符串，先解析 ──
         Map<String, Object> arguments;
@@ -424,7 +525,7 @@ public class ToolLoop {
      * 这次问答能用的工具。
      *
      * @param available true = 拉到清单了；false = 连不上或功能被关掉
-     * @param specs     工具清单。{@code available} 为 false 时是空列表
+     * @param specs     <b>按白名单裁剪后</b>的工具清单。{@code available} 为 false 时是空列表
      */
     private record Toolbox(boolean available, List<ToolSpec> specs) {
 
@@ -436,14 +537,29 @@ public class ToolLoop {
             return new Toolbox(false, List.of());
         }
 
-        /** 拉到了清单，但里面一个工具都没有 —— ★ 和「连不上」不是一回事 */
-        boolean isEmpty() {
-            return available && specs.isEmpty();
+        /**
+         * 模型叫的这个名字，在不在<b>这一次</b>的清单里。
+         *
+         * <p>★ 判据是 {@code specs}（裁剪【之后】的），不是服务端的清单 ——
+         * 那正是「按意图裁剪」这件事本身。见 {@link #invoke} 第 ⓪ 步。
+         */
+        boolean allows(String name) {
+            for (ToolSpec spec : specs) {
+                if (spec.name().equals(name)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** 给模型看的「你现在能用什么」 */
+        String allowedNames() {
+            return String.join("、", specs.stream().map(ToolSpec::name).toList());
         }
     }
 
     /**
-     * 拉工具清单。
+     * 拉工具清单，<b>并按这一次意图声明的白名单裁剪</b>。
      *
      * <p>★★ <b>连不上时返回 {@link Toolbox#unavailable()} 而不是抛异常。</b>
      * 这一步是整个类里最容易写错的地方：把它写成
@@ -454,23 +570,72 @@ public class ToolLoop {
      * <p>★ 另外注意：<b>它不区分「工具被配置关掉了」和「连不上」</b>。
      * 两者对模型的意义完全一样（「你现在没有工具可用」），
      * 所以合并成一种状态；区别只在日志里。
+     *
+     * <h2>★★★ 裁剪（阶段 9.3）：三种「空」必须分开读</h2>
+     *
+     * <p>加过滤之前，「工具清单是空的」只有一种成因；加了之后有三种，
+     * 而它们的处理方式完全不同：
+     *
+     * <pre>
+     *   ① 服务端一个工具都没注册        空【在过滤之前】→ 【部署问题】，WARN
+     *                                    （工具 Bean 没被扫到？）
+     *   ② 白名单是空的                  这一类意图就不调工具 → 正常态
+     *   ③ 白名单里的名字一个都没匹配上  意图树声明了服务端没有的工具 → 【配置错误】
+     * </pre>
+     *
+     * <p>不把 ① 和 ③ 从 ② 里拆出来，最常见的后果是<b>每一个 KB 轮都刷一条
+     * 误导性的「服务端没有任何工具」WARN</b>，把真正的部署问题淹掉 ——
+     * 那正是「静默失败」的反面：噪音把信号埋了。
+     *
+     * <p><b>①</b> 判在过滤之前（{@code serverList.isEmpty()}）。
+     * <p><b>③</b> 靠逐名比对，报 WARN。<b>每名字只报一次</b> ——
+     * 见 {@link #warnedMissingTools}：不这么做的话每个请求都刷一遍，
+     * 而这是个每请求都会走的路径。
+     * <p>★ ③ 这条 WARN 是本类唯一能发现「意图树拼错了工具名」的地方：
+     * 启动期的 {@code IntentToolBindingValidator} 拦得住第一次加载，
+     * 但意图树是<b>热加载</b>的 —— 改完 YAML 存盘就生效，不会再过那个校验。
+     *
+     * @param allowed 这一次允许的工具名。<b>只做过滤，不重排</b> ——
+     *                {@code registry} 已经按名字升序，重排会让 tools 数组的字节
+     *                在两次启动之间变化，而它是 prompt 前缀的一部分
      */
-    private Toolbox resolveToolbox(Long userId) {
+    private Toolbox resolveToolbox(Long userId, List<String> allowed) {
         if (userId == null) {
             return Toolbox.unavailable();
         }
         try {
-            List<ToolSpec> specs = gateway.listTools(userId);
-            if (specs.isEmpty()) {
-                // ★ 服务端连上了但一个工具都没注册 —— 这是个【部署问题】
-                //   （工具 Bean 没被扫描到？），值得一条 WARN。
-                //   而它就表现为「模型什么也查不到」，不主动报出来很难发现
+            List<ToolSpec> serverList = gateway.listTools(userId);
+
+            // ① 服务端连上了但一个工具都没注册 —— 【部署问题】，值得一条 WARN
+            if (serverList.isEmpty()) {
                 log.warn("MCP 服务端连上了但没有任何工具 —— 检查工具 Bean 是否被扫描到");
-                return Toolbox.of(specs);
+                return Toolbox.of(List.of());
             }
-            log.debug("拉到 MCP 工具 {} 个：{}",
-                    specs.size(), specs.stream().map(ToolSpec::name).toList());
-            return Toolbox.of(specs);
+
+            // ② / ③ 按白名单过滤。★ 保序（见 allowed 的说明）
+            Set<String> serverNames = new LinkedHashSet<>();
+            for (ToolSpec spec : serverList) {
+                serverNames.add(spec.name());
+            }
+            List<ToolSpec> picked = new ArrayList<>();
+            for (ToolSpec spec : serverList) {
+                if (allowed.contains(spec.name())) {
+                    picked.add(spec);
+                }
+            }
+            for (String name : allowed) {
+                if (serverNames.contains(name) || !warnedMissingTools.add(name)) {
+                    continue;
+                }
+                log.warn("★ 意图树声明了工具 {}，但服务端没有它 —— 本次用不上。"
+                                + "可能是拼写错误，也可能是那个工具没被 Spring 扫到。"
+                                + "服务端实际有：{}", name, serverNames);
+            }
+
+            log.debug("拉到 MCP 工具 {} 个，本次意图允许 {} 个，实际裁剪出 {} 个：{}",
+                    serverList.size(), allowed.size(), picked.size(),
+                    picked.stream().map(ToolSpec::name).toList());
+            return Toolbox.of(picked);
 
         } catch (McpGatewayException e) {
             // ★ 不抛。见方法注释

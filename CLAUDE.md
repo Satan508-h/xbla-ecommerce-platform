@@ -18,8 +18,10 @@
 **8.7（内网穿透）未做**（选型已定 cpolar，但**没有开** —— 开它 = 把服务暴露到公网，是外向动作）。
 ★ 测试数 824 → **860**。前端在 `frontend/`（Vue 3 + Vite + Element Plus），部署在 `deploy/`。
 
-★★ **阶段 9（Agentic RAG）进行中 —— 9.1 已完成并实测 ✅ 2026-09-25，测试数 860 → 870**。
-9.2~9.6（检索门控 / 工具扩容 / 多轮澄清 / 个性化 / 离线+在线指标）见 `docs/10`。
+★★ **阶段 9（Agentic RAG）进行中 —— 9.1 / 9.2 / 9.3 已完成并实测 ✅ 2026-09-25，
+测试数 860 → 870 → 915 → **999****。9.4~9.6（多轮澄清 / 个性化 / 离线+在线指标）见 `docs/10`。
+★ 工具从 3 个扩到 **6 个**，并且**按意图裁剪**（白名单，见下 §九）。
+★ 唯一一个**混合轮**叶子：`SCENARIO_PICK`（先检索、再给工具）。
 ★ 用户已拍板的边界：检索决策**复用分类那一次调用**（不新增往返）、个性化**从订单实时派生**、
 在线指标**前端埋点 + 事件表**、工具轮流式**先只做一次推完**。
 
@@ -178,7 +180,7 @@ python scripts/probe_stage8.py --url http://localhost -u xbla:<口令>
 # 前端（开发，5173，已配 /api 代理 → 8080）
 cd frontend && npm install && npm run dev
 
-# 跑测试（860 个）
+# 跑测试（999 个）
 # ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
 #   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
 #   ⚠️ 同一个坑 `./mvnw test-compile` 也有（见 docs/10 坑 12）。
@@ -230,6 +232,8 @@ curl -s "localhost:8080/api/debug/mcp/client?userId=8" | python -m json.tool  # 
 curl -s "localhost:8080/api/debug/mcp/qa-log?traceId=xxx" | python -m json.tool  # 看 tool_calls 落库没有
 # ★ 直调工具看它的返回原文（走完整 MCP 链路，和模型拿到的一模一样）——【不花钱】
 curl -s "localhost:8080/api/debug/mcp/call?tool=query_my_coupons&userId=8" | python -m json.tool
+#   ★ 9.3 的三个商品工具：search_products / compare_prices / recommend_products
+#     ⚠️ args 是一段 JSON，里面的中文必须先百分号编码（用 Python 做，见 §八）
 curl -s "localhost:8080/api/debug/agent/intent-tree" | python -m json.tool   # 看 structuredFactLeaves
 
 # ── 阶段 6：排队限流（★ 全部不花钱）──
@@ -372,7 +376,7 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
 - ⚠️ **`history.enabled` / `summary.enabled` 关掉时什么都不读**（不是「读了不拼」）——
   否则阶段 7 分不清「没开」和「开了但是空的」。
 
-### MCP（5.7 Server / 5.8 Client / 5.9 三个工具）
+### MCP（5.7 Server / 5.8 Client / 5.9 三个工具 / 9.3 扩到六个）
 
 - ★★ **身份只能来自 `McpToolContext`，不能是工具参数。** 工具参数是**模型填的** ——
   加一个 `user_id` 参数就是**模型可控的越权入口**，一段提示注入就够了。（ADR-054）
@@ -561,6 +565,41 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
   9.2 就栽在这：门控单测 34 项全绿，而 `retrievalTrace` 变成可空之后
   `retrievalTrace.summary()` 直接 NPE ——**每一句「你好」都会 500**。
   判据是 `verify(下游, never())` 这种对真实调用链的断言，不是「单测绿了」。（坑 35）
+
+### 工具绑定与混合轮（阶段 9.3）
+
+- ★★★ **白名单必须在 `ToolLoop`【服务端】强制** —— 请求里不提供 ≠ 调不到。
+  `invoke()` 第 ⓪ 步按 `Toolbox.allows()` 拦，拒绝做成**工具结果**（不抛异常）。
+  少了它，模型吐一个**注册过但不在白名单里**的名字（`query_my_coupons` 很好猜）
+  就会被**真的执行**并返回该用户的真实数据，而 `qa_log.tool_calls` 里
+  和正常调用长得一模一样。（ADR-093 / 坑 37）
+- ★★ **`tools:` 写在【分类落点】上**：`retrieval: TOOL` 写**顶层**、
+  `retrieval: KB` 写**叶子**（判据是 `classificationTargets()` 的粒度）。
+  写错位置 = 模型手上没有工具，而**没有任何东西会报错**。
+  三条硬校验在 `IntentToolBindingValidator`（`@PostConstruct`，启动即崩）——
+  ⚠️ 它必须用**本地注册表 Bean**，不能走 `gateway.listTools()`（启动期 Server 还没起）。
+- ★★★ **调用方判 `gate.hasTools()`，不要判 `path == TOOLS`** ——
+  混合轮的 `path` 是 `RETRIEVE` 而它同样要进工具循环，
+  判 `path` 会让混合轮**静默退化成纯 KB 问答**。（ADR-092/093）
+- ★★ **`ToolLoop.MAX_TOOL_RESULT_CHARS`（4000）是工具作者的【契约】，不是旋钮。**
+  新工具必须：声明条数上限常量 + 算最坏字数 + 进 `ToolResultBudgetTest`
+  （夹具**从 `information_schema` 读列宽**，抄字面量会静默失效）。
+  ★ **名字也要截断** —— 实测 `search_products` 最坏形状修前 **5734 字**。（ADR-095 / 坑 39）
+- ★★ **正文里的每个数字，要么确切、要么标明它是下界/样本**：
+  命中取满时报「共 N 个**以上**」（取的是 `limit+1` 条）、
+  同类目统计写「**取样** N 个在售商品」（样本有 200 上限）。
+  写成一个确切数 = 一句**关于平台的假话**，而模型会原样转述。（ADR-094 / 坑 38）
+- ★★ **三个商品工具各站一格，别合并**：`search_products` 只找候选
+  （**不排序**，正文自己说破顺序无含义）/ `compare_prices` 给同类目分布 /
+  `recommend_products` 是**唯一**负责排序的那个（理由写进正文）。
+  ⚠️ 前两个的「说破」句是**必需**的，删掉模型会把 id 升序当成「最相关」。（ADR-094）
+- ★★ **混合轮 = `retrieval_detail` ∧ `tool_calls` 两样都有**（`gate=KB` ∧ 工具非空）。
+  ⚠️ 它的 `references` **不是 null** —— `buildToolResponse` /
+  `buildStreamToolResponse` 是**两个独立方法**，补一处等于没补。（ADR-093 / 坑 40）
+- ⚠️ **`ToolField.Type.BOOLEAN` 已在 9.3 删掉**（枚举值在、工厂和 `McpArguments`
+  的读取器都不在，是个诱饵）—— 不要再加回来，除非同时补上那两样。
+- ⚠️ 新工具的集成测试要**用唯一的类目名** —— `MAX_CANDIDATES=200`
+  而种子数据正好 200 行，不这么做测试之间会互相看见。
 
 ### 代码风格（本项目强制）
 

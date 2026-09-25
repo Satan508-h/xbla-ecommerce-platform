@@ -77,6 +77,16 @@
 #                    （都不加 doc_type 过滤），所以它们能分开的
 #                    唯一理由就是这里
 #     retrieval    检索策略：KB 知识库 / TOOL 实时工具 / NONE 不检索
+#     tools        ★ 阶段 9.3 加。这一类允许模型调用的工具名白名单。
+#                  ⚠️ 它合法的位置只有一个：【分类的落点】。而落点由 retrieval 决定 ——
+#                     retrieval=TOOL  的分类落点是【顶层】→ tools 写在顶层
+#                     retrieval=KB    的分类落点是【叶子】→ tools 写在叶子
+#                     写在别的地方【启动即崩】，因为那一格永远读不到
+#                  ★ 它是白名单不是建议：ToolLoop 只按它过滤，不重排、不放大。
+#                  ★ 名字必须和注册表里的一致（IntentToolBindingValidator 启动期核对，
+#                     拼错会让那个工具静默地从白名单里消失）。
+#                  ★ KB 的叶子带了 tools = 【混合轮】：先检索知识库，
+#                     再让模型拿着切片去调工具。今天只有 SCENARIO_PICK 这么做。
 #     role         三种角色，互斥，默认 BUSINESS：
 #                    BUSINESS      业务意图。只有它计入「5 类」
 #                    OUT_OF_SCOPE  与业务完全无关（问候、闲聊）
@@ -176,6 +186,23 @@ intents:
         name: 按场景选购
         description: 问「某类人 / 某个用途适合买什么」，要的是选购建议和判断依据，不是某一款商品的参数。
         doc_types: [1]
+        # ★★ 阶段 9.3：全树唯一一个【混合轮】叶子。
+        #
+        #   它先照常检索知识库（导购指南「按使用场景选购」那三节），
+        #   再让模型拿着切片去调这三个工具。两类信息管的是不同的事：
+        #     知识库   「送长辈一般看什么」—— 通用建议，语料里有
+        #     工具     「现在有哪几款、各多少钱」—— 实时数据，语料里没有
+        #   而用户问「这个适合送长辈吗」时，两件事他都要。
+        #
+        #   ★ 为什么只开这一个叶子：混合轮的代价是每轮多一次工具往返，
+        #     而且 prompt 里同时有切片和工具，判断难度更高。
+        #     先在一个叶子上把它跑通、量出代价，再谈要不要铺开。
+        #
+        #   ★ 三个工具各站一格，别把它们当同一件事：
+        #     search_products    找候选（不排序，正文里说破顺序无含义）
+        #     compare_prices     看价格贵不贵（给的是同类目分布，不是推荐）
+        #     recommend_products 排序推荐（唯一负责排序的那个，理由写进正文）
+        tools: [search_products, compare_prices, recommend_products]
         note: 商品导购指南「一、按使用场景选购」的三个小节直接对应这里的三种问法。
         examples:
           - 这个适合送长辈吗
@@ -426,6 +453,17 @@ intents:
         - 问「库存不足会怎样」这种规则 → 那是售后服务
     answer_style: 只陈述查到的实时数据；查不到就如实说明查不到，不要用知识库里的通用规则替代。
     retrieval: TOOL
+    # ★★ 阶段 9.3：TOOL 类意图的工具白名单，写在【顶层】——
+    #   因为这一类的分类落点是顶层码（classificationTargets 对非 KB 意图
+    #   不展开 children），写在叶子上永远读不到。
+    #
+    #   ⚠️ 这一行必须显式列出全部三个。不写的话，注册表从 3 个变 6 个之后
+    #      它会拿到【全部六个】，模型可能在订单题上调 search_products ——
+    #      而那不是报错，是一份看起来合理的跑题回答。
+    #
+    #   ★ 加载期两条硬校验：retrieval=TOOL 却没有 tools → 启动即崩；
+    #     工具名不在注册表里 → IntentToolBindingValidator 启动即崩。
+    tools: [query_inventory, query_my_coupons, query_order_status]
     children:
       - code: ORDER_STATUS
         name: 订单状态

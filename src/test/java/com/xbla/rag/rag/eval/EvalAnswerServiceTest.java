@@ -51,17 +51,25 @@ class EvalAnswerServiceTest {
                 new IntentTree.TopIntent("KB_TOP", "知识库类", "d", "s",
                         IntentTree.Retrieval.KB, IntentTree.Role.BUSINESS, List.of(
                         new IntentTree.Leaf("LEAF_A", "叶子A", "d", List.of(2, 4),
-                                List.of(), null, IntentTree.StructuredFact.NONE),
+                                List.of(), null, IntentTree.StructuredFact.NONE, List.of()),
                         new IntentTree.Leaf("FACTS_LEAF", "带硬数据的叶子", "d", List.of(2),
-                                List.of(), null, IntentTree.StructuredFact.POLICY))),
+                                List.of(), null, IntentTree.StructuredFact.POLICY, List.of())),
+                        // ★ 9.3 起 tools 是 TopIntent / Leaf 的最后一个分量。
+                        //   这里一律传空 —— 本类测的是 prompt 组装，不涉及工具绑定；
+                        //   带工具的那些用例在 ToolLoopToolboxFilterTest 和
+                        //   RetrievalGateTest 里（那边才需要有非空的 whitelist）
+                        List.of()),
                 new IntentTree.TopIntent("TOOL_TOP", "工具类", "d", "s",
                         IntentTree.Retrieval.TOOL, IntentTree.Role.BUSINESS, List.of(
                         new IntentTree.Leaf("TOOL_LEAF", "工具叶子", "d", List.of(),
-                                List.of(), null, IntentTree.StructuredFact.NONE))),
+                                List.of(), null, IntentTree.StructuredFact.NONE, List.of())),
+                        List.of()),
                 new IntentTree.TopIntent("FALLBACK", "兜底", "d", "s",
-                        IntentTree.Retrieval.NONE, IntentTree.Role.OUT_OF_SCOPE, List.of()),
+                        IntentTree.Retrieval.NONE, IntentTree.Role.OUT_OF_SCOPE, List.of(),
+                        List.of()),
                 new IntentTree.TopIntent("CLARIFY_TOP", "澄清", "d", "s",
-                        IntentTree.Retrieval.NONE, IntentTree.Role.CLARIFY, List.of())));
+                        IntentTree.Retrieval.NONE, IntentTree.Role.CLARIFY, List.of(),
+                        List.of())));
     }
 
     private static final String FACTS = "【售后政策硬数据】\n手机：退货 7 天\n条件、流程和例外情况见知识库资料。";

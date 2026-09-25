@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -362,7 +363,7 @@ class ToolChatIntegrationTest {
     // ============================================================
 
     @Test
-    @DisplayName("⑥ ★ 模型编了一个不存在的工具名 → 服务端的原话喂回去 → 模型下一轮改对")
+    @DisplayName("⑥ ★ 模型编了一个不存在的工具名 → 一句点名的话喂回去 → 问答照常成功")
     void unknownToolIsFedBackNotThrown() throws Exception {
         classifyAsToolIntent();
 
@@ -387,8 +388,14 @@ class ToolChatIntegrationTest {
                 new ChatAskRequest(null, "我的订单到哪了", null), USER_ID);
 
         // ★ 关键：整次问答【成功了】。模型编错工具名是它的输出问题，
-        //   不是系统故障 —— 让它看到「未知的工具」然后自己纠正，
+        //   不是系统故障 —— 让它看到「这个工具不能用」然后自己纠正，
         //   比抛一个异常出来好得多（异常会让用户看到「服务内部错误」）
+        //
+        // ⚠️ 阶段 9.3 起，这句回话是【我们】给的（白名单那一关拦下的），
+        //    不是服务端给的：判据是「这个名字在不在本次白名单里」，
+        //    而 query_weather 连注册表都不在。两句话对模型的作用一样
+        //    （都点名了它错了、并且列出能用哪些），但来源不同 ——
+        //    服务端原话那条路现在由下面的 ⑨ 覆盖（白名单里的工具、参数不合 schema）
         assertThat(response.answer()).isNotBlank();
 
         QaLog log = qaLogOf(response.traceId());
@@ -429,6 +436,44 @@ class ToolChatIntegrationTest {
 
         assertThat(response.answer()).isNotBlank();
         assertThat(qaLogOf(response.traceId()).getStatus()).isEqualTo(QaLog.STATUS_SUCCESS);
+    }
+
+    @Test
+    @DisplayName("⑨ ★★ 白名单里【有】这个工具、但参数不合 schema → 服务端的原话喂回去")
+    void serverRejectionIsFedBackVerbatim() throws Exception {
+        classifyAsToolIntent();
+
+        AtomicInteger round = new AtomicInteger();
+        when(router.chat(any(), any())).thenAnswer(inv -> {
+            ModelCallTrace trace = inv.getArgument(1);
+            trace.succeeded(DESCRIPTOR, usage(100, 10), 5);
+            trace.cost(new BigDecimal("0.000100"));
+            if (round.incrementAndGet() == 1) {
+                // ★ 工具名合法、参数缺了必填的 order_no —— 这是模型最常见的错法
+                return new ChatResponse("", "tool_calls", usage(100, 10), DESCRIPTOR, 5,
+                        List.of(new ToolCall("call_00_missing", "query_order_status", "{}")),
+                        null);
+            }
+            return ChatResponse.text("请把订单号告诉我。", "stop",
+                    usage(100, 10), DESCRIPTOR, 5);
+        });
+
+        ChatAskResponse response = chatService.ask(
+                new ChatAskRequest(null, "我的订单到哪了", null), USER_ID);
+
+        assertThat(response.answer()).isNotBlank();
+        assertThat(qaLogOf(response.traceId()).getStatus()).isEqualTo(QaLog.STATUS_SUCCESS);
+
+        // ★★ 喂回去的必须是【服务端的原话】：
+        //    它点名了缺哪个参数，模型下一轮才知道要补什么。
+        //    换成一句我们自己编的「调用失败」，模型就只能瞎猜
+        ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(router, times(2)).chat(captor.capture(), any());
+        assertThat(captor.getAllValues().get(1).history())
+                .as("★ 第二跳的报文里应当带着服务端那句拒绝")
+                .anySatisfy(turn -> assertThat(turn.content())
+                        .contains("工具调用被服务端拒绝")
+                        .contains("order_no"));
     }
 
     @Test

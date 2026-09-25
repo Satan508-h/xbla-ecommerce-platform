@@ -488,9 +488,6 @@ public class ChatServiceImpl implements ChatService {
         //    ★ 它同时替代了 9.1 之前那个 isToolIntent —— 工具分支也是它的一种结论，
         //      所以这里【只算一次】，不是「先问一次要不要工具、再问一次要不要检索」。
         RetrievalGate.Decision gate = retrievalGate.decide(intent);
-        if (gate.shouldUseTools()) {
-            return answerWithTools(ctx, session, request, memory, intent, userId, startNanos);
-        }
 
         // ★ 检索插在【用户消息落库之后】。顺序是有意的：
         //   先落用户消息，检索失败时问题仍然在库里，评测数据是完整的。
@@ -508,6 +505,20 @@ public class ChatServiceImpl implements ChatService {
         List<RetrievedChunk> chunks = gate.shouldRetrieve()
                 ? retrieveSafely(request.question(), retrievalOptions(intent), retrievalTrace)
                 : List.of();
+
+        // ★★ 工具路的两个形态（阶段 9.3）：
+        //
+        //     纯工具轮   gate=TOOLS，没检索，chunks 是空列表
+        //     混合轮     gate=RETRIEVE 且这个叶子挂了工具，切片【已经检索好了】
+        //
+        //   ★ 判据是 gate.hasTools()，【不是】path == TOOLS。
+        //     判 path 会让混合轮静默走成纯知识库问答 —— 模型手上一件工具都没有，
+        //     而回答读起来完全正常，没有任何指标会红。
+        //   ★ 位置必须在检索【之后】：混合轮要把 chunks 一起带进 system prompt。
+        if (gate.hasTools()) {
+            return answerWithTools(ctx, session, request, memory, intent, userId,
+                    gate.tools(), retrievalTrace, chunks, startNanos);
+        }
 
         ModelCallTrace trace = new ModelCallTrace(traceId);
         ChatRequest modelRequest = ChatRequest.of(
@@ -588,33 +599,42 @@ public class ChatServiceImpl implements ChatService {
     private ChatAskResponse answerWithTools(CallContext ctx, ChatSession session,
                                             ChatAskRequest request, MemoryContext memory,
                                             IntentClassification intent, Long userId,
+                                            List<String> tools,
+                                            RetrievalTrace retrievalTrace,
+                                            List<RetrievedChunk> chunks,
                                             long startNanos) {
         String traceId = ctx.traceId();
 
         ModelCallTrace trace = new ModelCallTrace(traceId);
 
-        // ★ system prompt 和知识库路径用同一套组装逻辑，只是 chunks 为空。
-        //   RagPromptBuilder 在空上下文时不会写「以下是相关资料：（空）」，
-        //   而是换成一句「本次未检索到知识库内容」的说明 —— 对工具路径来说
-        //   这句话是对的：这次确实没检索，而且查到的实时数据会以
-        //   role=tool 消息的形式进来，不占 system 的位置
-        // ★ 结构化事实这里【固定传 EMPTY】而不是 structuredFactsSafely(intent)：
-        //   走工具这条路的意图检索都不检索，而加载期已经强制
-        //   「非 KB 的叶子不能声明 structured_facts」——
-        //   所以这里传 EMPTY 是【设计】，不是「恰好查不到」。
-        //   写成 structuredFactsSafely(intent) 也能跑，但那会让人以为
-        //   工具意图将来可能带上硬数据 —— 而那需要一个不存在的 prompt 组装时机
-        String systemPrompt = ragSystemPrompt(request.systemPrompt(), List.of(), memory,
-                StructuredFacts.EMPTY);
+        // ★ system prompt 和知识库路径用【同一套】组装逻辑。
+        //   ★ 9.3 起这不是「可以复用」而是「必须复用」：混合轮走的就是这条路，
+        //     而它手上确实有 chunks。纯工具轮传空列表，此时 RagPromptBuilder
+        //     不会写「以下是相关资料：（空）」，而是换成一句
+        //     「本次未检索到知识库内容」—— 对纯工具轮来说这句话是对的。
+        //
+        // ★★ 结构化事实传 structuredFactsSafely(intent)，【不再写死 EMPTY】。
+        //   9.2 之前这里写死 EMPTY，推理是「走这条路的意图都不检索，而加载期
+        //   强制非 KB 的叶子不能声明 structured_facts」。
+        //   9.3 加了混合轮之后那个推理断了：混合轮走的就是这条路，
+        //   而它的叶子【是】KB 叶子，合法地可以声明 structured_facts。
+        //   ★ 改回来不引入任何变化：TOOL 类意图传进来的是顶层码，
+        //     而 structuredFactOf 只查叶子 —— 返回 NONE。
+        //     也就是纯工具轮的结果和写死 EMPTY 逐字相同。
+        //     那条不变式现在由【意图树】保证，不再由这一行代码保证 ——
+        //     这正是它该待的地方。
+        String systemPrompt = ragSystemPrompt(request.systemPrompt(), chunks, memory,
+                structuredFactsSafely(intent));
 
         try {
             ToolLoop.Result result = toolLoop.run(
-                    new ToolLoop.Input(systemPrompt, memory.history(),
-                            request.question(), userId),
+                    new ToolLoop.Input(systemPrompt, memory.history(), request.question(),
+                            userId, tools, !chunks.isEmpty()),
                     trace);
 
             saveAssistantToolAnswer(session.getId(), result, intent);
-            saveQaLogTool(ctx, session, request.question(), trace, result, startNanos, intent);
+            saveQaLogTool(ctx, session, request.question(), trace, result,
+                    retrievalTrace, chunks, startNanos, intent);
             touchSession(session);
 
             // ★ 5.6 的摘要压缩照常触发 —— 工具回答也是会话的一部分，
@@ -622,14 +642,18 @@ public class ChatServiceImpl implements ChatService {
             //   ⚠️ 和知识库路径一样，必须放在助手消息落库【之后】
             sessionSummarizer.maybeSummarizeAsync(session.getId());
 
-            log.info("工具问答完成 {} | {} 轮 | 调用 {} 次 | intent={}",
-                    trace.summary(), result.rounds(), result.calls().size(), intentCode(intent));
+            log.info("工具问答完成 {} | {} 轮 | 调用 {} 次 | 本次可用工具 {} 个 | intent={}",
+                    trace.summary(), result.rounds(), result.calls().size(),
+                    tools.size(), intentCode(intent));
 
-            return buildToolResponse(traceId, session, trace, result, startNanos, intent);
+            return buildToolResponse(traceId, session, trace, result, chunks, startNanos, intent);
 
         } catch (Exception e) {
-            // ★ 只有模型链路失败才会到这里。检索那两列传 null —— 这条路径没检索过
-            saveQaLogFailure(ctx, session, request.question(), trace, null, null,
+            // ★ 只有模型链路失败才会到这里。
+            //   ★ 9.3：检索那两列【原样传下去】而不是写死 null —— 混合轮确实检索过，
+            //     写死 null 会让「这次到底有没有检索」在库里变成一句假话，
+            //     而那正是 9.2 那条一致性判据要读的两列
+            saveQaLogFailure(ctx, session, request.question(), trace, retrievalTrace, chunks,
                     e, startNanos, intent);
             touchSession(session);
             throw e;
@@ -683,13 +707,30 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 工具路径的 {@code qa_log}。
      *
-     * <p>和 {@link #saveQaLogSuccess} 的唯一区别是多填了一列
-     * {@code tool_calls}，以及检索那几列走 {@code null} 的既有语义。
+     * <p>和 {@link #saveQaLogSuccess} 的区别是它多填了一列 {@code tool_calls}。
+     *
+     * <p>★★ <b>检索那几列从 9.3 起【不再写死 null】。</b>
+     * 这条路径现在有两个形态，而它们在库里的形状<b>必须不同</b>：
+     *
+     * <pre>
+     *   纯工具轮  没检索过  → retrieval_detail IS NULL       （ADR-041 那条老语义）
+     *   混合轮    检索过    → retrieval_detail IS NOT NULL   ★ 9.3 新出现的形状
+     * </pre>
+     *
+     * <p>写死 null 会让混合轮在库里长得和纯工具轮一模一样 ——
+     * 「这次到底有没有检索」这句话就再也问不出来了，
+     * 而它正是 9.2 那条一致性判据（{@code retrieve=false ∧ retrieval_detail
+     * IS NOT NULL 必须为 0}）要读的列。
+     *
+     * <p>★ 于是混合轮在库里是<b>第一行同时有检索字段和 tool_calls 的数据</b>。
+     * 这不是巧合，是它的定义。
      */
     private void saveQaLogTool(CallContext ctx, ChatSession session, String question,
                                ModelCallTrace trace, ToolLoop.Result result,
+                               RetrievalTrace retrievalTrace, List<RetrievedChunk> chunks,
                                long startNanos, IntentClassification intent) {
-        QaLog log = baseLog(ctx, session, question, trace, null, null, startNanos, intent);
+        QaLog log = baseLog(ctx, session, question, trace, retrievalTrace, chunks,
+                startNanos, intent);
         log.setFinalAnswer(result.answer());
         log.setToolCalls(serializeToolCalls(result));
         log.setStatus(QaLog.STATUS_SUCCESS);
@@ -737,6 +778,7 @@ public class ChatServiceImpl implements ChatService {
      */
     private ChatAskResponse buildToolResponse(String traceId, ChatSession session,
                                               ModelCallTrace trace, ToolLoop.Result result,
+                                              List<RetrievedChunk> chunks,
                                               long startNanos, IntentClassification intent) {
         ChatResponse response = asResponse(result.answer(), trace);
         var route = trace.route();
@@ -752,7 +794,14 @@ public class ChatServiceImpl implements ChatService {
                 elapsedMs(startNanos),
                 trace.degraded(),
                 trace.events(),
-                null,                       // references —— 没检索
+                // ★★ 阶段 9.3：这里原来写死 null（「工具轮没检索」）——
+                //   那个推理在【混合轮】上断了：混合轮真的检索过，
+                //   而且模型会照着 prompt 里的编号在正文里写 [1][2]。
+                //   写死 null 的话，前端「引用」那一栏是空的，
+                //   而回答里却挂着指向不存在的编号。
+                //   ★ 纯工具轮传进来的是空列表 → buildReferences 返回 null，
+                //     和以前【逐字相同】，没有回归
+                buildReferences(chunks),
                 intentCode(intent));
     }
 
@@ -781,22 +830,28 @@ public class ChatServiceImpl implements ChatService {
     private void answerStreamWithTools(CallContext ctx, ChatSession session,
                                        ChatAskRequest request, MemoryContext memory,
                                        IntentClassification intent, Long userId,
+                                       List<String> tools,
+                                       RetrievalTrace retrievalTrace,
+                                       List<RetrievedChunk> chunks,
                                        ChatStreamSink sink, long startNanos) {
         String traceId = ctx.traceId();
         ModelCallTrace trace = new ModelCallTrace(traceId);
 
-        // ★ 同 answerWithTools：chunks 传空、结构化事实固定传 EMPTY
-        String systemPrompt = ragSystemPrompt(request.systemPrompt(), List.of(), memory,
-                StructuredFacts.EMPTY);
+        // ★ 和 answerWithTools 逐字同构，包括 chunks 和结构化事实的处理 ——
+        //   混合轮在流式路径上同样要看得见切片与硬数据。
+        //   ⚠️ 这两处是平行代码，本项目的教训是「只改了一条」编译能过、测试能绿
+        String systemPrompt = ragSystemPrompt(request.systemPrompt(), chunks, memory,
+                structuredFactsSafely(intent));
 
         try {
             ToolLoop.Result result = toolLoop.run(
-                    new ToolLoop.Input(systemPrompt, memory.history(),
-                            request.question(), userId),
+                    new ToolLoop.Input(systemPrompt, memory.history(), request.question(),
+                            userId, tools, !chunks.isEmpty()),
                     trace);
 
             saveAssistantToolAnswer(session.getId(), result, intent);
-            saveQaLogTool(ctx, session, request.question(), trace, result, startNanos, intent);
+            saveQaLogTool(ctx, session, request.question(), trace, result,
+                    retrievalTrace, chunks, startNanos, intent);
             touchSession(session);
 
             // ★ 正文一次推完。★ 空串也要推吗 —— 不。result.answer() 理论上不会是空
@@ -806,18 +861,20 @@ public class ChatServiceImpl implements ChatService {
                 sink.onDelta(result.answer());
             }
 
-            sink.onComplete(buildStreamToolResponse(traceId, session, trace, result,
+            sink.onComplete(buildStreamToolResponse(traceId, session, trace, result, chunks,
                     startNanos, intent));
 
             // ★ 同 askStream：压缩必须在助手消息落库【之后】
             sessionSummarizer.maybeSummarizeAsync(session.getId());
 
-            log.info("流式工具问答完成 {} | {} 轮 | 调用 {} 次 | intent={}",
-                    trace.summary(), result.rounds(), result.calls().size(), intentCode(intent));
+            log.info("流式工具问答完成 {} | {} 轮 | 调用 {} 次 | 本次可用工具 {} 个 | intent={}",
+                    trace.summary(), result.rounds(), result.calls().size(),
+                    tools.size(), intentCode(intent));
 
         } catch (Exception e) {
             // ★ 只有模型链路失败才会到这里（工具的任何失败都已被 ToolLoop 转成工具结果）
-            saveQaLogFailure(ctx, session, request.question(), trace, null, null,
+            //   ★ 检索那两列原样传下去 —— 同 answerWithTools，混合轮确实检索过
+            saveQaLogFailure(ctx, session, request.question(), trace, retrievalTrace, chunks,
                     e, startNanos, intent);
             touchSession(session);
             log.warn("流式工具问答失败 traceId={} : {}", traceId, e.getMessage());
@@ -852,6 +909,7 @@ public class ChatServiceImpl implements ChatService {
      */
     private ChatAskResponse buildStreamToolResponse(String traceId, ChatSession session,
                                                     ModelCallTrace trace, ToolLoop.Result result,
+                                                    List<RetrievedChunk> chunks,
                                                     long startNanos, IntentClassification intent) {
         ChatResponse response = asResponse(result.answer(), trace);
         var route = trace.route();
@@ -867,7 +925,8 @@ public class ChatServiceImpl implements ChatService {
                 elapsedMs(startNanos),
                 trace.degraded(),
                 trace.events(),
-                null,                       // references —— 没检索
+                // ★ 同 buildToolResponse：混合轮有引用，纯工具轮是 null
+                buildReferences(chunks),
                 intentCode(intent));
     }
 
@@ -946,10 +1005,6 @@ public class ChatServiceImpl implements ChatService {
         //   而前端只用流式 —— 所以线上从来没有一条工具问答走到过用户面前。
         // ★★ 检索门控（阶段 9.2）—— 与 ask() 同序、同判据，只算一次
         RetrievalGate.Decision gate = retrievalGate.decide(intent);
-        if (gate.shouldUseTools()) {
-            answerStreamWithTools(ctx, session, request, memory, intent, userId, sink, startNanos);
-            return;
-        }
 
         // ★★ 检索必须插在 sink.onStart 【之后】。
         //
@@ -971,6 +1026,15 @@ public class ChatServiceImpl implements ChatService {
         List<RetrievedChunk> chunks = gate.shouldRetrieve()
                 ? retrieveSafely(request.question(), retrievalOptions(intent), retrievalTrace)
                 : List.of();
+
+        // ★★ 工具路 —— 和 ask() 里那一份【逐字同构】，包括判据和位置。
+        //    ⚠️ 别在这里复现门控逻辑，也别改判据：两条流式/非流式路径
+        //    「只改了一条」是本项目反复出现的失败形态（ADR-047 / 9.1 / 坑 35）。
+        if (gate.hasTools()) {
+            answerStreamWithTools(ctx, session, request, memory, intent, userId,
+                    gate.tools(), retrievalTrace, chunks, sink, startNanos);
+            return;
+        }
 
         ModelCallTrace trace = new ModelCallTrace(traceId);
         ChatRequest modelRequest = ChatRequest.of(
@@ -1593,8 +1657,14 @@ public class ChatServiceImpl implements ChatService {
         return log;
     }
 
-    /** {@code intent_plan.v} 的当前值。模型那个 {@code v} 是它自己写的，这个是我们的 */
-    private static final int PLAN_VERSION = 1;
+    /**
+     * {@code intent_plan.v} 的当前值。模型那个 {@code v} 是它自己写的，这个是我们的。
+     *
+     * <p>★ 9.3 从 1 升到 2：多了一格 {@code tools}。
+     * v=1 的行有 6 格、v=2 的有 7 格 —— 下游脚本按 {@code v} 分派，
+     * 就不会在「某个键突然不存在」上栽跟头。
+     */
+    private static final int PLAN_VERSION = 2;
 
     /**
      * 把结构化计划序列化成 {@code intent_plan}（阶段 9.2）。
@@ -1619,6 +1689,12 @@ public class ChatServiceImpl implements ChatService {
      *           {@code NONE_INTENT} / {@code NONE_DISABLED} / {@code NO_CLASSIFY}</td>
      *       <td>谁下的决定。★ 没有它就无法把 {@code TOOL}（该走工具）和
      *           {@code PLAN_OFF}（模型主动关掉）分开 —— 两者都是「没检索」</td></tr>
+     *   <tr><td>{@code tools}</td><td>工具名数组（9.3 加）</td>
+     *       <td>★ 这一次<b>裁剪后</b>真正可用的工具，和 {@code retrieve} 一样是
+     *           <b>生效的结论</b>。没有它，「按意图裁剪到底生效没有」在库里
+     *           是一个答不出来的问题 —— 判据同 {@code shape}，
+     *           只是它拦的是另一种静默失败：白名单过滤写成恒等，
+     *           于是工具题一切照旧，而裁剪一次都没生效</td></tr>
      *   <tr><td>{@code missing}</td><td>槽位名数组</td>
      *       <td>9.4 做槽位填充的输入。★ 9.2 <b>只解析、只落库、不消费</b></td></tr>
      *   <tr><td>{@code shape}</td><td>{@code JSON} / {@code CODE} / {@code UNPARSED}</td>
@@ -1665,6 +1741,10 @@ public class ChatServiceImpl implements ChatService {
         row.put("intent", intent.code());
         row.put("retrieve", gate.shouldRetrieve());
         row.put("gate", gate.reason());
+        // ★ 9.3：裁剪后【真正可用】的工具。★ 和 retrieve 一样记的是门控的结论，
+        //   不是意图树的声明 —— 两者在 NO_CLASSIFY 上会不同（树里可能写着工具，
+        //   而分类都没成，门控给的是空清单），记声明会让那个区别看不出来
+        row.put("tools", gate.tools());
         row.put("missing", plan.missingSlots());
         row.put("shape", plan.shape().name());
 
