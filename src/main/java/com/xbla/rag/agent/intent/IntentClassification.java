@@ -39,6 +39,13 @@ import java.math.BigDecimal;
  * @param cost       本次调用的成本。拿不到用量时为 {@code null}（不估算）
  * @param latencyMs  分类耗时（含模型往返）。它是加在检索之前的用户可感延迟
  * @param error      失败原因。成功时为 {@code null}
+ * @param plan       <b>阶段 9.2</b>：同一次调用顺带产出的计划（要不要检索、缺哪些槽位）。
+ *                   <p>★ {@code null} 是<b>有意义的状态</b>，不是「忘了填」：
+ *                   它表示<b>这次分类没有产出计划</b> —— 测试直接构造的结果，
+ *                   或者分类整个失败了。此时检索门控退回「只看意图树」，
+ *                   也就是 9.2 之前的行为。
+ *                   <p>★★ 它<b>刻意不携带 intent</b>：意图码只有上面那个 {@code code} 一个出处。
+ *                   两个字段能各自构造 = 总有一天会不一致，而那种不一致是静默的。
  */
 public record IntentClassification(
         String code,
@@ -47,7 +54,28 @@ public record IntentClassification(
         ModelDescriptor descriptor,
         BigDecimal cost,
         long latencyMs,
-        String error) {
+        String error,
+        IntentPlan plan) {
+
+    /**
+     * <b>兼容构造器</b>（阶段 9.2）—— 不带计划的那种。
+     *
+     * <p>它存在的唯一理由是<b>改动的爆炸半径</b>：{@code IntentClassification}
+     * 在阶段 9.2 之前有 <b>16 个构造点</b>，绝大多数在测试里，
+     * 而它们<b>根本不关心计划</b>。
+     *
+     * <p>★ 有了它，那些点位一个字都不用改，{@code plan} 为 {@code null}
+     * （= 没有计划 = 门控只看意图树 = 9.2 之前的行为）。
+     *
+     * <p>⚠️ 不要因为「看起来更短」而把线上那条路也写成 7 参 ——
+     * {@code LlmIntentClassifier} 必须带上真实的计划，
+     * 否则门控永远收不到模型的意见，而表现是「什么都对，就是 retrieve 永远是 true」。
+     */
+    public IntentClassification(String code, Outcome outcome, String rawReply,
+                                ModelDescriptor descriptor, BigDecimal cost, long latencyMs,
+                                String error) {
+        this(code, outcome, rawReply, descriptor, cost, latencyMs, error, null);
+    }
 
     public enum Outcome {
         /** 拿到了合法 code */

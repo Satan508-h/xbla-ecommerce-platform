@@ -142,6 +142,15 @@ class IntentPromptBuilderTest {
     }
 
     private static IntentPromptBuilder builder(Path dir) throws IOException {
+        // 默认走阶段 9.2 的新契约（JSON 计划）
+        return builder(dir, true);
+    }
+
+    /**
+     * @param planEnabled ★ 阶段 9.2 的 A/B 开关。关掉时 prompt 必须与 9.2 之前
+     *                    <b>逐字节相同</b> —— 否则「关掉新契约」这个对照组就没意义了
+     */
+    private static IntentPromptBuilder builder(Path dir, boolean planEnabled) throws IOException {
         Path treeFile = dir.resolve("tree.yml");
         Files.writeString(treeFile, treeYaml(), StandardCharsets.UTF_8);
         Path sampleFile = dir.resolve("fewshot.yml");
@@ -149,9 +158,10 @@ class IntentPromptBuilderTest {
 
         AgentProperties properties = new AgentProperties();
         properties.getIntent().setFewShotPath(sampleFile.toString());
+        properties.getPlan().setEnabled(planEnabled);
 
         IntentTree tree = new IntentTree(treeFile);
-        return new IntentPromptBuilder(tree, new IntentFewShot(properties, tree));
+        return new IntentPromptBuilder(tree, new IntentFewShot(properties, tree), properties);
     }
 
     // ============================================================
@@ -198,10 +208,57 @@ class IntentPromptBuilderTest {
         }
 
         @Test
-        @DisplayName("输出要求里写明「只输出一个 code」")
-        void statesOutputFormat() throws IOException {
+        @DisplayName("★ 默认走新契约：输出要求里写明那四键 JSON 的格式")
+        void statesPlanFormat() throws IOException {
             String prompt = builder(tempDir).build();
-            assertThat(prompt).contains("只输出一个 code");
+
+            assertThat(prompt)
+                    .contains("只输出一行 JSON")
+                    .contains("\"intent\"")
+                    .contains("\"retrieve\"")
+                    .contains("\"missing\"")
+                    // ★ 示例里的 code 必须是占位符，不能是一个真的 code ——
+                    //   示例是 prompt 里最强的信号，写真的会诱导模型偏向那一类
+                    //   （同 IntentFewShot 存在的理由）
+                    .doesNotContain("\"intent\":\"LEAF_1\"");
+        }
+
+        /**
+         * ★★ 反对照 —— 这条是让上面那条有意义的那个。
+         *
+         * <p>只断言「新契约在」是不够的：一个把新旧两套要求<b>都</b>写进去的
+         * prompt 也能通过上面那条，而那种 prompt 会让模型无所适从
+         * （「到底输出 code 还是 JSON？」），症状是 shape 大量落到 CODE。
+         */
+        @Test
+        @DisplayName("★★ 关掉开关 → 回到老契约，且【不再】出现计划相关的字眼")
+        void disabledFallsBackToBareCode() throws IOException {
+            String prompt = builder(tempDir, false).build();
+
+            assertThat(prompt)
+                    .as("关掉时必须是 9.2 之前那份 prompt")
+                    .contains("只输出一个 code")
+                    .doesNotContain("retrieve")
+                    .doesNotContain("missing")
+                    .doesNotContain("JSON");
+        }
+
+        @Test
+        @DisplayName("★ 两个契约共用同一段边界规则（防的是两份措辞漂移）")
+        void boundaryRulesShared() throws IOException {
+            String on = builder(tempDir, true).build();
+            String off = builder(tempDir, false).build();
+
+            String boundary = "三个非业务选项的边界：";
+            assertThat(on).contains(boundary);
+            assertThat(off).contains(boundary);
+            // 两边的那一段必须一模一样 —— 否则两个实验组不止差一个变量
+            assertThat(segmentFrom(on, boundary)).isEqualTo(segmentFrom(off, boundary));
+        }
+
+        private static String segmentFrom(String text, String marker) {
+            int at = text.indexOf(marker);
+            return at < 0 ? null : text.substring(at);
         }
     }
 

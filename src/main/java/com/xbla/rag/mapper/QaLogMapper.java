@@ -101,6 +101,20 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
      * 拉出来逐个对照</b>，不要靠记忆 —— 两次都是「加新读取忘了加列」，
      * 而两次的症状都不指向这条查询。
      *
+     * <h3>★★ 阶段 9.2 加了 {@code intent_plan}（第三次的预防，不是第三次）</h3>
+     *
+     * <p>9.2 要给报告加「<b>检索决策准确率</b>」：这道题该不该检索、
+     * 实际检索了没有。前者只有 {@code intent_plan.retrieve} 说得清 ——
+     * 光看 {@code retrieval_detail IS NULL} 分不清
+     * 「模型主动关掉」和「这个意图本来就不检索」。
+     *
+     * <p>★ 所以这一列<b>必须在</b>这份清单里。漏了它的症状和上两次同型：
+     * 报告里那一格显示 <b>0 次「不该检索却检索了」</b> ——
+     * 而 0 是个看起来像好消息的数，没有任何东西会红。
+     *
+     * <p>⚠️ 另外注意：{@code tool_calls} <b>不在这份清单里</b>，这是刻意的 ——
+     * 报告目前不用它。哪天真要按「有没有调工具」切片，记得连它一起加。
+     *
      * @param runId 评测运行 ID（{@code qa_log.eval_run_id}）
      */
     @Select("""
@@ -109,7 +123,7 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
                    intent, intent_confidence, status, error_msg,
                    queue_ms, queue_position,
                    retrieval_latency_ms, rerank_latency_ms, llm_latency_ms, total_latency_ms,
-                   retrieval_detail, final_answer, "references",
+                   retrieval_detail, intent_plan, final_answer, "references",
                    provider, model, prompt_tokens, completion_tokens, total_tokens, cost,
                    created_at
             FROM qa_log

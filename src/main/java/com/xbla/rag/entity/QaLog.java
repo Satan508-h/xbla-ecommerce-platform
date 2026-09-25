@@ -123,6 +123,27 @@ public class QaLog {
     private String toolCalls;
 
     /**
+     * 结构化计划（阶段 9.2），JSONB 对象。
+     *
+     * <p>形状：{@code {"v":1,"intent":"SPEC_QUERY","retrieve":true,"gate":"KB",
+     * "missing":[],"shape":"JSON"}}
+     *
+     * <p>★★ <b>{@code NULL} 表示「这次分类没有产出计划」</b>（分类整个失败，
+     * 或测试直接构造的结果）—— 不是 {@code "{}"}。同 {@code tool_calls} 那条约定。
+     *
+     * <p>★ 为什么它不能塞进 {@code retrieval_detail}（那里本来是可以加法式扩展的，
+     * 见 ADR-082）：<b>{@code retrieval_detail} 在「没有检索」时是 NULL</b>，
+     * 而「决定不检索」恰恰是本阶段最需要记录的时刻 ——
+     * 写进去等于在最需要它的那条路上把它丢掉。
+     *
+     * <p>★★★ {@code shape} 是这一列里最重要的一格：它记录<b>模型有没有按新契约作答</b>。
+     * 详见 {@code IntentPlan.Shape} 的注释 ——
+     * 没有它，「prompt 改了但模型照旧吐裸码 → 门控一次都没生效」
+     * 这件事在数据上<b>完全看不出来</b>。
+     */
+    private String intentPlan;
+
+    /**
      * 排队等待毫秒数（阶段 6）。
      *
      * <p>★★ <b>{@code NULL} 表示「没排队」，不是 0。</b>

@@ -68,6 +68,19 @@ from collections import Counter
 # ★ Windows 上 Python 读服务端响应可能按 GBK 解码（CLAUDE.md 的坑 1）
 sys.stdout.reconfigure(encoding="utf-8")
 
+# ★★ 接入点默认 localhost:8080，但【可覆盖】（--base）。
+#
+#   为什么要有这个开关（2026-09-25 加的）：
+#     localhost:8080 是本地开发那条路的端口，而它**经常被一个别的实例占着**。
+#     没有开关时只有两个选择：杀掉那个实例，或者不测 ——
+#     而「杀掉一个不是自己起的进程」不该是一个测量脚本逼你做出来的决定。
+#
+#   ★ 同 probe_stage8.py 的 --url：验证脚本要能指向【任何一个】实例，
+#     包括起在另一个端口上的新版本（撞端口时最自然的做法）。
+#
+#   ⚠️ 它【不解决】「测到了旧进程」那个坑（docs/10 坑 36）——
+#      换端口只是让你能挑一个确定的实例，你仍然要自己确认那一版对不对。
+#      ★ 判据：先打一发 /api/debug/agent/intent-prompt，看头两行是不是你期望的文案。
 BASE = "http://localhost:8080"
 
 
@@ -111,12 +124,18 @@ def classify_safely(question):
 
 
 def main():
+    global BASE
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--set", required=True, help="question_set，如 baseline / stage7")
     ap.add_argument("--repeat", type=int, default=8,
                     help="每题重复次数。★ 默认 8 —— 3 次分辨不出「稳定」与「3:0 的假象」"
                          "（一道真实 70/30 的题有约 34%% 概率给出 3:0）。低于 8 会在结尾告警")
+    ap.add_argument("--base", default=BASE,
+                    help="接入点。★ 默认 %(default)s —— 8080 被别的实例占着时，"
+                         "把新实例起在别的端口再指过来。同 probe_stage8.py 的 --url")
     args = ap.parse_args()
+    BASE = args.base.rstrip("/")
 
     bank = post_reload()
     questions = [q for q in bank["questions"] if q["questionSet"] == args.set]

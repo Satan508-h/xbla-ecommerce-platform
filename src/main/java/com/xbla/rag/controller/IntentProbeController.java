@@ -2,9 +2,11 @@ package com.xbla.rag.controller;
 
 import com.xbla.rag.agent.intent.IntentClassification;
 import com.xbla.rag.agent.intent.IntentFewShot;
+import com.xbla.rag.agent.intent.IntentPlan;
 import com.xbla.rag.agent.intent.IntentPromptBuilder;
 import com.xbla.rag.agent.intent.IntentTree;
 import com.xbla.rag.agent.intent.LlmIntentClassifier;
+import com.xbla.rag.agent.intent.RetrievalGate;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -72,12 +74,23 @@ public class IntentProbeController {
     private final IntentPromptBuilder promptBuilder;
     private final LlmIntentClassifier classifier;
 
+    /**
+     * ★ 阶段 9.2：把门控的结论也报出来。
+     *
+     * <p>★ 用的是<b>线上那同一个 Bean</b>，不是探针里再实现一遍 ——
+     * 同 {@code RetrievalDetailBuilder} 那条纪律：调试看到的和线上跑的
+     * 必须是同一个函数，否则「探针说会检索」这件事不构成证据。
+     */
+    private final RetrievalGate retrievalGate;
+
     public IntentProbeController(IntentTree intentTree,
                                  IntentFewShot intentFewShot,
                                  IntentPromptBuilder promptBuilder,
-                                 LlmIntentClassifier classifier) {
+                                 LlmIntentClassifier classifier,
+                                 RetrievalGate retrievalGate) {
         this.intentTree = intentTree;
         this.intentFewShot = intentFewShot;
+        this.retrievalGate = retrievalGate;
         this.promptBuilder = promptBuilder;
         this.classifier = classifier;
     }
@@ -120,6 +133,28 @@ public class IntentProbeController {
         // （5.4 要拿它当 WHERE 条件），也是验证树有没有画对的地方
         if (result.isClassified()) {
             response.put("docTypes", intentTree.get().docTypesOf(result.code()));
+
+            // ★★ 阶段 9.2：把【计划】和【门控的结论】一起报出来。
+            //
+            //    没有这一段的话，排查「这次为什么没检索」只有两条路：
+            //    去读 qa_log（要真跑一次问答），或者去猜。
+            //    而 shape 这一格尤其需要在这里看得见 —— 它是
+            //    「模型有没有按新契约作答」的唯一判据，而契约没生效时
+            //    【没有任何别的东西会异常】。
+            IntentPlan plan = result.plan();
+            Map<String, Object> planView = new LinkedHashMap<>();
+            planView.put("shape", plan == null ? null : plan.shape().name());
+            planView.put("modelRetrieve", plan == null ? null : plan.retrieve());
+            planView.put("missing", plan == null ? List.of() : plan.missingSlots());
+            response.put("plan", planView);
+
+            RetrievalGate.Decision gate = retrievalGate.decide(result);
+            Map<String, Object> gateView = new LinkedHashMap<>();
+            gateView.put("path", gate.path().name());
+            gateView.put("reason", gate.reason());
+            gateView.put("willRetrieve", gate.shouldRetrieve());
+            gateView.put("willUseTools", gate.shouldUseTools());
+            response.put("gate", gateView);
         }
         return response;
     }

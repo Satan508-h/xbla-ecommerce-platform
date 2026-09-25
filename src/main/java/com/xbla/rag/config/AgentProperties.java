@@ -127,6 +127,64 @@ public class AgentProperties {
         private Double temperature = 0.0;
     }
 
+    /** 结构化计划（阶段 9.2）—— 分类那一次调用同时产出的几个决定 */
+    private Plan plan = new Plan();
+
+    /**
+     * 「分类同时产出计划」的几个旋钮（阶段 9.2）。
+     *
+     * <p>★★ <b>这一整块的默认值都是「新行为」，但每一个都能单独关掉回退到 9.2 之前。</b>
+     * 理由是这次改的是<b>分类 prompt 本身</b>，而 5.2 的意图准确率基线建立在那份 prompt 上 ——
+     * 「准确率掉了吗」「门控有效吗」是两个必须分开回答的问题，
+     * 所以要有能单独拨动的开关，而不是一个总开关。
+     */
+    @Data
+    public static class Plan {
+
+        /**
+         * 分类 prompt 要不要走<b>新的 JSON 契约</b>。
+         *
+         * <p>关掉时 prompt 与 9.2 之前<b>逐字节相同</b>（老的那句「只输出一个 code」），
+         * 解析器也只会走回退路径。这是量「新契约本身的代价」的旋钮：
+         * 准确率如果有变化，先看这里。
+         *
+         * <p>⚠️ 关掉之后 {@code qa_log.intent_plan.shape} 恒为 {@code CODE} ——
+         * 那正是判断「这个开关有没有生效」的判据。
+         */
+        private boolean enabled = true;
+
+        /**
+         * 允不允许<b>模型</b>把检索关掉（{@code retrieve=false}）。
+         *
+         * <p>这就是用户诉求里那句「Agent 先判断要不要检索」的本体。
+         * 关掉之后门控<b>只看意图树</b>（{@code retrieval} 字段），
+         * 于是可以干净地量出「模型关掉检索」这一笔账值不值。
+         *
+         * <p>★ 注意这个方向是<b>单向</b>的：模型只能把检索<b>关掉</b>，
+         * 不能把意图树声明为不检索的意图<b>打开</b>。反向的那条路在
+         * {@code RetrievalGate} 里被显式拒绝 —— 见 ADR-044
+         * （工具意图一旦退化成裸聊，模型会编一个订单状态出来）。
+         */
+        private boolean allowModelNoRetrieve = true;
+
+        /**
+         * {@code retrieval=NONE} 的意图要不要<b>真的</b>不检索。
+         *
+         * <p>★★ 这一条是本阶段顺带修掉的<b>已知不一致</b>：
+         * {@code OUT_OF_SCOPE} 在意图树里声明的是 {@code retrieval: NONE}，
+         * 而从阶段 5 到 9.1 代码里<b>从来没有实现过这个短路</b> ——
+         * 它一路走到全池召回，实测那 7 道兜底题<b>100% 过度检索</b>
+         * （见 {@code docs/05} §9.3 ⑩ 和 §9.4 ⑥，记了两个阶段）。
+         *
+         * <p>★ 留这个开关是为了把那笔账量出来：关掉它就回到那个不一致的状态，
+         * 于是「停止检索」省下了多少延迟、动没动回答质量，都能对得上。
+         *
+         * <p>⚠️ 关掉时 {@code qa_log.retrieval_detail} 又会变回「有内容」——
+         * 两种状态的差别就是「兜底题有没有在检索」，一眼可辨。
+         */
+        private boolean noneIntentSkipRetrieval = true;
+    }
+
     /** 工具调用（阶段 5.8） */
     private Tool tool = new Tool();
 

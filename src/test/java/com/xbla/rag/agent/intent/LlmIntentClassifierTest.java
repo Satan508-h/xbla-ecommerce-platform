@@ -1,5 +1,6 @@
 package com.xbla.rag.agent.intent;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xbla.rag.client.ChatModelRouter;
 import com.xbla.rag.client.ModelCallException;
 import com.xbla.rag.client.ModelCallTrace;
@@ -126,11 +127,13 @@ class LlmIntentClassifierTest {
 
         IntentTree tree = new IntentTree(treeFile);
         IntentPromptBuilder promptBuilder =
-                new IntentPromptBuilder(tree, new IntentFewShot(properties, tree));
+                new IntentPromptBuilder(tree, new IntentFewShot(properties, tree), properties);
         ChatModelRouter router = mock(ChatModelRouter.class);
 
         return new Fixture(
-                new LlmIntentClassifier(router, tree, promptBuilder, properties), router);
+                new LlmIntentClassifier(router, tree, promptBuilder, properties,
+                        new IntentReplyParser(new ObjectMapper())),
+                router);
     }
 
     private static ChatResponse reply(String content, String finishReason) {
@@ -182,7 +185,10 @@ class LlmIntentClassifierTest {
             ChatRequest sent = captor.getValue();
 
             assertThat(sent.userQuestion()).isEqualTo("退货要几天");
-            assertThat(sent.systemPrompt()).contains("LEAF_1").contains("只输出一个 code");
+            // ★ 这里只断言「用的确实是那份分类 prompt」，不断言它的格式要求 ——
+            //   格式是 9.2 的 A/B 变量（IntentPromptBuilderTest 专门管那一件事），
+            //   两边都断言会让「改格式」这个动作连红两个测试。
+            assertThat(sent.systemPrompt()).contains("LEAF_1").contains("## 候选意图");
             assertThat(sent.history()).isEmpty();
         }
 
@@ -338,15 +344,15 @@ class LlmIntentClassifierTest {
         @DisplayName("只做无害清洗：去围栏 / 取首行 / 去两端引号与尾标点 / 转大写")
         void stripsHarmlessWrappers() {
             // 每一条都只差一层包装，语义完全没变
-            assertThat(LlmIntentClassifier.normalize("LEAF_1")).isEqualTo("LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("  LEAF_1  ")).isEqualTo("LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("`LEAF_1`")).isEqualTo("LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("\"LEAF_1\"")).isEqualTo("LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("```\nLEAF_1\n```")).isEqualTo("LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("LEAF_1。")).isEqualTo("LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("leaf_1")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("LEAF_1")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("  LEAF_1  ")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("`LEAF_1`")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("\"LEAF_1\"")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("```\nLEAF_1\n```")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("LEAF_1。")).isEqualTo("LEAF_1");
+            assertThat(IntentReplyParser.normalize("leaf_1")).isEqualTo("LEAF_1");
             // 首行是答案，后面是解释 —— 取首行，丢弃其余
-            assertThat(LlmIntentClassifier.normalize("LEAF_1\n因为用户在问规格"))
+            assertThat(IntentReplyParser.normalize("LEAF_1\n因为用户在问规格"))
                     .isEqualTo("LEAF_1");
         }
 
@@ -355,16 +361,16 @@ class LlmIntentClassifierTest {
         void doesNotTouchInnerText() {
             // 中间带标点/空格说明这多半不是我们要的格式，应当原样报出去，
             // 由 Java 侧判定 UNKNOWN_CODE，而不是猜模型想说什么
-            assertThat(LlmIntentClassifier.normalize("分类结果：LEAF_1"))
+            assertThat(IntentReplyParser.normalize("分类结果：LEAF_1"))
                     .isEqualTo("分类结果：LEAF_1");
-            assertThat(LlmIntentClassifier.normalize("LEAF_1 或 LEAF_2"))
+            assertThat(IntentReplyParser.normalize("LEAF_1 或 LEAF_2"))
                     .isEqualTo("LEAF_1 或 LEAF_2");
         }
 
         @Test
         @DisplayName("null 返回 null（不抛）")
         void nullStaysNull() {
-            assertThat(LlmIntentClassifier.normalize(null)).isNull();
+            assertThat(IntentReplyParser.normalize(null)).isNull();
         }
 
         @Test
@@ -375,7 +381,7 @@ class LlmIntentClassifierTest {
 
             // 反证「清洗不是多此一举」：原始串查不到，清洗后能查到
             assertThat(tree.get().findTarget("```LEAF_1```")).isEmpty();
-            assertThat(tree.get().findTarget(LlmIntentClassifier.normalize("```LEAF_1```")))
+            assertThat(tree.get().findTarget(IntentReplyParser.normalize("```LEAF_1```")))
                     .isPresent();
         }
     }

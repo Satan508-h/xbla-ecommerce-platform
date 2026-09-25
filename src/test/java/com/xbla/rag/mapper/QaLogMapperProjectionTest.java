@@ -307,4 +307,63 @@ class QaLogMapperProjectionTest {
                             + "★ 注意它守的是【我们写的这一行】——真数据里它是全称成立的");
         }
     }
+
+    // ============================================================
+    // 四、★ 阶段 9.2：intent_plan（同一个坑的第三次预防）
+    // ============================================================
+
+    @Nested
+    @DisplayName("四、★ 阶段 9.2 的 intent_plan")
+    class IntentPlanColumn {
+
+        /**
+         * ★★ 这一条存在的理由，就是「同一个坑已经踩过两次」。
+         *
+         * <p>前两次（7.5 漏 {@code question}、7.6 漏两个 token 列）的症状都是
+         * <b>一个看起来合法的 0/null</b>，而且都不指向这条查询。
+         *
+         * <p>9.2 加「检索决策准确率」时，漏了这一列的后果是：
+         * 报告里那一格显示 <b>0 次「不该检索却检索了」</b> ——
+         * 一个看起来像好消息的数。
+         */
+        @Test
+        @DisplayName("★★ intent_plan 取得回来 —— 它是「检索决策准确率」的唯一数据源")
+        void intentPlanRoundTrip() {
+            QaLog row = new QaLog();
+            row.setTraceId("T-PROJ-" + System.nanoTime());
+            row.setQuestion("PROJ-" + SEQ.incrementAndGet());
+            row.setEvalRunId(RUN);
+            row.setEvalQuestionNo("P-" + SEQ.get());
+            row.setIntent("OUT_OF_SCOPE");
+            row.setIntentPlan("""
+                    {"v":1,"intent":"OUT_OF_SCOPE","retrieve":false,\
+                    "gate":"NONE_INTENT","missing":[],"shape":"JSON"}""");
+            qaLogMapper.insert(row);
+
+            QaLog back = qaLogMapper.selectByEvalRun(RUN).get(0);
+
+            assertNotNull(back.getIntentPlan(),
+                    "★★★ 读成 null 的话，报告侧算「检索决策准确率」时"
+                            + "每一行都会被 `!= null` 挡掉 —— 分子分母一起变 0，"
+                            + "而 0 次「不该检索却检索了」看起来是个好消息");
+            assertTrue(back.getIntentPlan().contains("NONE_INTENT"),
+                    "★ JSONB 往返会重排键、改空白，所以只能断言内容，不能断言文本");
+            assertTrue(back.getIntentPlan().contains("\"shape\""),
+                    "★★ shape 是「门控到底有没有生效」的唯一判据，它必须读得回来");
+        }
+
+        @Test
+        @DisplayName("★★ 反对照：没写 intent_plan 的行读回来是 null，不是 '{}'")
+        void absentPlanStaysNull() {
+            QaLog row = insertRow();
+
+            QaLog back = qaLogMapper.selectByEvalRun(RUN).stream()
+                    .filter(r -> r.getId().equals(row.getId()))
+                    .findFirst().orElseThrow();
+
+            assertNull(back.getIntentPlan(),
+                    "★ 「没发生」和「发生了但是空的」必须能区分开 —— "
+                            + "查询侧 `WHERE intent_plan IS NOT NULL` 靠的就是这一点");
+        }
+    }
 }

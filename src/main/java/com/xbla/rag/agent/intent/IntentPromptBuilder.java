@@ -1,5 +1,6 @@
 package com.xbla.rag.agent.intent;
 
+import com.xbla.rag.config.AgentProperties;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -41,10 +42,13 @@ public class IntentPromptBuilder {
 
     private final IntentTree intentTree;
     private final IntentFewShot fewShot;
+    private final AgentProperties properties;
 
-    public IntentPromptBuilder(IntentTree intentTree, IntentFewShot fewShot) {
+    public IntentPromptBuilder(IntentTree intentTree, IntentFewShot fewShot,
+                               AgentProperties properties) {
         this.intentTree = intentTree;
         this.fewShot = fewShot;
+        this.properties = properties;
     }
 
     /**
@@ -58,11 +62,16 @@ public class IntentPromptBuilder {
     public String build() {
         IntentTree.Tree tree = intentTree.get();
         IntentFewShot.Samples samples = fewShot.get();
+        // ★ 这个开关必须在【本方法内】读，而不是构造时读一次：
+        //   阶段 7 的 A/B 是靠改环境变量跑的，构造时缓存会让开关在某些路径上失效。
+        boolean planEnabled = properties.getPlan().isEnabled();
 
         StringBuilder sb = new StringBuilder(4096);
 
         sb.append("你是电商问答平台的意图分类器。\n")
-          .append("读用户的一句话，判断它属于下面哪一类，只输出一个 code。\n\n");
+          .append(planEnabled
+                  ? "读用户的一句话，判断它属于下面哪一类，并按指定的 JSON 格式输出。\n\n"
+                  : "读用户的一句话，判断它属于下面哪一类，只输出一个 code。\n\n");
 
         sb.append("## 候选意图\n\n");
 
@@ -87,36 +96,99 @@ public class IntentPromptBuilder {
             sb.append('\n');
         }
 
-        sb.append("## 输出要求\n")
-          .append("- 只输出一个 code，不要有任何其他文字、标点、引号或解释\n")
-          .append("- 必须是上面列出的 code 之一，不要自创\n")
+        sb.append("## 输出要求\n");
+        if (planEnabled) {
+            appendPlanContract(sb);
+        } else {
+            appendBareCodeContract(sb);
+        }
+        appendBoundaryRules(sb);
 
-          // ★ 下面这三条是本 prompt 最容易写错的地方，每一条都对应一次实测或一次事故：
-          //
-          //   ① NEEDS_CLARIFICATION 和 OUT_OF_SCOPE 的边界
-          //      —— 不写清的话，模型会把「那个怎么样」丢进 OUT_OF_SCOPE。
-          //         实测（2026-09-19）在没有 NEEDS_CLARIFICATION 这个选项时，
-          //         它对「那个怎么样」给出的正是一个【自信的】OUT_OF_SCOPE，
-          //         于是用户收到「我只处理商品导购与售后问题」——
-          //         而那句话明明就是在问商品。
-          //
-          //   ② 「拿不准 ≠ 信息不足」
-          //      —— 加了澄清选项之后最大的风险是模型【滥用】它：
-          //         把「退货要几天」这种正常问题也判成信息不足。
-          //         必须显式说明这两件事不是一回事。
-          //
-          //   ③ 「拿不准时选更接近的」
-          //      —— 不能因为分不清就反问用户。分类边界模糊是【我们的】问题，
-          //         不该拿去骚扰用户。这是 5.3 设计里被实测修正过的一条：
-          //         曾经以为「分类置信度低 → 澄清」，实测证明两者正交。
-          .append("- 三个非业务选项的边界：\n")
+        return sb.toString();
+    }
+
+    /**
+     * <b>老契约</b>：只输出一个 code。
+     *
+     * <p>★★ 这个分支在 {@code xbla.agent.plan.enabled=false} 时生效，而它的输出
+     * <b>必须与阶段 9.2 之前逐字节相同</b> —— 否则「关掉新契约」这个对照组的
+     * 意义就没了：你分不清准确率的变化是来自新契约，还是来自这一段的措辞改动。
+     * 所以下面两行是<b>原样搬过来</b>的，一个字都不要"顺手改改"。
+     */
+    private static void appendBareCodeContract(StringBuilder sb) {
+        sb.append("- 只输出一个 code，不要有任何其他文字、标点、引号或解释\n")
+          .append("- 必须是上面列出的 code 之一，不要自创\n");
+    }
+
+    /**
+     * <b>新契约</b>（阶段 9.2）：一行 JSON，四个键。
+     *
+     * <h3>★ 为什么是扁平的四键 JSON，而不是自定义的行协议</h3>
+     *
+     * <p>备选方案是 {@code CODE|retrieve=1|missing=a,b} 这种省 token 的私有格式。
+     * 选 JSON 是因为<b>失败可枚举</b>：缺键、多键、值类型不对，都能给出一句
+     * 可读的原因；而私有格式的失败长得都差不多。而且 JSON 走 Jackson，
+     * 和本项目「JSONB 一律 Jackson、绝不手拼」是同一条纪律。
+     *
+     * <p><b>为什么是一层扁平对象、不是嵌套的 {@code {"plan":{...}}}</b>：
+     * 多一层就多一个「多打了个花括号」的失败形态，而这一层的全部价值就是低失败率。
+     *
+     * <h3>★★ 示例里为什么写 {@code <某个 code>} 而不是一个真的 code</h3>
+     *
+     * <p>写一个真的 code 会<b>诱导模型偏向那一类</b> —— 示例在 prompt 里是最强的信号。
+     * 而 {@link IntentFewShot} 的整个存在理由就是「不能给模型看它待会儿要答的题」。
+     */
+    private static void appendPlanContract(StringBuilder sb) {
+        sb.append("- 只输出一行 JSON，不要代码块、不要解释、不要任何其他文字\n")
+          .append("- 格式（键的顺序固定，缺一不可）：\n")
+          .append("  {\"v\":1,\"intent\":\"<某个 code>\",\"retrieve\":true,\"missing\":[]}\n")
+          .append("- intent：必须是上面列出的 code 之一，不要自创\n")
+          .append("- retrieve：这句话【需不需要查平台资料】。\n")
+          .append("  只有当它完全不需要任何平台资料就能回答时（纯问候、纯感谢、\n")
+          .append("  对你上一轮反问的确认）才写 false。拿不准时一律写 true\n")
+          .append("- missing：要回答这句话还缺哪些信息，从下面几个里选，可以多选也可以是空：\n")
+          .append("  · purpose（用途或场景，比如送人还是自用）\n")
+          .append("  · budget（预算）\n")
+          .append("  · product（具体是哪一款）\n")
+          .append("  · category（品类）\n")
+          .append("  ★ 它只是一条记录，【不影响】intent 的选择，也不要因此去选\n")
+          .append("    NEEDS_CLARIFICATION —— 那个选项的判据见下面\n");
+    }
+
+    /**
+     * 两个契约<b>共用</b>的边界规则。
+     *
+     * <p>★ 下面这三条是本 prompt 最容易写错的地方，每一条都对应一次实测或一次事故：
+     *
+     * <pre>
+     *   ① NEEDS_CLARIFICATION 和 OUT_OF_SCOPE 的边界
+     *      —— 不写清的话，模型会把「那个怎么样」丢进 OUT_OF_SCOPE。
+     *         实测（2026-09-19）在没有 NEEDS_CLARIFICATION 这个选项时，
+     *         它对「那个怎么样」给出的正是一个【自信的】OUT_OF_SCOPE，
+     *         于是用户收到「我只处理商品导购与售后问题」——
+     *         而那句话明明就是在问商品。
+     *
+     *   ② 「拿不准 ≠ 信息不足」
+     *      —— 加了澄清选项之后最大的风险是模型【滥用】它：
+     *         把「退货要几天」这种正常问题也判成信息不足。
+     *         必须显式说明这两件事不是一回事。
+     *
+     *   ③ 「拿不准时选更接近的」
+     *      —— 不能因为分不清就反问用户。分类边界模糊是【我们的】问题，
+     *         不该拿去骚扰用户。这是 5.3 设计里被实测修正过的一条：
+     *         曾经以为「分类置信度低 → 澄清」，实测证明两者正交。
+     * </pre>
+     *
+     * <p>★ 放在共用方法里而不是各写一份：两份措辞一旦漂移，
+     * 两个实验组就不止差一个变量了，而那正好是本 builder 最忌讳的事。
+     */
+    private static void appendBoundaryRules(StringBuilder sb) {
+        sb.append("- 三个非业务选项的边界：\n")
           .append("  · NEEDS_CLARIFICATION：是本平台的业务，但这句话【单独拿出来】回答不了\n")
           .append("  · OUT_OF_SCOPE：与商品、促销、售后、订单【都无关】\n")
           .append("- ★ 在两个【业务类别】之间拿不准时，选更接近的那一个。\n")
           .append("  「拿不准」不是「信息不足」—— 后者说的是【这句话本身】缺东西，\n")
           .append("  不是「你分不清它属于哪一类」。分类边界模糊是我们该解决的问题，\n")
           .append("  不该拿去反问用户\n");
-
-        return sb.toString();
     }
 }

@@ -11,7 +11,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 
 /**
@@ -63,6 +62,11 @@ import java.util.UUID;
  *
  * <p>⚠️ 如果 20 题实测下来 {@code UNKNOWN_CODE} 的比例明显偏高，
  * 说明模型确实爱加包装，那时再加宽松解析 —— <b>由数据驱动，不靠预判</b>。
+ *
+ * <p>★ <b>阶段 9.2 起，上面这些清洗逻辑搬到了 {@link IntentReplyParser}</b>，
+ * 本类只负责「调模型 → 交给解析器 → 组装结果」。搬家的理由是：
+ * 解析现在要处理<b>两种</b>契约（JSON 计划 / 裸 code），
+ * 而「模型回复怎么解读」这件事只该有一个归属地。
  */
 @Component
 public class LlmIntentClassifier {
@@ -73,15 +77,18 @@ public class LlmIntentClassifier {
     private final IntentTree intentTree;
     private final IntentPromptBuilder promptBuilder;
     private final AgentProperties properties;
+    private final IntentReplyParser replyParser;
 
     public LlmIntentClassifier(ChatModelRouter router,
                                IntentTree intentTree,
                                IntentPromptBuilder promptBuilder,
-                               AgentProperties properties) {
+                               AgentProperties properties,
+                               IntentReplyParser replyParser) {
         this.router = router;
         this.intentTree = intentTree;
         this.promptBuilder = promptBuilder;
         this.properties = properties;
+        this.replyParser = replyParser;
     }
 
     /**
@@ -129,19 +136,29 @@ public class LlmIntentClassifier {
                         "模型返回空正文（finish_reason=" + response.finishReason() + "）");
             }
 
-            String candidate = normalize(response.content());
-            if (intentTree.get().findTarget(candidate).isEmpty()) {
-                log.warn("★ 意图分类失败：模型返回的不是合法 code。raw={}", abridge(response.content()));
+            IntentReplyParser.ParsedReply parsed =
+                    replyParser.parse(response.content(), intentTree.get());
+            if (!parsed.ok()) {
+                log.warn("★ 意图分类失败：{}。raw={}", parsed.note(), abridge(response.content()));
                 return new IntentClassification(null,
                         IntentClassification.Outcome.UNKNOWN_CODE,
                         response.content(), response.descriptor(), trace.cost(), latencyMs,
-                        "模型返回了非法的分类 code");
+                        parsed.note());
             }
 
-            IntentClassification result = new IntentClassification(candidate,
+            // ★★ 回退路径（模型没按新契约答、但答对了）—— 这一行是「新契约到底有没有生效」
+            //    的唯一线索。打在 WARN 而不是 DEBUG，是因为它一旦长期出现，
+            //    整个阶段 9.2 的门控就【一次都没生效】过，而那从任何指标上都看不出来。
+            if (parsed.note() != null) {
+                log.warn("★ 意图分类走了回退路径：{}（raw={}）",
+                        parsed.note(), abridge(response.content()));
+            }
+
+            IntentClassification result = new IntentClassification(parsed.code(),
                     IntentClassification.Outcome.CLASSIFIED,
-                    response.content(), response.descriptor(), trace.cost(), latencyMs, null);
-            log.debug("意图分类：{}", result.describe());
+                    response.content(), response.descriptor(), trace.cost(), latencyMs, null,
+                    parsed.plan());
+            log.debug("意图分类：{} | {}", result.describe(), parsed.plan().describe());
             return result;
 
         } catch (ModelCallException e) {
@@ -154,42 +171,6 @@ public class LlmIntentClassifier {
                     null, trace.route(), trace.cost(), latencyMs,
                     e.kind() + ": " + e.getMessage());
         }
-    }
-
-    /**
-     * 清洗模型返回，让它能被精确匹配。
-     *
-     * <p>只做<b>不改变语义</b>的处理，步骤和顺序都在下面写清楚了 ——
-     * 这是本类唯一一处「猜模型想说什么」的地方，所以要能逐行解释。
-     */
-    static String normalize(String reply) {
-        if (reply == null) {
-            return null;
-        }
-
-        // ① 去掉 Markdown 代码围栏。模型很爱把答案包在 ``` 里，
-        //    而围栏是格式噪声，去掉它不会改变模型想表达的东西
-        String text = reply.replace("```", "").trim();
-
-        // ② 取第一行非空。prompt 明确要求「只输出一个 code」，
-        //    所以答案一定在第一行；后面的内容无论是什么都是多余的
-        for (String line : text.split("\\R")) {
-            String candidate = line.trim();
-            if (!candidate.isEmpty()) {
-                text = candidate;
-                break;
-            }
-        }
-
-        // ③ 去掉两端的引号类和尾部标点。★ 都只动【两端】，
-        //    不碰中间 —— 中间出现标点说明这多半不是我们想要的格式，
-        //    那种情况应该走 UNKNOWN_CODE 把原话报出来
-        text = text.replaceAll("^[`'\"*\\s]+", "")
-                   .replaceAll("[`'\"*.。,，;；:：、\\s]+$", "");
-
-        // ④ 统一大写。意图码本身是大写下划线，模型偶尔会回小写，
-        //    这是纯粹的书写差异，不该算分类失败
-        return text.toUpperCase(Locale.ROOT);
     }
 
     private static String shortId() {

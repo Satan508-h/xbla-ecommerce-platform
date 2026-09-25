@@ -3,8 +3,10 @@ package com.xbla.rag.service.impl;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xbla.rag.agent.intent.ClarificationDecider;
 import com.xbla.rag.agent.intent.IntentClassification;
+import com.xbla.rag.agent.intent.IntentPlan;
 import com.xbla.rag.agent.intent.IntentTree;
 import com.xbla.rag.agent.intent.LlmIntentClassifier;
+import com.xbla.rag.agent.intent.RetrievalGate;
 import com.xbla.rag.agent.memory.ConversationMemory;
 import com.xbla.rag.agent.memory.MemoryContext;
 import com.xbla.rag.agent.memory.SessionSummarizer;
@@ -117,6 +119,16 @@ public class ChatServiceImpl implements ChatService {
     private final LlmIntentClassifier intentClassifier;
     private final ClarificationDecider clarificationDecider;
     private final AgentProperties agentProperties;
+
+    /**
+     * 检索门控（阶段 9.2）—— <b>「这一次要不要检索」的唯一判断点</b>。
+     *
+     * <p>★ 它同时接管了阶段 5.8 那个 {@code isToolIntent}：工具分支也是它的一种结论。
+     * 把两者合成一个的原因不是「少写一个方法」，是<b>它们本来就是同一个判断</b>
+     * （「这次的数据从哪来：知识库、实时工具、还是都不要」），
+     * 拆成两处会让「工具类意图要不要检索」这个问题有两个答案。
+     */
+    private final RetrievalGate retrievalGate;
 
     // ── 意图定向检索（阶段 5.4 新增）──
     private final IntentTree intentTree;
@@ -325,7 +337,7 @@ public class ChatServiceImpl implements ChatService {
      *
      * <p>「哪类问题需要政策硬数据」是<b>树里的声明</b>
      * （{@code structured_facts: POLICY}），不是 Java 该判断的事 ——
-     * 同 {@link #isToolIntent} 那条「不要把 YAML 里的知识挪进 Java」。
+     * 同 {@link RetrievalGate} 那条「不要把 YAML 里的知识挪进 Java」。
      *
      * <p>⚠️ 和 {@code retrieveSafely} / {@code classifySafely} 一样，
      * <b>这里也自己吞异常</b>。理由完全一样：查政策表失败混进外层那个
@@ -470,7 +482,13 @@ public class ChatServiceImpl implements ChatService {
         //   ⚠️ 只有 intent 分类成功、且它声明的 retrieval 是 TOOL 才走这里。
         //      分类失败/关闭时 retrievalOf 返回 null，走原来的检索路径 ——
         //      那等于阶段 5.7 之前的行为，不引入回归。
-        if (isToolIntent(intent)) {
+        // ★★ 检索门控（阶段 9.2）—— 判断收在 RetrievalGate 一处，这里只读结论。
+        //    见那个类的注释：它有【三条路】要用（ask / askStream / 调试探针），
+        //    而漏改一条的症状不是报错，是「那条路上的问题答得更差」。
+        //    ★ 它同时替代了 9.1 之前那个 isToolIntent —— 工具分支也是它的一种结论，
+        //      所以这里【只算一次】，不是「先问一次要不要工具、再问一次要不要检索」。
+        RetrievalGate.Decision gate = retrievalGate.decide(intent);
+        if (gate.shouldUseTools()) {
             return answerWithTools(ctx, session, request, memory, intent, userId, startNanos);
         }
 
@@ -480,9 +498,16 @@ public class ChatServiceImpl implements ChatService {
         //   注意这只是【声明】—— 要不要真的下推由 RetrievalPipeline 决定
         //   （池子太小它会拒绝、过滤后一无所获它会回落）。理由见那个类的注释第四节，
         //   核心是：调试探针和线上必须走同一套规则，所以判断只能有一处。
-        RetrievalTrace retrievalTrace = new RetrievalTrace(traceId);
-        List<RetrievedChunk> chunks = retrieveSafely(
-                request.question(), retrievalOptions(intent), retrievalTrace);
+        //
+        // ★★ 「不检索」的那条路（阶段 9.2）：retrievalTrace 保持 null、
+        //    chunks 用【空列表】。传 null 的 trace 会让 qa_log 那几个检索列
+        //    全写 NULL —— 那正是「检索确实没发生」的诚实表达（ADR-041）。
+        //    ⚠️ 千万不能传一个空的 RetrievalTrace：序列化出来和
+        //    「检索跑了但两路都没召回」逐字相同，而那两件事的排查方向完全相反。
+        RetrievalTrace retrievalTrace = gate.shouldRetrieve() ? new RetrievalTrace(traceId) : null;
+        List<RetrievedChunk> chunks = gate.shouldRetrieve()
+                ? retrieveSafely(request.question(), retrievalOptions(intent), retrievalTrace)
+                : List.of();
 
         ModelCallTrace trace = new ModelCallTrace(traceId);
         ChatRequest modelRequest = ChatRequest.of(
@@ -507,8 +532,8 @@ public class ChatServiceImpl implements ChatService {
 
             ChatAskResponse result = buildResponse(traceId, session, trace, response, chunks,
                     startNanos, intent);
-            log.info("问答完成 {} | {} | {}", trace.summary(), retrievalTrace.summary(),
-                    memory.summary());
+            log.info("问答完成 {} | {} | {}", trace.summary(),
+                    retrievalSummary(retrievalTrace, gate), memory.summary());
             return result;
 
         } catch (Exception e) {
@@ -525,29 +550,8 @@ public class ChatServiceImpl implements ChatService {
     }
 
     // ============================================================
-    // ★ 工具路径（阶段 5.8，只有非流式）
+    // ★ 工具路径（阶段 5.8；阶段 9.1 接进流式）
     // ============================================================
-
-    /**
-     * 这次该走工具吗 —— <b>纯查表，不含任何业务判断</b>。
-     *
-     * <p>★ 判据是意图树里声明的 {@code retrieval} 字段，不是 code 的字面量。
-     * 写 {@code "ORDER_LOGISTICS".equals(intent.code())} 也能跑，
-     * 但那把「订单物流这类问题该调工具」这条知识<b>从 YAML 挪进了 Java</b> ——
-     * 以后在意图树里加第四个工具类意图时，这里会被忘记改，
-     * 而症状是「新加的那类问题永远查不到实时数据」，
-     * 日志里一行异常都没有。
-     *
-     * <p>⚠️ 分类失败 / 关闭 / 模型编了个不存在的 code 时，
-     * {@code retrievalOf} 返回 {@code null}，这里返回 {@code false} ——
-     * 走原来的检索路径，等于 5.7 之前的行为，<b>不引入回归</b>。
-     */
-    private boolean isToolIntent(IntentClassification intent) {
-        if (intent == null || !intent.isClassified()) {
-            return false;
-        }
-        return intentTree.get().retrievalOf(intent.code()) == IntentTree.Retrieval.TOOL;
-    }
 
     /**
      * 工具路径（阶段 5.8）。
@@ -940,7 +944,9 @@ public class ChatServiceImpl implements ChatService {
         //   而 qa_log 里 intent=ORDER_STATUS、status=1，看起来完全正常。
         //   这是阶段 5.8 划下的边界（当时只把工具接进非流式），
         //   而前端只用流式 —— 所以线上从来没有一条工具问答走到过用户面前。
-        if (isToolIntent(intent)) {
+        // ★★ 检索门控（阶段 9.2）—— 与 ask() 同序、同判据，只算一次
+        RetrievalGate.Decision gate = retrievalGate.decide(intent);
+        if (gate.shouldUseTools()) {
             answerStreamWithTools(ctx, session, request, memory, intent, userId, sink, startNanos);
             return;
         }
@@ -958,9 +964,13 @@ public class ChatServiceImpl implements ChatService {
         //   注意这只是【声明】—— 要不要真的下推由 RetrievalPipeline 决定
         //   （池子太小它会拒绝、过滤后一无所获它会回落）。理由见那个类的注释第四节，
         //   核心是：调试探针和线上必须走同一套规则，所以判断只能有一处。
-        RetrievalTrace retrievalTrace = new RetrievalTrace(traceId);
-        List<RetrievedChunk> chunks = retrieveSafely(
-                request.question(), retrievalOptions(intent), retrievalTrace);
+        // ⚠️⚠️ 下面这一段和 ask() 里那一份是【平行代码】，而本项目的教训是
+        //    「只改了一条」编译能过、测试能绿（ADR-047；9.1 修的正是它的一个实例）。
+        //    防线是「判断收在 RetrievalGate 一处」—— 这里只读结论，不复现逻辑。
+        RetrievalTrace retrievalTrace = gate.shouldRetrieve() ? new RetrievalTrace(traceId) : null;
+        List<RetrievedChunk> chunks = gate.shouldRetrieve()
+                ? retrieveSafely(request.question(), retrievalOptions(intent), retrievalTrace)
+                : List.of();
 
         ModelCallTrace trace = new ModelCallTrace(traceId);
         ChatRequest modelRequest = ChatRequest.of(
@@ -1001,8 +1011,8 @@ public class ChatServiceImpl implements ChatService {
             //      但顺序表达了意图。
             sessionSummarizer.maybeSummarizeAsync(session.getId());
 
-            log.info("流式问答完成 {} | {} | {}", trace.summary(), retrievalTrace.summary(),
-                    memory.summary());
+            log.info("流式问答完成 {} | {} | {}", trace.summary(),
+                    retrievalSummary(retrievalTrace, gate), memory.summary());
 
         } catch (Exception e) {
             saveQaLogFailure(ctx, session, request.question(), trace, retrievalTrace,
@@ -1550,6 +1560,25 @@ public class ChatServiceImpl implements ChatService {
             log.setRewrittenQuestion(retrievalTrace.rewrittenQuestion());
         }
 
+        // ── ★★ 结构化计划（阶段 9.2 新增）──
+        //
+        // ★ 它和 queue_ms 是同一个理由：在【这一处】填，不在各条路径上填。
+        //   成功、失败、工具、澄清都从这里经过；写在别处的话，
+        //   每加一条路径就多一次「忘了填」的机会。
+        //
+        // ★★ 门控那两格（retrieve / gate）是【用同一个纯函数在这里再算一次】得到的，
+        //    不是从调用点传下来的。这么做有一个必须写下来的前提：
+        //    RetrievalGate.decide() 是【纯函数】—— 输入相同则输出逐字相同。
+        //    ⚠️ 如果将来给它加了缓存或状态，「再算一次」和「调用点那次」就可能不一致，
+        //       那时必须改成显式传参（会让 5 个落库方法一起编译不过，跑不掉的）。
+        //
+        // ★ 记的是【生效的结论】（gate 的输出），不是模型的原话。
+        //   两者的差别在工具意图上最明显：模型可能说 retrieve=true，
+        //   而工具意图根本不检索 —— 记原话会让「retrieve=true 却没检索」
+        //   看起来像 bug。★ 模型的原话在 shape/retrieve 的原始值里另有体现
+        //   （见 IntentPlan），而这里要的是「实际发生了什么」。
+        log.setIntentPlan(serializeIntentPlan(intent));
+
         // ── ★ 意图（阶段 5.3 新增）──
         //
         // ★★ 没开意图识别、或分类失败时，这一列写 NULL ——【不能】填
@@ -1562,6 +1591,91 @@ public class ChatServiceImpl implements ChatService {
         //    早晚会被当成阈值用。留着 NULL 比填一个反相关的值好。
         log.setIntent(intentCode(intent));
         return log;
+    }
+
+    /** {@code intent_plan.v} 的当前值。模型那个 {@code v} 是它自己写的，这个是我们的 */
+    private static final int PLAN_VERSION = 1;
+
+    /**
+     * 把结构化计划序列化成 {@code intent_plan}（阶段 9.2）。
+     *
+     * <p>形状固定六格：
+     *
+     * <pre>
+     *   {"v":1,"intent":"SPEC_QUERY","retrieve":true,"gate":"KB","missing":[],"shape":"JSON"}
+     * </pre>
+     *
+     * <table border="1">
+     *   <caption>每一格回答什么问题</caption>
+     *   <tr><th>格</th><th>取值</th><th>它回答的问题</th></tr>
+     *   <tr><td>{@code intent}</td><td>code</td>
+     *       <td>★ 冗余自 {@code qa_log.intent}，<b>故意冗余</b>：
+     *           这一列要能单独看懂，而分析时反复 JOIN 同一行的另一列没有意义</td></tr>
+     *   <tr><td>{@code retrieve}</td><td>true/false</td>
+     *       <td>★★ <b>生效的结论</b>（门控的输出），不是模型的原话。
+     *           工具意图上两者会不同（模型说 true，而工具意图不检索）——
+     *           记原话会让「retrieve=true 却没检索」看起来像 bug</td></tr>
+     *   <tr><td>{@code gate}</td><td>{@code KB} / {@code PLAN_OFF} / {@code TOOL} /
+     *           {@code NONE_INTENT} / {@code NONE_DISABLED} / {@code NO_CLASSIFY}</td>
+     *       <td>谁下的决定。★ 没有它就无法把 {@code TOOL}（该走工具）和
+     *           {@code PLAN_OFF}（模型主动关掉）分开 —— 两者都是「没检索」</td></tr>
+     *   <tr><td>{@code missing}</td><td>槽位名数组</td>
+     *       <td>9.4 做槽位填充的输入。★ 9.2 <b>只解析、只落库、不消费</b></td></tr>
+     *   <tr><td>{@code shape}</td><td>{@code JSON} / {@code CODE} / {@code UNPARSED}</td>
+     *       <td>★★★ <b>这一格是本阶段最重要的一格。</b>见下</td></tr>
+     * </table>
+     *
+     * <h3>★★★ 为什么 {@code shape} 是这一项最重要的一格</h3>
+     *
+     * <p>没有它，本阶段最可能发生的那种失败是<b>完全静默的</b>：
+     *
+     * <pre>
+     *   prompt 改成了「输出 JSON」，但模型照旧只吐一个裸 code
+     *   → 解析器走回退路径（IntentReplyParser 的 ② CODE）
+     *   → 一切看起来正常：分类照样成功、问答照样回答
+     *   → 而【门控一次都没生效过】
+     *   → 报告上所有旧指标一格不动，没有任何东西会红
+     * </pre>
+     *
+     * <p>★ {@code shape} 的分布一印出来，这件事当场可见：
+     * 正常的 {@code JSON} 占比应该接近 100%，掉下来就说明模型没跟上契约。
+     *
+     * <h3>★ 为什么返回 {@code null} 而不是 {@code "{}"}</h3>
+     *
+     * <p>同 {@code tool_calls} / {@code retrieval_detail} / {@code references} 那条
+     * 贯穿全文件的约定：<b>「没发生」和「发生了但是空的」必须能区分开</b>。
+     * 这里的「没发生」= 这次分类没有产出计划
+     * （分类整个失败，或者是测试直接构造的结果）。
+     */
+    private String serializeIntentPlan(IntentClassification intent) {
+        if (intent == null || !intent.isClassified()) {
+            return null;
+        }
+        IntentPlan plan = intent.plan();
+        if (plan == null) {
+            return null;
+        }
+
+        RetrievalGate.Decision gate = retrievalGate.decide(intent);
+
+        // ★ LinkedHashMap 而不是 Map.of：键序稳定，人能直接 diff 两次输出
+        //   （同 McpToolRegistry / ToolSpec 那条纪律，只是这里不进 prompt 前缀）
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("v", PLAN_VERSION);
+        row.put("intent", intent.code());
+        row.put("retrieve", gate.shouldRetrieve());
+        row.put("gate", gate.reason());
+        row.put("missing", plan.missingSlots());
+        row.put("shape", plan.shape().name());
+
+        try {
+            return objectMapper.writeValueAsString(row);
+        } catch (Exception e) {
+            // 同 serializeEvents / serializeToolCalls：序列化失败只记 ERROR，绝不抛 ——
+            // 「记录过程信息」失败不该让已经拿到的回答作废
+            log.error("intent_plan 序列化失败：{}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -1658,6 +1772,25 @@ public class ChatServiceImpl implements ChatService {
     /** 意图 code，没分类时为 {@code null}。★ 不填占位串，理由见 {@code ChatAskResponse.intent} */
     private static String intentCode(IntentClassification intent) {
         return intent == null ? null : intent.code();
+    }
+
+    /**
+     * 日志里那一段「检索」的摘要（阶段 9.2）。
+     *
+     * <p>★★ <b>它存在的理由是「不检索」成了一条正常路径。</b>
+     * 在此之前 {@code retrievalTrace} 只在澄清路径上是 null，而那条路
+     * 压根走不到这两行日志；9.2 之后「模型说不用检索」也会让它为 null，
+     * 于是 {@code retrievalTrace.summary()} 直接 NPE ——
+     * <b>每一句「你好」都会 500</b>。
+     *
+     * <p>★ 这是<b>集成测试抓到的</b>，纯函数的门控测试一个都抓不到：
+     * 它们证明了「判据是对的」，证不了「调用点用了它之后还活着」。
+     *
+     * <p>★ 没检索时用门控的 reason 顶替 —— 日志里仍然要能看出
+     * <b>为什么</b>没检索（是模型关的、还是这个意图本来就不检索）。
+     */
+    private static String retrievalSummary(RetrievalTrace trace, RetrievalGate.Decision gate) {
+        return trace != null ? trace.summary() : "未检索（" + gate.reason() + "）";
     }
 
     /**
