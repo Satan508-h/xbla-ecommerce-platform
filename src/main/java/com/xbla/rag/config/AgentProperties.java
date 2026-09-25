@@ -1,7 +1,11 @@
 package com.xbla.rag.config;
 
+import com.xbla.rag.agent.intent.ClarifySlots;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * 智能体层（阶段 5）配置，对应 {@code application.yml} 里的 {@code xbla.agent}。
@@ -183,6 +187,64 @@ public class AgentProperties {
          * 两种状态的差别就是「兜底题有没有在检索」，一眼可辨。
          */
         private boolean noneIntentSkipRetrieval = true;
+    }
+
+    /** 澄清槽位（阶段 9.4）—— 多轮澄清问哪一个、怎么问 */
+    private Slots slots = new Slots();
+
+    /**
+     * 澄清反问的<b>槽位</b>旋钮（阶段 9.4）。
+     *
+     * <p>★ 它要修的那个洞有实测数字：{@code docs/05} §9.5 ② ——
+     * <b>最自然的追问方式有约 2/3 被澄清闸门挡掉</b>
+     * （「那个怎么样」→ 反问 → 用户答「送长辈」→ 分类器只看到这三个字 → 再问一次）。
+     * 根因是 ADR-046：分类器的输入只有这一句话。
+     *
+     * <p>★★ 留下的这个开关不是装饰，它同时是<b>对照组</b>：
+     * 关掉之后<b>不写 {@code pending_clarify}、不注入分类 prompt、
+     * 反问文案回落到固定的 {@code clarify-text}</b> —— 也就是
+     * 分类 prompt 与 9.3 <b>逐字节相同</b>。
+     * 于是「多轮澄清到底有没有用」可以像 9.2 那样干净地对账。
+     */
+    @Data
+    public static class Slots {
+
+        /**
+         * 多轮澄清的总开关。
+         *
+         * <p>⚠️ 关掉时以上三件事<b>一起</b>停 —— 只关注入而不关写入的话，
+         * {@code chat_session.pending_clarify} 会攒下永远没人读的状态。
+         */
+        private boolean enabled = true;
+
+        /**
+         * 每个槽位的反问文案（槽位名 → 一句话）。
+         *
+         * <p>做成配置而不是常量，理由同 {@code Intent#clarifyText}：
+         * 它是<b>用户可见的文案</b>，那正是最该能改而不重新编译的东西。
+         *
+         * <p>★ <b>缺了某个槽位的模板不会出错</b>：回落到 {@code clarify-text}
+         * （那个固定的、把几个槽位一起问掉的版本）。
+         * ⇒ 所以这里允许只配一部分，也允许整块留空。
+         *
+         * <p>⚠️ 用 {@code LinkedHashMap} 而不是 {@code Map.of}：后者的迭代顺序
+         * 由 JDK 的 hash SALT 决定（<b>每次 JVM 启动都不一样</b>），
+         * 实测三个 JVM 三种顺序。本项目已经为这件事踩过两次（ADR-058 / 064）。
+         */
+        private Map<String, String> questions = defaultQuestions();
+
+        private static Map<String, String> defaultQuestions() {
+            Map<String, String> map = new LinkedHashMap<>();
+            map.put(ClarifySlots.PRODUCT,
+                    "你是想问哪款商品呢？说一下型号或者商品名就行。");
+            map.put(ClarifySlots.PURPOSE,
+                    "你买来主要是做什么用呢？比如送人、办公还是学习。");
+            map.put(ClarifySlots.CATEGORY,
+                    "你想看哪一类商品呢？比如手机、笔记本、平板。");
+            map.put(ClarifySlots.BUDGET,
+                    "你大概想花多少钱呢？说一下预算范围就行。");
+            return map;
+        }
     }
 
     /** 工具调用（阶段 5.8） */

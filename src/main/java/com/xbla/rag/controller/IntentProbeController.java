@@ -113,7 +113,10 @@ public class IntentProbeController {
      */
     @GetMapping("/classify")
     public Map<String, Object> classify(@RequestParam("q") String question) {
-        IntentClassification result = classifier.classify(question);
+        // ★ 探针用【不带上一轮澄清】的分类：它问的是「这句话单独看属于哪一类」，
+        //   而多轮恢复那条路要连着两轮才能构造出来 —— 那由
+        //   ClarifyResumeIntegrationTest 和活体验收覆盖，不在这里假装。
+        IntentClassification result = classifier.classify(question, null);
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("question", question);
@@ -174,7 +177,10 @@ public class IntentProbeController {
      */
     @GetMapping(value = "/intent-prompt", produces = "text/plain;charset=UTF-8")
     public String intentPrompt() {
-        return promptBuilder.build();
+        // ★ 同上：打的是【不带上轮澄清】的那一份，也就是 9.3 逐字节相同的那一份。
+        //   ★★ 「有没有上一轮澄清时，prompt 到底差哪几行」由
+        //      IntentPromptBuilderTest 断言（它比读输出更可靠）。
+        return promptBuilder.build(null);
     }
 
     /**

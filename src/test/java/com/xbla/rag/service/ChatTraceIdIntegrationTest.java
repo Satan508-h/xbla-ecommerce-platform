@@ -98,7 +98,7 @@ class ChatTraceIdIntegrationTest {
 
     @BeforeEach
     void stubEverything() {
-        when(intentClassifier.classify(anyString())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(anyString(), any())).thenReturn(new IntentClassification(
                 "RETURN_EXCHANGE", IntentClassification.Outcome.CLASSIFIED,
                 "RETURN_EXCHANGE", DESCRIPTOR, null, 10L, null));
         when(retrievalPipeline.retrieve(anyString(), any(), any())).thenReturn(List.of());
@@ -279,7 +279,7 @@ class ChatTraceIdIntegrationTest {
             String question = uniqueQuestion("退货要几天");
 
             chatService.ask(new ChatAskRequest(null, question, null), null,
-                    new CallContext(GIVEN, 1234, 7, null, null));
+                    new CallContext(GIVEN, 1234, 7, null, null, false));
 
             QaLog row = logOf(GIVEN);
             assertEquals(1234, row.getQueueMs(),
@@ -319,7 +319,7 @@ class ChatTraceIdIntegrationTest {
             CapturingSink sink = new CapturingSink();
 
             chatService.askStream(new ChatAskRequest(null, question, null), sink, null,
-                    new CallContext(GIVEN, 4321, 3, null, null));
+                    new CallContext(GIVEN, 4321, 3, null, null, false));
 
             QaLog row = logOf(GIVEN);
             assertEquals(4321, row.getQueueMs(),
@@ -333,12 +333,12 @@ class ChatTraceIdIntegrationTest {
         void clarificationAlsoCarriesQueueFields() {
             // 澄清是【短路】的：不检索、不调生成模型。但它照样是先排队、
             // 拿到名额、才进 ChatService 的 —— 所以排队时间是真花了的。
-            when(intentClassifier.classify(anyString())).thenReturn(new IntentClassification(
+            when(intentClassifier.classify(anyString(), any())).thenReturn(new IntentClassification(
                     "NEEDS_CLARIFICATION", IntentClassification.Outcome.CLASSIFIED,
                     "NEEDS_CLARIFICATION", DESCRIPTOR, null, 10L, "你到底想问哪款？"));
 
             chatService.ask(new ChatAskRequest(null, uniqueQuestion("那个怎么样"), null), null,
-                    new CallContext(GIVEN, 999, 2, null, null));
+                    new CallContext(GIVEN, 999, 2, null, null, false));
 
             QaLog row = logOf(GIVEN);
             assertEquals(QaLog.STATUS_CLARIFY, row.getStatus());

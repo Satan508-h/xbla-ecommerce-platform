@@ -109,7 +109,7 @@ class ChatHistoryIntegrationTest {
 
     /** 让分类器固定返回一个业务意图（不澄清、不过滤） */
     private void stubBusinessIntent() {
-        when(intentClassifier.classify(anyString())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(anyString(), any())).thenReturn(new IntentClassification(
                 "RETURN_EXCHANGE", IntentClassification.Outcome.CLASSIFIED,
                 "RETURN_EXCHANGE", DESCRIPTOR, null, 10L, null));
         when(router.chat(any(), any(ModelCallTrace.class)))
@@ -260,7 +260,7 @@ class ChatHistoryIntegrationTest {
     @Test
     @DisplayName("★ 澄清反问那一轮，下一轮看得到（它不是「没发生过」）")
     void clarificationTurnEntersHistory() {
-        when(intentClassifier.classify(anyString())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(anyString(), any())).thenReturn(new IntentClassification(
                 "NEEDS_CLARIFICATION", IntentClassification.Outcome.CLASSIFIED,
                 "NEEDS_CLARIFICATION", DESCRIPTOR, null, 10L, null));
         when(retrievalPipeline.retrieve(anyString(), any(), any())).thenReturn(List.of());

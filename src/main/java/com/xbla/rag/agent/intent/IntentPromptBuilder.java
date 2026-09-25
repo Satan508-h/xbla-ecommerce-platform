@@ -36,6 +36,13 @@ import java.util.List;
  * 不是「我分不清 AFTER_SALE 下面哪一类」——
  * 混起来之后，「模型没把握」和「问题确实无关」在数据上就分不开了，
  * 而 5.3 的澄清反问恰恰要靠「没把握」这个信号。
+ *
+ * <p><b>④ 上一轮的澄清只在【有】的时候出现（阶段 9.4）。</b>
+ *
+ * <p>它由 {@link #build(PendingClarify)} 的参数决定，<b>没有待澄清时产出的
+ * 字符串与 9.3 逐字节相同</b> —— 这正是「改了分类 prompt，但 5.2 的准确率基线
+ * 不用重测」的依据（那 20 道题都是单轮的，永远没有 pending）。
+ * ★ 所以那段插入<b>不能</b>写成「永远出现、内容为空」，那会让对照组凭空多一个变量。
  */
 @Component
 public class IntentPromptBuilder {
@@ -58,8 +65,19 @@ public class IntentPromptBuilder {
      * 输出要求。段与段的顺序<b>不要调整</b>：
      * 通用指令在前、具体素材在后，和阶段 4 的
      * {@code RagPromptBuilder} 是同一条理由（DeepSeek 的上下文缓存是前缀匹配）。
+     *
+     * <p>★★ <b>阶段 9.4 起多了一个可选的第四段</b>（{@link #appendResumeSection}）：
+     * 上一轮的反问还没被回答时，插入一小段结构化状态。
+     * 它插在<b>候选清单之后、输出要求之前</b> ——
+     * 素材挨着素材，而「只输出一行 JSON」那条契约仍然是最后一句
+     * （prompt 里最后的指令是模型最不容易忽略的）。
+     *
+     * @param pending ★ 上一轮悬着的反问；<b>{@code null} = 没有</b>（常态）。
+     *                ⚠️ <b>本方法刻意只有一个版本，没有 {@code build()} 重载</b> ——
+     *                加重载会让「忘了传」编译通过，而症状正是这次要修的那个
+     *                （恢复路径一次都不生效，而回答看起来完全正常）。同 ADR-091。
      */
-    public String build() {
+    public String build(PendingClarify pending) {
         IntentTree.Tree tree = intentTree.get();
         IntentFewShot.Samples samples = fewShot.get();
         // ★ 这个开关必须在【本方法内】读，而不是构造时读一次：
@@ -96,6 +114,14 @@ public class IntentPromptBuilder {
             sb.append('\n');
         }
 
+        // ★★ 开关在这里再判一次（而不是只信调用方）：
+        //   「关掉时 prompt 与 9.3 逐字节相同」这句话要由【产出 prompt 的这个地方】
+        //   保证，否则某天有人绕过调用方的判断传了 pending 进来，
+        //   对照组就悄悄多了一个变量，而两组的数据看起来都正常。
+        if (pending != null && properties.getSlots().isEnabled()) {
+            appendResumeSection(sb, pending);
+        }
+
         sb.append("## 输出要求\n");
         if (planEnabled) {
             appendPlanContract(sb);
@@ -105,6 +131,51 @@ public class IntentPromptBuilder {
         appendBoundaryRules(sb);
 
         return sb.toString();
+    }
+
+    /**
+     * <b>上一轮的反问</b>（阶段 9.4）—— 只在「刚问过、还没答」的那一轮出现。
+     *
+     * <h3>★★ 措辞是刻意写弱的</h3>
+     *
+     * <p>我们<b>不可能</b>在分类之前知道用户是不是在回答上一个问题 ——
+     * 他完全可能换了话题（「送长辈」之后突然问「退货要几天」）。
+     * 所以这一段不写「用户正在回答」，而写「<b>如果</b>是在回答…；
+     * 如果是在问别的，忽略这一段」——把判断权交给模型，它手上信息比我们多
+     * （它看得见这一句话本身）。
+     *
+     * <p>★ 两层缓解缺一不可：这一段的措辞 ＋ 状态的<b>一次性</b>生命周期
+     * （{@code pending_clarify} 读后即清，窗口只有一轮）。只有一层的话，
+     * 一个悬了很久的旧反问会在后续每一轮里误导分类。
+     *
+     * <h3>★ 为什么把「缺的是哪几项」和「实际问的是哪一项」都写上</h3>
+     *
+     * <p>两者会不同：缺三项时我们只问一项（{@link ClarifySlots} 的优先级）。
+     * 只写「缺三项」模型会以为用户在一次性回答三个问题；
+     * 只写「问的是 product」又丢了「本来还缺什么」这个背景。
+     */
+    private static void appendResumeSection(StringBuilder sb, PendingClarify pending) {
+        sb.append("## 上一轮的澄清（★ 只在这一轮出现）\n")
+          .append("- 用户上一轮问的是：「").append(oneLine(pending.question())).append("」\n")
+          .append("- 你当时判定这句话信息不足，缺的是：")
+          .append(pending.slots().isEmpty() ? "（未记录）" : String.join("、", pending.slots()))
+          .append('\n');
+        if (pending.asked() != null) {
+            sb.append("- 你实际反问他的是：").append(pending.asked()).append('\n');
+        }
+        sb.append("- ★ 如果现在这句话是在回答上面那个问题，就把它和上面那个问题"
+                        + "【合起来】判断 intent —— 例如回答「送长辈」时应当归到对应的"
+                        + "业务类别，而不是再判一次信息不足；已经补上的那一项不要再写进 missing\n")
+          .append("- ★ 如果这句话明显是在问别的事情、和上面无关，就忽略这一段，照常判断\n\n");
+    }
+
+    /** 注入的是用户原话，换行会把这一段的排版打乱 —— 压成一行再放进去 */
+    private static String oneLine(String text) {
+        if (text == null) {
+            return "";
+        }
+        String flat = text.replaceAll("\\s+", " ").trim();
+        return flat.length() > 100 ? flat.substring(0, 100) + "…" : flat;
     }
 
     /**

@@ -110,7 +110,7 @@ class StructuredFactsRoutingIntegrationTest {
     }
 
     private void classifyAs(String code) {
-        when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                 code, IntentClassification.Outcome.CLASSIFIED,
                 code, DESCRIPTOR, new BigDecimal("0.0001"), 5, null));
     }
@@ -178,7 +178,7 @@ class StructuredFactsRoutingIntegrationTest {
     @Test
     @DisplayName("★ 分类失败（模型编了个不存在的 code）→ 不注入，也不抛异常")
     void unclassifiedGetsNoFacts() {
-        when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                 "LEAF_THAT_DOES_NOT_EXIST", IntentClassification.Outcome.UNKNOWN_CODE,
                 "LEAF_THAT_DOES_NOT_EXIST", DESCRIPTOR, new BigDecimal("0.0001"), 5, null));
 

@@ -18,10 +18,12 @@
 **8.7（内网穿透）未做**（选型已定 cpolar，但**没有开** —— 开它 = 把服务暴露到公网，是外向动作）。
 ★ 测试数 824 → **860**。前端在 `frontend/`（Vue 3 + Vite + Element Plus），部署在 `deploy/`。
 
-★★ **阶段 9（Agentic RAG）进行中 —— 9.1 / 9.2 / 9.3 已完成并实测 ✅ 2026-09-25，
-测试数 860 → 870 → 915 → **999****。9.4~9.6（多轮澄清 / 个性化 / 离线+在线指标）见 `docs/10`。
+★★ **阶段 9（Agentic RAG）进行中 —— 9.1 / 9.2 / 9.3 / 9.4 已完成并实测 ✅ 2026-09-25，
+测试数 860 → 870 → 915 → 999 → **1049**。9.5~9.6（个性化 / 离线+在线指标）见 `docs/10`。
 ★ 工具从 3 个扩到 **6 个**，并且**按意图裁剪**（白名单，见下 §九）。
 ★ 唯一一个**混合轮**叶子：`SCENARIO_PICK`（先检索、再给工具）。
+★ 9.4 让澄清反问变成**多轮**：反问的槽位状态存一列、下一轮读出来拼进分类 prompt
+  （读后即清、只出现一轮）。实测「追问被挡回去」从 **2/3 掉到 0/3**（n=3）。
 ★ 用户已拍板的边界：检索决策**复用分类那一次调用**（不新增往返）、个性化**从订单实时派生**、
 在线指标**前端埋点 + 事件表**、工具轮流式**先只做一次推完**。
 
@@ -180,7 +182,7 @@ python scripts/probe_stage8.py --url http://localhost -u xbla:<口令>
 # 前端（开发，5173，已配 /api 代理 → 8080）
 cd frontend && npm install && npm run dev
 
-# 跑测试（999 个）
+# 跑测试（1049 个）
 # ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
 #   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
 #   ⚠️ 同一个坑 `./mvnw test-compile` 也有（见 docs/10 坑 12）。
@@ -224,6 +226,10 @@ curl -s -G localhost:8080/api/debug/llm/chat --data-urlencode "q=你好" \
 
 # ── 阶段 5.7：MCP ──
 python scripts/probe_mcp.py                          # ★ 完整握手 + 工具调用 + 越权，12 项判定
+python scripts/probe_clarify.py                      # ★★ 阶段 9.4：多轮澄清（会调模型，3 个场景）
+#   ★ 关掉开关跑同一个脚本就是 9.3 的样子（那是这个 A/B 的另一半）：
+#     XBLA_AGENT_SLOTS_ENABLED=false ./mvnw spring-boot:run
+#   ⚠️ /api/debug/agent/memory 里也能看到 pendingClarify（那一行是「下一轮会不会被注入」）
 curl -s localhost:8080/api/debug/mcp/tools | python -m json.tool   # 模型看到的工具清单
 
 # ── 阶段 5.8 / 5.9：MCP Client + 工具调用 + 结构化硬数据 ──
@@ -565,6 +571,35 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
   9.2 就栽在这：门控单测 34 项全绿，而 `retrievalTrace` 变成可空之后
   `retrievalTrace.summary()` 直接 NPE ——**每一句「你好」都会 500**。
   判据是 `verify(下游, never())` 这种对真实调用链的断言，不是「单测绿了」。（坑 35）
+
+### 多轮澄清（阶段 9.4）
+
+- ★★★ **待澄清状态【只进分类那一次调用】**（`chat_session.pending_clarify` → 分类 prompt）。
+  **不进生成、不进检索、不新增模型调用。** 与 ADR-046 的边界：那条禁的是
+  **自由文本历史**；这里是一小段**结构化状态**，且**只出现一轮**（读后即清）。（ADR-096）
+- ★★★ **注入是【条件式】的** —— 没有 pending 时分类 prompt 与 9.3 **逐字节相同**，
+  这就是「5.2 基线不用重测」的唯一依据。改动那一段时
+  `IntentPromptBuilderTest` 的「剪掉后逐字节相等」会拦住你。（ADR-096）
+- ★★★ **清空一列必须用 `lambdaUpdate().set(col, null)`，不能用 `updateById`** ——
+  MyBatis-Plus 的 `NOT_NULL` 策略会**静默跳过 null**，于是「清空」变成一次空更新，
+  状态永不清空、每一轮都注入那个旧反问。**不报错。**（坑 41）
+- ★★ **生命周期是「读后即清」**（不是「用完再清」）：后者要判「用上了没有」，
+  而那只在分类之后才知道 ⇒ 清空点散落在 5 个出口上，漏一处就是永久残留。（ADR-049/096）
+- ★★ **反问文案按缺的槽位选**（`xbla.agent.slots.questions.*`），
+  缺模板/缺 missing 就回落 `intent.clarify-text`。**不调模型生成反问。**
+  缺多个按 `product > purpose > category > budget` **只问一个**。
+- ★★ **槽位词表两个出处，一致性由测试钉住**：prompt（模型只从这里学）+
+  `ClarifySlots`（代码过滤）。★ **解析端刻意不过滤** ——
+  模型自创的槽位名要落进 `intent_plan.missing`，那是「它开始编槽位了」的信号。
+- ★★ **「关掉 = 与 9.3 逐字节相同」必须连 `intent_plan.resumed` 也成立** ——
+  只关注入不关标记的话，库里会出现「`resumed=true` 而 prompt 里没有那一段」的行，
+  而那一格的全部用途就是统计恢复路径触发了几次。
+- ★★ **匿名（无身份头）时混合轮不短路**：判据是「**手上有没有资料**」而不是
+  「有没有工具」。纯工具轮短路（查不出「他的」订单），
+  混合轮照常作答（切片已经在 prompt 里了）。★「这条路断了」≠「手上什么都没有」。（ADR-097）
+- ⚠️ `intent_plan` 的 `v` 现在是 **3**（8 格）。v=1 六格 / v=2 七格 —— 下游按 `v` 分派。
+- ⚠️ **改分类 prompt 就要问一句「这次是不是条件式的」**：条件式的（如 9.4）
+  不动基线；无条件的（如 9.2）基线当场作废。
 
 ### 工具绑定与混合轮（阶段 9.3）
 

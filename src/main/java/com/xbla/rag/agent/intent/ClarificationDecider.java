@@ -80,8 +80,36 @@ import java.util.List;
  * 但注释必须说实话，否则它就成了一个「看起来 5.5 会来接」的坑。
  *
  * <p>代价（明确记下来）：<b>「那个怎么样」在有上下文时仍然会触发澄清反问。</b>
- * 要修它得改分类器的输入，那是另一项工作。详见
- * {@code ConversationMemory} 类注释第一节。
+ * 详见 {@code ConversationMemory} 类注释第一节。
+ *
+ * <h2>四、★★ 阶段 9.4 还的这笔债：多轮澄清</h2>
+ *
+ * <p>上面那条代价的<b>实测数字</b>在 {@code docs/05} §9.5 ②：
+ * <b>最自然的追问方式有约 2/3 被澄清闸门挡掉</b> ——
+ *
+ * <pre>
+ *   用户：那个怎么样  → 「信息不足」→ 反问「你是想问哪款商品呢？」
+ *   用户：送长辈      → 分类器【只看到这三个字】→ 仍然是「信息不足」→ 再问一次
+ * </pre>
+ *
+ * <p>9.4 的修法是给分类<b>补一小段上下文</b>（{@link PendingClarify}），
+ * 而不是让它去读会话历史 —— 那两件事的边界见那个类的注释。
+ *
+ * <p>本类在其中的职责有两件（都在这一个方法里，因为它们是同一个判断的产物）：
+ *
+ * <ol>
+ *   <li>★ <b>按缺的槽位选反问文案</b>：模型说缺 {@code budget}，就不再问「哪款商品」。
+ *       文案在 {@code xbla.agent.slots.questions} 里配，缺了就回落到固定文案
+ *       （{@code xbla.agent.intent.clarify-text}，即 9.3 那一句）。</li>
+ *   <li>★ <b>产出下一轮要用的状态</b>（{@link Decision#pending()}）：
+ *       用户原本问的是什么、缺哪几项、我们实际问了哪一项。
+ *       ★ 它<b>只进分类 prompt</b>，不进生成、不进检索。</li>
+ * </ol>
+ *
+ * <p>⚠️ 一个刻意保留的边界：本类<b>仍然不消解指代</b>。
+ * 三参数 {@code decide(question, classification, history)} 那个历史参数
+ * <b>依然是恒空的</b>（第 三 节的结论没变），
+ * 9.4 补的上下文走的是分类器那一侧，不是这里。
  */
 @Component
 public class ClarificationDecider {
@@ -102,13 +130,24 @@ public class ClarificationDecider {
      * @param shouldClarify  true 时调用方应当<b>短路</b>：不检索、不调大模型，
      *                       直接把 {@code clarifyText} 回给用户
      * @param clarifyText    反问的话术。{@code shouldClarify} 为 false 时为 {@code null}
+     * @param pending        ★ 阶段 9.4：<b>要记进 {@code chat_session.pending_clarify}
+     *                       的状态</b>（「刚问了什么、缺哪一项」），供下一轮分类时
+     *                       看得见。{@code null} = 不记（槽位功能关着，或者不澄清）。
+     *                       <p>★ 它<b>由本类产出</b>而不是让调用方自己拼：槽位那一整套
+     *                      判断（词表过滤、优先级、开关）都在本类里，
+     *                       调用方只需要「拿到什么就存什么」
      * @param classification 原样带回来，方便调用方一次拿到全部信息
      */
-    public record Decision(boolean shouldClarify, String clarifyText,
+    public record Decision(boolean shouldClarify, String clarifyText, PendingClarify pending,
                            IntentClassification classification) {
 
         static Decision proceed(IntentClassification classification) {
-            return new Decision(false, null, classification);
+            return new Decision(false, null, null, classification);
+        }
+
+        /** 这一次实际问的是哪个槽位；{@code null} = 问的是固定文案里那几项 */
+        public String askedSlot() {
+            return pending == null ? null : pending.asked();
         }
     }
 
@@ -152,7 +191,28 @@ public class ClarificationDecider {
                     + "请检查调用方", history.size());
         }
 
-        log.info("★ 需要澄清：问题「{}」被判为信息不足，不检索、不调模型", question);
-        return new Decision(true, properties.getIntent().getClarifyText(), classification);
+        // ★★ 阶段 9.4：按【缺的槽位】选反问文案，并把状态交给调用方去记。
+        //
+        //   9.4 之前这里是一段【固定】文案（「你是想问哪款商品呢？…」），
+        //   而模型报的可能是 budget —— 于是我们问了一个它没缺的东西。
+        //   ★ 固定文案没有删：它是兜底（模型没给 missing、或给的槽位没模板时，
+        //     它仍然是一句能用的反问，而且是 9.3 逐字节相同的那一句）。
+        AgentProperties.Slots slots = properties.getSlots();
+        List<String> missing = classification.plan() == null
+                ? List.of() : classification.plan().missingSlots();
+        String asked = slots.isEnabled() ? ClarifySlots.pickToAsk(missing) : null;
+        String text = slots.isEnabled() ? slots.getQuestions().get(asked) : null;
+        if (text == null) {
+            // 走到这里有两种情况：开关关着，或者模型报的槽位我们没模板（含一个都没报）
+            text = properties.getIntent().getClarifyText();
+        }
+
+        PendingClarify pending = slots.isEnabled()
+                ? PendingClarify.of(question, missing, asked)
+                : null;
+
+        log.info("★ 需要澄清：问题「{}」被判为信息不足，不检索、不调模型{}",
+                question, pending == null ? "" : "（缺 " + missing + "，问 " + asked + "）");
+        return new Decision(true, text, pending, classification);
     }
 }

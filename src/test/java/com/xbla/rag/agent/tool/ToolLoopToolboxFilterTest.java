@@ -339,5 +339,46 @@ class ToolLoopToolboxFilterTest {
             assertThat(result.toolsAvailable()).isFalse();
             assertThat(result.answer()).contains("X-Xbla-User-Id");
         }
+
+        @Test
+        @DisplayName("★★ 但【混合轮】不短路：手上有知识库切片时，不带工具照常作答")
+        void hybridRoundDoesNotShortCircuit() throws Exception {
+            modelAnswers();
+            ToolLoop.Result result = toolLoop.run(
+                    new ToolLoop.Input("系统提示（含导购指南切片）", List.of(), "送长辈用的", null,
+                            List.of("search_products"), true),
+                    new ModelCallTrace("t-no-identity-hybrid"));
+
+            // ★★ 实测（2026-09-25，probe_clarify.py）：这条分支之前会把一份
+            //    【已经检索好资料的】导购回答换成「我需要先知道你是哪位」——
+            //    而知识库那条路根本不需要身份。9.3 把 SCENARIO_PICK 变成混合轮
+            //    之前，工具轮必然没有切片，所以那句短路在当时是对的。
+            verify(router).chat(any(), any());
+            assertThat(result.answer()).doesNotContain("X-Xbla-User-Id");
+            assertThat(result.answer())
+                    .as("模型是被真的调了一次、用切片作答的")
+                    .isEqualTo("好的");
+
+            // ★ 而且【不带工具】—— 没有身份就没有「我的订单」可查
+            assertThat(toolNames(requestSeenByModel()))
+                    .as("没有身份时必须不带工具：带上等于给模型一个必然失败的调用")
+                    .isNull();
+            // ★ 也不加「实时查询不可用」那段说明：模型手上【有】切片，
+            //   加了等于一边递资料一边叫它别用（9.3 的 needsUnavailableNote 判据）
+            assertThat(requestSeenByModel().systemPrompt())
+                    .doesNotContain("实时查询");
+        }
+
+        @Test
+        @DisplayName("★ 反对照：纯工具轮（没有切片）仍然短路")
+        void plainToolRoundStillShortCircuits() throws Exception {
+            ToolLoop.Result result = toolLoop.run(
+                    new ToolLoop.Input("系统提示", List.of(), "我的订单到哪了", null,
+                            List.of("query_order_status"), false),
+                    new ModelCallTrace("t-no-identity-plain"));
+
+            verify(router, never()).chat(any(), any());
+            assertThat(result.rounds()).isZero();
+        }
     }
 }

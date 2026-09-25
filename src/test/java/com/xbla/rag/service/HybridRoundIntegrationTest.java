@@ -140,7 +140,7 @@ class HybridRoundIntegrationTest {
     // ============================================================
 
     private void classifyAs(String code, boolean retrieve) {
-        when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                 code, IntentClassification.Outcome.CLASSIFIED, code,
                 DESCRIPTOR, new BigDecimal("0.0001"), 5, null,
                 new IntentPlan(retrieve, List.of(), IntentPlan.Shape.JSON)));
@@ -309,7 +309,10 @@ class HybridRoundIntegrationTest {
                             + "看到两处顺序不一样时，别去「修」成一致")
                     .isEqualTo(List.of("search_products", "compare_prices", "recommend_products"));
             assertThat(plan.get("retrieve")).isEqualTo(true);
-            assertThat(plan.get("v")).isEqualTo(2);
+            // ★ v=3 起（9.4 加了 resumed 一格）。★ 混合轮【不是】恢复轮：
+            //   它前面那一轮不是澄清，所以这一格必须是 false
+            assertThat(plan.get("v")).isEqualTo(3);
+            assertThat(plan.get("resumed")).isEqualTo(false);
         }
     }
 

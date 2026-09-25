@@ -155,7 +155,7 @@ class LlmIntentClassifierTest {
             Fixture f = fixture();
             when(f.router().chat(any(), any())).thenReturn(reply("LEAF_2", "stop"));
 
-            IntentClassification result = f.classifier().classify("随便问一句");
+            IntentClassification result = f.classifier().classify("随便问一句", null);
 
             assertThat(result.outcome()).isEqualTo(IntentClassification.Outcome.CLASSIFIED);
             assertThat(result.code()).isEqualTo("LEAF_2");
@@ -170,7 +170,7 @@ class LlmIntentClassifierTest {
             Fixture f = fixture();
             when(f.router().chat(any(), any())).thenReturn(reply("TOP_5", "stop"));
 
-            assertThat(f.classifier().classify("我的订单到哪了").code()).isEqualTo("TOP_5");
+            assertThat(f.classifier().classify("我的订单到哪了", null).code()).isEqualTo("TOP_5");
         }
 
         @Test
@@ -179,7 +179,7 @@ class LlmIntentClassifierTest {
             Fixture f = fixture();
             when(f.router().chat(any(), any())).thenReturn(reply("LEAF_1", "stop"));
 
-            f.classifier().classify("退货要几天");
+            f.classifier().classify("退货要几天", null);
 
             ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
             verify(f.router()).chat(captor.capture(), any(ModelCallTrace.class));
@@ -199,7 +199,7 @@ class LlmIntentClassifierTest {
             Fixture f = fixture();
             when(f.router().chat(any(), any())).thenReturn(reply("LEAF_1", "stop"));
 
-            f.classifier().classify("随便问一句");
+            f.classifier().classify("随便问一句", null);
 
             ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
             verify(f.router()).chat(captor.capture(), any(ModelCallTrace.class));
@@ -227,7 +227,7 @@ class LlmIntentClassifierTest {
             // 日志里也看不出原因，只是「AI 不说话」
             when(f.router().chat(any(), any())).thenReturn(reply("", "length"));
 
-            IntentClassification result = f.classifier().classify("退货要几天");
+            IntentClassification result = f.classifier().classify("退货要几天", null);
 
             assertThat(result.outcome())
                     .as("空正文必须当失败处理 —— 当成成功往下走的话，"
@@ -244,7 +244,7 @@ class LlmIntentClassifierTest {
             when(f.router().chat(any(), any())).thenReturn(reply("LEAF_1", "stop"));
 
             // 与上一条只差 content 的内容 —— 证明「空正文判定」不是恒真的
-            assertThat(f.classifier().classify("退货要几天").outcome())
+            assertThat(f.classifier().classify("退货要几天", null).outcome())
                     .isEqualTo(IntentClassification.Outcome.CLASSIFIED);
         }
 
@@ -254,7 +254,7 @@ class LlmIntentClassifierTest {
             Fixture f = fixture();
             when(f.router().chat(any(), any())).thenReturn(reply("   \n  ", "length"));
 
-            assertThat(f.classifier().classify("退货要几天").outcome())
+            assertThat(f.classifier().classify("退货要几天", null).outcome())
                     .isEqualTo(IntentClassification.Outcome.CALL_FAILED);
         }
     }
@@ -273,7 +273,7 @@ class LlmIntentClassifierTest {
             Fixture f = fixture();
             when(f.router().chat(any(), any())).thenReturn(reply("RETURN_POLICY", "stop"));
 
-            IntentClassification result = f.classifier().classify("退货要几天");
+            IntentClassification result = f.classifier().classify("退货要几天", null);
 
             assertThat(result.outcome()).isEqualTo(IntentClassification.Outcome.UNKNOWN_CODE);
             assertThat(result.code()).isNull();
@@ -291,7 +291,7 @@ class LlmIntentClassifierTest {
             when(f.router().chat(any(), any()))
                     .thenReturn(reply("我不确定这是 LEAF_1 还是别的，请再说明一下", "stop"));
 
-            IntentClassification result = f.classifier().classify("退货要几天");
+            IntentClassification result = f.classifier().classify("退货要几天", null);
 
             assertThat(result.outcome())
                     .as("模型的回复里【确实出现了】合法 code，但它是散文不是答案。"
@@ -315,7 +315,7 @@ class LlmIntentClassifierTest {
             when(f.router().chat(any(), any()))
                     .thenThrow(ModelCallException.emptyContent("deepseek", "deepseek-flash", "全链路失败"));
 
-            IntentClassification result = f.classifier().classify("退货要几天");
+            IntentClassification result = f.classifier().classify("退货要几天", null);
 
             assertThat(result.outcome()).isEqualTo(IntentClassification.Outcome.CALL_FAILED);
             assertThat(result.code()).isNull();
@@ -327,7 +327,7 @@ class LlmIntentClassifierTest {
         void blankQuestionThrows() throws IOException {
             Fixture f = fixture();
 
-            assertThatThrownBy(() -> f.classifier().classify("  "))
+            assertThatThrownBy(() -> f.classifier().classify("  ", null))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("不能为空");
         }

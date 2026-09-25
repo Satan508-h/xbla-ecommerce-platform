@@ -163,7 +163,7 @@ class ChatStreamToolIntegrationTest {
 
     /** 让分类固定返回「订单物流」——它在意图树里声明的是 retrieval: TOOL */
     private void classifyAsToolIntent() {
-        when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                 "ORDER_LOGISTICS", IntentClassification.Outcome.CLASSIFIED,
                 "ORDER_LOGISTICS", DESCRIPTOR, new BigDecimal("0.0001"), 5, null));
     }

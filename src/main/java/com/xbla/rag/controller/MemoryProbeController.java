@@ -1,5 +1,7 @@
 package com.xbla.rag.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xbla.rag.agent.intent.PendingClarify;
 import com.xbla.rag.agent.memory.ConversationMemory;
 import com.xbla.rag.agent.memory.MemoryContext;
 import com.xbla.rag.client.dto.ChatRequest;
@@ -93,16 +95,21 @@ public class MemoryProbeController {
     private final ChatSessionService chatSessionService;
     private final ChatProperties properties;
 
+    /** ★ 阶段 9.4：只用来解析 {@code pending_clarify} 那一列（读给人看，不做判断） */
+    private final ObjectMapper objectMapper;
+
     public MemoryProbeController(ConversationMemory conversationMemory,
                                  ChatMessageService chatMessageService,
                                  ChatSummaryService chatSummaryService,
                                  ChatSessionService chatSessionService,
-                                 ChatProperties properties) {
+                                 ChatProperties properties,
+                                 ObjectMapper objectMapper) {
         this.conversationMemory = conversationMemory;
         this.chatMessageService = chatMessageService;
         this.chatSummaryService = chatSummaryService;
         this.chatSessionService = chatSessionService;
         this.properties = properties;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -212,6 +219,21 @@ public class MemoryProbeController {
         }
         history.put("turns", preview);
         response.put("whatTheModelSees", history);
+
+        // ── ★ 阶段 9.4：悬着的澄清状态（不进 prompt，只是让「为什么没恢复」可排查）──
+        //
+        //   ★ 刻意【只读】这一列，不做任何判断 —— 探针和线上跑的要看到同一份数据，
+        //     但「怎么用它」只有一个地方（ChatServiceImpl.consumePendingClarify）。
+        //   ⚠️ 它和「这一轮会不会恢复」不是同一个问题：状态在这里，
+        //      但下一轮可能因为分类失败、排队被拒而不消费它。
+        Map<String, Object> pending = new LinkedHashMap<>();
+        PendingClarify parsed = PendingClarify.read(objectMapper, session.getPendingClarify());
+        pending.put("raw", session.getPendingClarify());
+        pending.put("parsed", parsed == null ? null : parsed.describe());
+        pending.put("note", "★ 读后即清：下一轮问答一开始就会把它取走并清空，"
+                + "所以这里看到有值 = 「下一轮会被注入」。"
+                + "★ 它只进分类 prompt，不进生成、不进检索。");
+        response.put("pendingClarify", pending);
 
         return response;
     }

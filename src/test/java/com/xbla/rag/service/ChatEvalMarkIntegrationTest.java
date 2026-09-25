@@ -109,7 +109,7 @@ class ChatEvalMarkIntegrationTest {
 
     @BeforeEach
     void stubEverything() {
-        when(intentClassifier.classify(anyString())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(anyString(), any())).thenReturn(new IntentClassification(
                 "RETURN_EXCHANGE", IntentClassification.Outcome.CLASSIFIED,
                 "RETURN_EXCHANGE", DESCRIPTOR, null, 10L, null));
         when(retrievalPipeline.retrieve(anyString(), any(), any())).thenReturn(List.of());

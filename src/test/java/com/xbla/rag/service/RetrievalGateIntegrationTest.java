@@ -111,7 +111,7 @@ class RetrievalGateIntegrationTest {
      * @param plan null = 「没有计划」（走 9.2 之前的兼容构造器）
      */
     private void classifyAs(String code, IntentPlan plan) {
-        when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                 code, IntentClassification.Outcome.CLASSIFIED, code,
                 DESCRIPTOR, new BigDecimal("0.0001"), 5, null, plan));
     }
@@ -184,21 +184,29 @@ class RetrievalGateIntegrationTest {
         }
 
         @Test
-        @DisplayName("★★ intent_plan 的六格全都在，且 shape 被记下来")
-        void planHasAllSevenFields() throws Exception {
+        @DisplayName("★★ intent_plan 的八格全都在，且 shape 被记下来")
+        void planHasAllEightFields() throws Exception {
             classifyAs("OUT_OF_SCOPE", jsonPlan(true));
             scriptPlainAnswer();
 
             var response = chatService.ask(new ChatAskRequest(null, "帮我写首诗", null), null);
             Map<String, Object> plan = planOf(qaLogOf(response.traceId()));
 
-            // ★ 七格一个都不能少 —— 每一格都对应一个事后必须能回答的问题
-            //   （第 7 格 tools 是阶段 9.3 加的，v 同时从 1 升到 2）
+            // ★ 八格一个都不能少 —— 每一格都对应一个事后必须能回答的问题
+            //   （第 7 格 tools 是阶段 9.3 加的、第 8 格 resumed 是 9.4 加的，
+            //     v 跟着从 1 → 2 → 3）
             assertThat(plan)
-                    .containsKeys("v", "intent", "retrieve", "gate", "tools", "missing", "shape")
-                    .containsEntry("v", 2)
+                    .containsKeys("v", "intent", "retrieve", "gate", "tools", "missing",
+                            "shape", "resumed")
+                    .containsEntry("v", 3)
                     .containsEntry("intent", "OUT_OF_SCOPE")
                     .containsEntry("gate", RetrievalGate.REASON_NONE_INTENT);
+            // ★ 阶段 9.4：这一轮【没有】上一轮悬着的澄清（第一次提问），
+            //   所以 resumed 必须是 false。它恒为 true 的话，
+            //   「恢复路径到底触发过几次」就答不出来了 —— 而那是这一格唯一的用途
+            assertThat(plan.get("resumed"))
+                    .as("★ 第一次提问没有上一轮，resumed 必须是 false")
+                    .isEqualTo(false);
             // ★ OUT_OF_SCOPE 的工具清单必须是空的：它既不检索也不调工具。
             //   非空会让「按意图裁剪」在这一类上静默失效
             assertThat(plan.get("tools"))
@@ -304,7 +312,7 @@ class RetrievalGateIntegrationTest {
         @Test
         @DisplayName("★ 分类失败 → 退化成全池检索，且 intent_plan 为 NULL（没有计划可言）")
         void failedClassificationStillRetrieves() {
-            when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+            when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                     null, IntentClassification.Outcome.CALL_FAILED,
                     null, DESCRIPTOR, null, 5, "超时"));
             scriptPlainAnswer();

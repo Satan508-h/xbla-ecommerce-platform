@@ -6,6 +6,7 @@ import com.xbla.rag.agent.intent.IntentClassification;
 import com.xbla.rag.agent.intent.IntentPlan;
 import com.xbla.rag.agent.intent.IntentTree;
 import com.xbla.rag.agent.intent.LlmIntentClassifier;
+import com.xbla.rag.agent.intent.PendingClarify;
 import com.xbla.rag.agent.intent.RetrievalGate;
 import com.xbla.rag.agent.memory.ConversationMemory;
 import com.xbla.rag.agent.memory.MemoryContext;
@@ -198,12 +199,12 @@ public class ChatServiceImpl implements ChatService {
      * <p>⚠️ 但阶段 7 做 A/B 时要区分它们 —— 看配置快照里的
      * {@code xbla.agent.intent.enabled} 即可，不需要在数据里再记一份。
      */
-    private IntentClassification classifySafely(String question) {
+    private IntentClassification classifySafely(String question, PendingClarify pending) {
         if (!agentProperties.getIntent().isEnabled()) {
             return null;
         }
         try {
-            return intentClassifier.classify(question);
+            return intentClassifier.classify(question, pending);
         } catch (Exception e) {
             log.warn("意图分类出现未预期的异常，按「不澄清、照常检索」处理：{}", e.getMessage(), e);
             return null;
@@ -445,6 +446,18 @@ public class ChatServiceImpl implements ChatService {
 
         saveUserMessage(session.getId(), request.question());
 
+        // ★★ 阶段 9.4：把上一轮悬着的澄清读出来（并立刻清空）。
+        //
+        //   位置在【分类之前】—— 它就是分类的输入之一
+        //   （「上一轮我问了他用途，这句『送长辈』很可能是在回答它」）。
+        //
+        //   ★ 读后即清（consumePendingClarify 里做的）：状态是一次性的。
+        //     这样它不会悬过一轮又一轮 —— 用户换了话题时，窗口最多只有一轮。
+        PendingClarify pending = consumePendingClarify(session);
+        if (pending != null) {
+            ctx = ctx.withClarifyResumed();
+        }
+
         // ★★ 意图识别插在【用户消息落库之后、检索之前】。
         //
         //   为什么必须在检索【之前】：澄清要短路掉整条链路 ——
@@ -452,12 +465,12 @@ public class ChatServiceImpl implements ChatService {
         //   而且用户得到的仍然是那句反问，不会因为检索过而更好。
         //
         //   （★ askStream 里插在 sink.onStart 【之后】，理由见那个方法。）
-        IntentClassification intent = classifySafely(request.question());
+        IntentClassification intent = classifySafely(request.question(), pending);
         ClarificationDecider.Decision decision =
                 clarificationDecider.decide(request.question(), intent);
         if (decision.shouldClarify()) {
             return answerWithClarification(ctx, session, request.question(),
-                    intent, decision.clarifyText(), startNanos);
+                    intent, decision, startNanos);
         }
 
         // ★★ 工具分支（阶段 5.8）—— 插在【澄清之后、检索之前】。
@@ -980,16 +993,25 @@ public class ChatServiceImpl implements ChatService {
         // 先告诉前端 traceId 和 sessionNo，别让它对着空白页等首字节
         sink.onStart(traceId, session.getSessionNo());
 
+        // ★★ 阶段 9.4：上一轮悬着的澄清状态（读后即清）——
+        //   与 ask() 同序（分类之前），只是被 onStart 挤到了它后面。
+        //   ⚠️ 它是一次主键 UPDATE + 一次内存赋值，不是模型调用，
+        //     所以放在 onStart 之后不会抵消 onStart 的价值（见下面那段注释）。
+        PendingClarify pending = consumePendingClarify(session);
+        if (pending != null) {
+            ctx = ctx.withClarifyResumed();
+        }
+
         // ★★ 意图识别也插在 sink.onStart 【之后】，理由和检索完全一样 ——
         //   一次分类是 0.5~2.5 秒的模型往返（走完整降级链，P0 是推理模型），
         //   插在 onStart 前面会把这段时间原封不动地加在用户看到任何反馈之前，
         //   【正好抵消掉 onStart 的全部价值】。
-        IntentClassification intent = classifySafely(request.question());
+        IntentClassification intent = classifySafely(request.question(), pending);
         ClarificationDecider.Decision decision =
                 clarificationDecider.decide(request.question(), intent);
         if (decision.shouldClarify()) {
             answerStreamWithClarification(ctx, session, request.question(),
-                    intent, decision.clarifyText(), sink, startNanos);
+                    intent, decision, sink, startNanos);
             return;
         }
 
@@ -1115,9 +1137,12 @@ public class ChatServiceImpl implements ChatService {
      */
     private ChatAskResponse answerWithClarification(CallContext ctx, ChatSession session,
                                                     String question, IntentClassification intent,
-                                                    String clarifyText, long startNanos) {
+                                                    ClarificationDecider.Decision decision,
+                                                    long startNanos) {
         String traceId = ctx.traceId();
+        String clarifyText = decision.clarifyText();
         saveAssistantClarification(session.getId(), clarifyText, intent);
+        rememberPendingClarify(session, decision.pending());
         saveQaLogClarification(ctx, session, question, intent, clarifyText, startNanos);
         touchSession(session);
 
@@ -1147,9 +1172,11 @@ public class ChatServiceImpl implements ChatService {
      * @see #answerWithClarification 关于响应体里那些 null 的说明
      */
     private void answerStreamWithClarification(CallContext ctx, ChatSession session, String question,
-                                               IntentClassification intent, String clarifyText,
+                                               IntentClassification intent,
+                                               ClarificationDecider.Decision decision,
                                                ChatStreamSink sink, long startNanos) {
         String traceId = ctx.traceId();
+        String clarifyText = decision.clarifyText();
         try {
             sink.onDelta(clarifyText);
             sink.onComplete(new ChatAskResponse(
@@ -1164,6 +1191,8 @@ public class ChatServiceImpl implements ChatService {
             sink.onError(userFacingMessage(e), traceId);
         } finally {
             saveAssistantClarification(session.getId(), clarifyText, intent);
+            // ★ 与 ask() 那条路同序、同判据（两条是平行代码）
+            rememberPendingClarify(session, decision.pending());
             saveQaLogClarification(ctx, session, question, intent, clarifyText, startNanos);
             touchSession(session);
         }
@@ -1344,6 +1373,120 @@ public class ChatServiceImpl implements ChatService {
             // ★ 认领失败不该让问答失败 —— 它只是一条归属信息，
             //   而且失败时那一列仍然是 NULL，是「不知道」的诚实表达
             log.warn("会话 id={} 认领失败：{}", existing.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * 读出并清空上一轮悬着的澄清状态（阶段 9.4）。
+     *
+     * <h3>★★ 为什么是「读后即清」而不是「用完再清」</h3>
+     *
+     * <p>「用完再清」看起来更精确（这一轮真的用上了才清），但它有两个坏处：
+     *
+     * <pre>
+     *   ① 中途抛异常时状态残留 → 下一轮把它当成「刚问过的」再注入一次 ——
+     *      而那一轮用户早就换了话题
+     *   ② 「用上了」需要一个判据，而那个判据只能在分类【之后】才知道 ——
+     *      于是清空点散落在 4~5 处出口上（成功/失败/澄清/工具/异常），
+     *      漏一处就是永久残留（ADR-049 那个形态：一个坏状态永久卡住会话）
+     * </pre>
+     *
+     * <p>读后即清把窗口压到<b>恰好一轮</b>：状态要么被这一轮用掉，要么消失。
+     * 代价是「这一轮分类失败」时它也没了 —— 那可以接受，
+     * 因为用户重问一次就是了，而残留的代价是<b>每一轮都被误导</b>。
+     *
+     * <h3>★ 坏数据也要清</h3>
+     *
+     * <p>JSON 读不出来时<b>照样清空</b>：留着它会让每一轮都重新解析一遍、
+     * 重新 WARN 一遍，而日志里那条 WARN 会淹没在正常的噪音里。
+     */
+    private PendingClarify consumePendingClarify(ChatSession session) {
+        String raw = session.getPendingClarify();
+        if (raw == null || raw.isBlank()) {
+            return null;            // 常态：上一轮不是澄清
+        }
+
+        // ★★ 开关关着时：把残留【清掉】，但【不注入】也不标 resumed。
+        //
+        //   「关掉 = 与 9.3 逐字节相同」这句话必须连 `intent_plan.resumed` 那一格
+        //   也成立 —— 只清不注入的话，库里会出现「resumed=true 而 prompt 里
+        //   根本没有那一段」的行，而那一格的全部用途就是「恢复路径触发了几次」。
+        //   清理仍然要做：不然一个旧状态会在开关重新打开的那天突然生效。
+        if (!agentProperties.getSlots().isEnabled()) {
+            session.setPendingClarify(null);
+            writePendingClarify(session.getId(), null);
+            log.debug("槽位功能关着，清掉残留的 pending_clarify（不注入）");
+            return null;
+        }
+
+        PendingClarify pending = PendingClarify.read(objectMapper, raw);
+
+        // ★ 先清内存再清库：即使下面那条 UPDATE 失败，这一轮也不会重复消费
+        session.setPendingClarify(null);
+        writePendingClarify(session.getId(), null);
+
+        if (pending != null) {
+            log.info("★ 取出上一轮悬着的澄清（{}）—— 本轮分类会带上它", pending.describe());
+        }
+        return pending;
+    }
+
+    /**
+     * 记下这一轮的反问，供<b>下一轮</b>分类时使用（阶段 9.4）。
+     *
+     * <p>位置与 {@code saveAssistantClarification} 相邻（都在澄清的落库段），
+     * 但它们是两件事：那条写的是<b>用户能看到的那句话</b>（chat_message），
+     * 这条写的是<b>给下一轮的机器状态</b>（chat_session）。
+     *
+     * <p>★ 不写检索/生成那两列，也不进 qa_log —— 它只服务分类那一次调用，
+     * 而它的样子在下一轮的 {@code intent_plan.resumed} 上可见。
+     */
+    private void rememberPendingClarify(ChatSession session, PendingClarify pending) {
+        if (pending == null) {
+            return;                 // 槽位功能关着（Decision.pending() 为 null）
+        }
+        String json = PendingClarify.write(objectMapper, pending);
+        if (json == null) {
+            return;                 // 序列化失败已经记了 ERROR，退化成 9.3 的行为
+        }
+        session.setPendingClarify(json);
+        writePendingClarify(session.getId(), json);
+        log.info("★ 记下待澄清状态（{}），下一轮分类会带上它", pending.describe());
+    }
+
+    /**
+     * 只写 {@code chat_session.pending_clarify} 这一列。
+     *
+     * <h3>★★ 为什么必须用 {@code lambdaUpdate().set(...)}，不能 {@code updateById}</h3>
+     *
+     * <p>MyBatis-Plus 的默认更新策略是 {@code NOT_NULL}：<b>{@code updateById}
+     * 会静默跳过值为 null 的字段</b>（{@code touchSession} 的注释里记着这条）。
+     * 而这里「清空」正是 {@code null} —— 用 {@code updateById} 的话，
+     * <b>清空这个动作会变成一次空更新，什么都不改，也不报错</b>。
+     *
+     * <pre>
+     *   后果：状态永不清空 → 每一轮都把那个旧反问注入一次
+     *   → 用户换了话题也照样被它误导，而日志里只有一条「取出上一轮悬着的澄清」
+     * </pre>
+     *
+     * <p>★ {@code .set(column, null)} 生成的 {@code SET pending_clarify = NULL}
+     * 才是这里要的语义（同 {@code claimSession} 用条件 UPDATE 而不是先读后写的理由：
+     * <b>「想做的动作」和「实际写下去的语句」必须对得上</b>）。
+     *
+     * <p>⚠️ 失败只 WARN，不让问答失败 —— 它是一条会话状态，
+     * 丢了最坏的结果是「这一轮的反问没被记住」，也就是退回 9.3 的行为。
+     */
+    private void writePendingClarify(Long sessionId, String json) {
+        if (sessionId == null) {
+            return;
+        }
+        try {
+            chatSessionService.lambdaUpdate()
+                    .eq(ChatSession::getId, sessionId)
+                    .set(ChatSession::getPendingClarify, json)
+                    .update();
+        } catch (Exception e) {
+            log.warn("更新 pending_clarify 失败 sessionId={}：{}", sessionId, e.getMessage());
         }
     }
 
@@ -1641,7 +1784,7 @@ public class ChatServiceImpl implements ChatService {
         //   而工具意图根本不检索 —— 记原话会让「retrieve=true 却没检索」
         //   看起来像 bug。★ 模型的原话在 shape/retrieve 的原始值里另有体现
         //   （见 IntentPlan），而这里要的是「实际发生了什么」。
-        log.setIntentPlan(serializeIntentPlan(intent));
+        log.setIntentPlan(serializeIntentPlan(intent, ctx.clarifyResumed()));
 
         // ── ★ 意图（阶段 5.3 新增）──
         //
@@ -1661,10 +1804,11 @@ public class ChatServiceImpl implements ChatService {
      * {@code intent_plan.v} 的当前值。模型那个 {@code v} 是它自己写的，这个是我们的。
      *
      * <p>★ 9.3 从 1 升到 2：多了一格 {@code tools}。
-     * v=1 的行有 6 格、v=2 的有 7 格 —— 下游脚本按 {@code v} 分派，
+     * ★ 9.4 从 2 升到 3：多了一格 {@code resumed}。
+     * v=1 的行有 6 格、v=2 有 7 格、v=3 有 8 格 —— 下游脚本按 {@code v} 分派，
      * 就不会在「某个键突然不存在」上栽跟头。
      */
-    private static final int PLAN_VERSION = 2;
+    private static final int PLAN_VERSION = 3;
 
     /**
      * 把结构化计划序列化成 {@code intent_plan}（阶段 9.2）。
@@ -1696,9 +1840,20 @@ public class ChatServiceImpl implements ChatService {
      *           只是它拦的是另一种静默失败：白名单过滤写成恒等，
      *           于是工具题一切照旧，而裁剪一次都没生效</td></tr>
      *   <tr><td>{@code missing}</td><td>槽位名数组</td>
-     *       <td>9.4 做槽位填充的输入。★ 9.2 <b>只解析、只落库、不消费</b></td></tr>
-     *   <tr><td>{@code shape}</td><td>{@code JSON} / {@code CODE} / {@code UNPARSED}</td>
-     *       <td>★★★ <b>这一格是本阶段最重要的一格。</b>见下</td></tr>
+     *       <td>9.4 做槽位填充的输入。★ 9.2 <b>只解析、只落库、不消费</b>。
+     *           ⚠️ 它是<b>模型的原话</b>（不做白名单过滤）——
+     *           过滤只发生在消费端，见 {@code ClarifySlots}</td></tr>
+     *   <tr><td>{@code shape}</td><td>{@code JSON} / {@code CODE}</td>
+     *       <td>★★★ <b>这一格是本阶段最重要的一格。</b>见下
+     *           <p>⚠️ 文档里一度写着还有 {@code UNPARSED} —— 那个值
+     *           <b>从来没有被构造过</b>（解析两边都失败时 plan 直接是 null，
+     *           整列写 NULL）。9.4 把文档改成了事实</td></tr>
+     *   <tr><td>{@code resumed}</td><td>true / false（9.4 加）</td>
+     *       <td>★ 这一次分类<b>有没有带上上一轮悬着的澄清状态</b>
+     *           （{@code chat_session.pending_clarify}）。
+     *           没有它，「多轮澄清一次都没生效」在数据上和
+     *           「生效了但没用」长得一模一样 —— 同 {@code shape} 那条理由，
+     *           只是它拦的是另一种静默失败</td></tr>
      * </table>
      *
      * <h3>★★★ 为什么 {@code shape} 是这一项最重要的一格</h3>
@@ -1723,7 +1878,7 @@ public class ChatServiceImpl implements ChatService {
      * 这里的「没发生」= 这次分类没有产出计划
      * （分类整个失败，或者是测试直接构造的结果）。
      */
-    private String serializeIntentPlan(IntentClassification intent) {
+    private String serializeIntentPlan(IntentClassification intent, boolean clarifyResumed) {
         if (intent == null || !intent.isClassified()) {
             return null;
         }
@@ -1747,6 +1902,11 @@ public class ChatServiceImpl implements ChatService {
         row.put("tools", gate.tools());
         row.put("missing", plan.missingSlots());
         row.put("shape", plan.shape().name());
+        // ★ 9.4：这一次分类有没有带上上一轮的澄清状态。★ 它记的是【事实】
+        //   （我们从库里取出了一份 pending），而不是「模型有没有用上它」——
+        //   后者模型自己都不会说，也没有可判定的判据。
+        //   ⚠️ 它在【澄清行】上恒为 false：澄清行当然不是「恢复轮」。
+        row.put("resumed", clarifyResumed);
 
         try {
             return objectMapper.writeValueAsString(row);

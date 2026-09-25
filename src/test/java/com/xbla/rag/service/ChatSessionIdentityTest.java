@@ -94,7 +94,7 @@ class ChatSessionIdentityTest {
 
     /** 固定分类成一个 KB 叶子 —— 本类不关心意图，只要它别走工具那条路 */
     private void classifyAsSpecQuery() {
-        when(intentClassifier.classify(any())).thenReturn(new IntentClassification(
+        when(intentClassifier.classify(any(), any())).thenReturn(new IntentClassification(
                 "SPEC_QUERY", IntentClassification.Outcome.CLASSIFIED,
                 "SPEC_QUERY", DESCRIPTOR, new BigDecimal("0.0001"), 5, null));
     }

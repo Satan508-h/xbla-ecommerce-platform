@@ -301,6 +301,11 @@ public class McpProbeController {
         data.put("cost", log.getCost() == null ? null : log.getCost().toPlainString());
         data.put("llmLatencyMs", log.getLlmLatencyMs());
         data.put("retrievalDetail", log.getRetrievalDetail());
+        // ★ 阶段 9.2/9.4：结构化计划（shape / gate / tools / missing / resumed）。
+        //   补它的理由和这个接口存在的理由是同一条 ——
+        //   「门控到底有没有生效」和「恢复路径触发过几次」都【只能】从这一列看出来，
+        //   而在此之前要回答它们只能去连 psql（那条路对克隆仓库的人不成立）。
+        data.put("intentPlan", log.getIntentPlan());
         data.put("references", log.getReferences());
         data.put("finalAnswer", log.getFinalAnswer());
         response.put("code", 0);

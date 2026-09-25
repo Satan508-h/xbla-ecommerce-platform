@@ -102,13 +102,20 @@ public class LlmIntentClassifier {
      *
      * @param question 用户原话（不做任何改写 —— 改写是阶段 4 的
      *                 {@code QueryPlanner} 的事，且默认关闭）
+     * @param pending  ★ 阶段 9.4：<b>上一轮悬着的反问</b>（若上一轮是一次澄清）。
+     *                 <b>{@code null} = 没有</b>（常态），此时分类 prompt
+     *                 与 9.3 <b>逐字节相同</b>。
+     *                 <p>⚠️ <b>刻意没有一参重载</b> —— 同 ADR-091 的那条纪律：
+     *                 加重载会让「忘了传」编译通过，而症状是
+     *                 <b>恢复路径一次都不生效、回答看起来完全正常</b>。
+     *                 忘了传必须是编译错误。
      */
-    public IntentClassification classify(String question) {
+    public IntentClassification classify(String question, PendingClarify pending) {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("待分类的问题不能为空");
         }
 
-        String prompt = promptBuilder.build();
+        String prompt = promptBuilder.build(pending);
         AgentProperties.Intent config = properties.getIntent();
         ChatRequest request = new ChatRequest(
                 prompt,
@@ -158,7 +165,8 @@ public class LlmIntentClassifier {
                     IntentClassification.Outcome.CLASSIFIED,
                     response.content(), response.descriptor(), trace.cost(), latencyMs, null,
                     parsed.plan());
-            log.debug("意图分类：{} | {}", result.describe(), parsed.plan().describe());
+            log.debug("意图分类：{} | {}{}", result.describe(), parsed.plan().describe(),
+                    pending == null ? "" : " | ★ 带上一轮澄清：" + pending.describe());
             return result;
 
         } catch (ModelCallException e) {

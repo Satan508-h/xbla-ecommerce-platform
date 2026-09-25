@@ -242,13 +242,34 @@ public class ToolLoop {
         // ── ① 拿到工具清单（或确认拿不到），并按这一次的白名单裁剪 ──
         Toolbox toolbox = resolveToolbox(input.userId(), input.allowedTools());
 
-        // ★ 没有身份：不调模型，直接回一句实话。
-        //   理由见 AgentProperties.Tool.noIdentityText —— 用户没带身份头时，
-        //   我们【确实】查不出「他的」订单，让模型发挥的唯一素材就是通用规则，
-        //   也就是编。这和 5.3 澄清路径「短路不调模型」是同一个设计。
-        if (input.userId() == null) {
+        // ★ 没有身份时要不要短路 —— 分两种情况，判据是【手上有没有资料】。
+        //
+        //   ① 纯工具轮（没有知识库切片）：短路，回一句实话。
+        //      用户没带身份头时我们【确实】查不出「他的」订单/券，
+        //      让模型发挥的唯一素材就是通用规则，也就是编。
+        //      理由见 AgentProperties.Tool.noIdentityText，同 5.3 澄清路径「短路」的设计。
+        //
+        //   ② ★★ 混合轮（有切片）：【不能】短路。
+        //      它手上有检索到的导购指南，本来就能答一份有依据的建议 ——
+        //      而短路会把它换成一句「我需要先知道你是哪位」。
+        //
+        //   ⚠️ 这条分支是 9.3 埋下的：把 SCENARIO_PICK 变成混合轮之前
+        //      「工具轮」必然没有切片，所以短路是对的。
+        //      ★ 实测（2026-09-25，scripts/probe_clarify.py）：
+        //      匿名用户问「那个怎么样 → 送长辈用的」，第二轮收到的是
+        //      「我需要先知道你是哪位，才能查你的订单、库存或优惠券」——
+        //      而知识库切片其实已经检索好了（那一轮 references 非空）。
+        //
+        //   ⇒ 走「工具不可用」那条既有的路（不带工具、让模型用切片作答）：
+        //     resolveToolbox(null, …) 本来就返回 unavailable，specs 为空，
+        //     于是循环里 mayUseTools 恒为 false；而 needsUnavailableNote
+        //     对「有切片」返回 false —— 模型拿到的就是一份干净的带资料问答。
+        if (input.userId() == null && !input.kbContextPresent()) {
             log.info("工具意图但没有身份，短路不调模型");
             return new Result(properties.getTool().getNoIdentityText(), List.of(), 0, false);
+        }
+        if (input.userId() == null) {
+            log.info("★ 混合轮但没有身份 —— 不短路，改为不带工具、用知识库切片作答");
         }
 
         List<ChatRequest.Turn> working = new ArrayList<>();
