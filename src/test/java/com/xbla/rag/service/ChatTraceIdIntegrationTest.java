@@ -241,7 +241,8 @@ class ChatTraceIdIntegrationTest {
         void givenTraceIdReachesBothSinkAndQaLog() {
             CapturingSink sink = new CapturingSink();
 
-            chatService.askStream(new ChatAskRequest(null, "退货要几天", null), sink, CallContext.fresh(GIVEN));
+            chatService.askStream(new ChatAskRequest(null, "退货要几天", null), sink, null,
+                    CallContext.fresh(GIVEN));
 
             assertEquals(GIVEN, sink.startedTraceId.get(),
                     "★ onStart 推给前端的 id 必须就是排队层那个 —— "
@@ -256,7 +257,8 @@ class ChatTraceIdIntegrationTest {
         void streamBodyActuallyProduced() {
             CapturingSink sink = new CapturingSink();
 
-            chatService.askStream(new ChatAskRequest(null, "退货要几天", null), sink, CallContext.fresh(GIVEN));
+            chatService.askStream(new ChatAskRequest(null, "退货要几天", null), sink, null,
+                    CallContext.fresh(GIVEN));
 
             assertEquals("自签收之日起 7 天内。", sink.body.toString(),
                     "★ 这一条是上面两条的【前提】：如果 askStream 根本没跑起来，"
@@ -277,7 +279,7 @@ class ChatTraceIdIntegrationTest {
             String question = uniqueQuestion("退货要几天");
 
             chatService.ask(new ChatAskRequest(null, question, null), null,
-                    new CallContext(GIVEN, 1234, 7, null));
+                    new CallContext(GIVEN, 1234, 7, null, null));
 
             QaLog row = logOf(GIVEN);
             assertEquals(1234, row.getQueueMs(),
@@ -316,8 +318,8 @@ class ChatTraceIdIntegrationTest {
             String question = uniqueQuestion("退货要几天");
             CapturingSink sink = new CapturingSink();
 
-            chatService.askStream(new ChatAskRequest(null, question, null), sink,
-                    new CallContext(GIVEN, 4321, 3, null));
+            chatService.askStream(new ChatAskRequest(null, question, null), sink, null,
+                    new CallContext(GIVEN, 4321, 3, null, null));
 
             QaLog row = logOf(GIVEN);
             assertEquals(4321, row.getQueueMs(),
@@ -336,7 +338,7 @@ class ChatTraceIdIntegrationTest {
                     "NEEDS_CLARIFICATION", DESCRIPTOR, null, 10L, "你到底想问哪款？"));
 
             chatService.ask(new ChatAskRequest(null, uniqueQuestion("那个怎么样"), null), null,
-                    new CallContext(GIVEN, 999, 2, null));
+                    new CallContext(GIVEN, 999, 2, null, null));
 
             QaLog row = logOf(GIVEN);
             assertEquals(QaLog.STATUS_CLARIFY, row.getStatus());

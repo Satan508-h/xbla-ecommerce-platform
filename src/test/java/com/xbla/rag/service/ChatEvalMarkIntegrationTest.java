@@ -216,7 +216,7 @@ class ChatEvalMarkIntegrationTest {
         @DisplayName("★★ 流式路径同样把标记落进 qa_log")
         void markLandsInQaLogOnStreamPath() {
             String question = uniqueQuestion("退货要几天");
-            chatService.askStream(new ChatAskRequest(null, question, null), new SilentSink(),
+            chatService.askStream(new ChatAskRequest(null, question, null), new SilentSink(), null,
                     CallContext.fresh("t-eval-2", MARK));
 
             QaLog row = logOfQuestion(question);

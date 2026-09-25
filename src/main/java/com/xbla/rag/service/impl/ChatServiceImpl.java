@@ -30,6 +30,7 @@ import com.xbla.rag.dto.ChatAskResponse;
 import com.xbla.rag.entity.ChatMessage;
 import com.xbla.rag.entity.ChatSession;
 import com.xbla.rag.entity.QaLog;
+import com.xbla.rag.service.AppUserService;
 import com.xbla.rag.service.ChatMessageService;
 import com.xbla.rag.service.ChatService;
 import com.xbla.rag.service.CallContext;
@@ -133,11 +134,27 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 模型 ⇄ MCP 工具的多轮往返（阶段 5.8）。
      *
-     * <p>★ 它<b>只被 {@code ask()} 用到</b>，{@code askStream()} 还没接 ——
-     * 见 {@link ChatService#askStream} 的说明。这个不对称是刻意的边界，
-     * 不是漏改。
+     * <p>★ 阶段 5.8 时它<b>只被 {@code ask()} 用到</b>；阶段 9 起
+     * {@code askStream()} 也接上了（{@code answerStreamWithTools}）。
+     * 在那之前，SSE 上的工具意图是<b>静默降级</b>成普通 KB 问答的 ——
+     * 而前端只用流式，所以那条边界实际是「工具功能对用户不可见」。
      */
     private final ToolLoop toolLoop;
+
+    /**
+     * 用户（阶段 9 新增）。
+     *
+     * <p>★ 只有一个用途：{@code resolveSession} 在把身份写进
+     * {@code chat_session.user_id} 之前<b>核对这个人真的存在</b>。
+     *
+     * <p>★★ 这一步不是「多此一举的校验」，是 FK 逼出来的：
+     * {@code chat_session.user_id} 上有 {@code FOREIGN KEY → app_user(id)}
+     * （V5 迁移）。而 {@code X-Xbla-User-Id} 是<b>明文未签名的</b>（ADR-054），
+     * 所以任何一个客户端发一个 {@code X-Xbla-User-Id: 999} 都会让
+     * <b>每一次对话在建会话那一步 500</b>。
+     * 查不到就如实记 NULL（= 匿名），这才是与「它不是认证」相符的处置。
+     */
+    private final AppUserService appUserService;
 
     // ============================================================
     // ★ 意图识别（阶段 5.3 新增）
@@ -390,10 +407,10 @@ public class ChatServiceImpl implements ChatService {
     @Override
     public ChatAskResponse ask(ChatAskRequest request, Long userId, CallContext ctx) {
         long startNanos = System.nanoTime();
-        ctx = ctxOrFresh(ctx);
+        ctx = convergeIdentity(userId, ctxOrFresh(ctx));
         String traceId = ctx.traceId();
 
-        ChatSession session = resolveSession(request.sessionNo(), request.question());
+        ChatSession session = resolveSession(request.sessionNo(), request.question(), userId);
 
         // ★★ 5.5：读历史必须在 saveUserMessage 【之前】。
         //
@@ -735,29 +752,146 @@ public class ChatServiceImpl implements ChatService {
                 intentCode(intent));
     }
 
+    /**
+     * 工具路径的流式版本（阶段 9）。
+     *
+     * <p>它是 {@code answerWithTools} 的孪生体 —— 流程、落库、异常处理都一样，
+     * <b>只有「正文怎么交给用户」不同</b>（那里是返回，这里是推事件）。
+     * 之所以不把两者合并成一个「接受一个可选的 sink」的方法：
+     * 那样每条路径里都会多出 {@code sink != null} 的分支，
+     * 而「哪条路该做什么」会变成运行时的判断 —— 这里它是编译期的事实。
+     *
+     * <h3>★ 正文是一次性推的，没有打字机效果 —— 这是有意的边界</h3>
+     *
+     * <p>因为这条路上的<b>每一轮都走 {@code router.chat}（非流式）</b>：
+     * 工具决策轮的正文本来就是空串（见 {@code WireChatResponse.hasAnyContent}），
+     * 真正的正文只在最后一轮产生。要让它逐字推，得先扩展
+     * {@code WireStreamChunk} 支持 {@code tool_calls} 增量装配 ——
+     * 而那是 {@code client/} 里按 ADR-061 已经坏过两次的地方，值得单开一步。
+     *
+     * <p>★★ 但<b>「答对」和「有打字机」是两件事，这一版解决的是前者</b>：
+     * 在此之前，SSE 上的工具意图走的是普通 KB 问答 ——
+     * 用户问「我的订单到哪了」，模型拿通用发货规则<b>编一个订单状态</b>。
+     * 那是一个错误答案；而现在它是一个没有打字机的正确答案。
+     */
+    private void answerStreamWithTools(CallContext ctx, ChatSession session,
+                                       ChatAskRequest request, MemoryContext memory,
+                                       IntentClassification intent, Long userId,
+                                       ChatStreamSink sink, long startNanos) {
+        String traceId = ctx.traceId();
+        ModelCallTrace trace = new ModelCallTrace(traceId);
+
+        // ★ 同 answerWithTools：chunks 传空、结构化事实固定传 EMPTY
+        String systemPrompt = ragSystemPrompt(request.systemPrompt(), List.of(), memory,
+                StructuredFacts.EMPTY);
+
+        try {
+            ToolLoop.Result result = toolLoop.run(
+                    new ToolLoop.Input(systemPrompt, memory.history(),
+                            request.question(), userId),
+                    trace);
+
+            saveAssistantToolAnswer(session.getId(), result, intent);
+            saveQaLogTool(ctx, session, request.question(), trace, result, startNanos, intent);
+            touchSession(session);
+
+            // ★ 正文一次推完。★ 空串也要推吗 —— 不。result.answer() 理论上不会是空
+            //   （ToolLoop 的每一轮都要求 hasAnyContent），但真为空时推一个空 delta
+            //   等于让前端渲染一个空气泡；跳过它，让 done 事件自己说明。
+            if (result.answer() != null && !result.answer().isEmpty()) {
+                sink.onDelta(result.answer());
+            }
+
+            sink.onComplete(buildStreamToolResponse(traceId, session, trace, result,
+                    startNanos, intent));
+
+            // ★ 同 askStream：压缩必须在助手消息落库【之后】
+            sessionSummarizer.maybeSummarizeAsync(session.getId());
+
+            log.info("流式工具问答完成 {} | {} 轮 | 调用 {} 次 | intent={}",
+                    trace.summary(), result.rounds(), result.calls().size(), intentCode(intent));
+
+        } catch (Exception e) {
+            // ★ 只有模型链路失败才会到这里（工具的任何失败都已被 ToolLoop 转成工具结果）
+            saveQaLogFailure(ctx, session, request.question(), trace, null, null,
+                    e, startNanos, intent);
+            touchSession(session);
+            log.warn("流式工具问答失败 traceId={} : {}", traceId, e.getMessage());
+            sink.onError(userFacingMessage(e), traceId);
+        }
+    }
+
+    /**
+     * 工具路径的流式响应体 —— 和 {@link #buildToolResponse} 的唯一区别是
+     * <b>{@code answer} 为 {@code null}</b>。
+     *
+     * <h3>★★ 为什么这不是多余的洁癖</h3>
+     *
+     * <p>{@code ChatAskResponse.answer} 这个字段在两条路上是两个含义：
+     *
+     * <pre>
+     *   非流式        → 正文
+     *   流式          → 刻意的 null（正文只在 delta 事件里）
+     * </pre>
+     *
+     * <p>前端在 {@code done} 到达时做的事是「收尾」，而历史上有过
+     * 「收到 done 就 {@code content = payload.answer}」的写法 ——
+     * 那会在流式的每一条回答上<b>把刚刚逐字渲染出来的正文整条抹掉</b>。
+     * 所以流式契约里 {@code answer} 必须是 null。
+     *
+     * <p>如果这里偷懒复用 {@code buildToolResponse}，这个字段就会变成
+     * <b>三种</b>含义（非流式 / 流式 / 流式工具），而第三个含义
+     * 「流式工具轮它<b>有</b>正文」正好会把上面那个规则戳出一个洞 ——
+     * 前端要么为它写一个特例，要么在工具轮上把正文渲染两遍。
+     *
+     * <p>★ 一句话：<b>流式契约是传输层的契约，工具轮也是流式轮。</b>
+     */
+    private ChatAskResponse buildStreamToolResponse(String traceId, ChatSession session,
+                                                    ModelCallTrace trace, ToolLoop.Result result,
+                                                    long startNanos, IntentClassification intent) {
+        ChatResponse response = asResponse(result.answer(), trace);
+        var route = trace.route();
+        return new ChatAskResponse(
+                traceId,
+                session.getSessionNo(),
+                null,                       // ★★ 正文已经推走了 —— 同 buildStreamResponse
+                route == null ? null : route.provider(),
+                route == null ? null : route.modelId(),
+                response.usage(),
+                trace.cost(),
+                trace.llmLatencyMs(),
+                elapsedMs(startNanos),
+                trace.degraded(),
+                trace.events(),
+                null,                       // references —— 没检索
+                intentCode(intent));
+    }
+
     // ============================================================
     // 流式
     // ============================================================
 
     @Override
     public void askStream(ChatAskRequest request, ChatStreamSink sink) {
-        askStream(request, sink, CallContext.fresh());
+        // ★ 两参版本 = 「没有身份」那条路（测试、探针）。线上不走这里 ——
+        //   见了 userId 为 null，工具路径会回一句「需要先知道你是哪位」。
+        askStream(request, sink, null, CallContext.fresh());
     }
 
     /**
-     * 流式问答（阶段 6：带调用上下文）。
+     * 流式问答（阶段 6：带调用上下文；阶段 9：带身份）。
      *
      * <p>★ 排队层在主调这一个是<b>刻意的</b>：
      * traceId 在排队开始的那一刻就产生了，一路用到 {@code qa_log.trace_id}。
-     * 见 {@code ChatService#askStream(ChatAskRequest, ChatStreamSink, CallContext)} 的说明。
+     * 见 {@code ChatService#askStream(ChatAskRequest, ChatStreamSink, Long, CallContext)} 的说明。
      */
     @Override
-    public void askStream(ChatAskRequest request, ChatStreamSink sink, CallContext ctx) {
+    public void askStream(ChatAskRequest request, ChatStreamSink sink, Long userId, CallContext ctx) {
         long startNanos = System.nanoTime();
-        ctx = ctxOrFresh(ctx);
+        ctx = convergeIdentity(userId, ctxOrFresh(ctx));
         String traceId = ctx.traceId();
 
-        ChatSession session = resolveSession(request.sessionNo(), request.question());
+        ChatSession session = resolveSession(request.sessionNo(), request.question(), userId);
 
         // ★★ 5.5：读历史必须在 saveUserMessage 【之前】。
         //
@@ -793,6 +927,21 @@ public class ChatServiceImpl implements ChatService {
         if (decision.shouldClarify()) {
             answerStreamWithClarification(ctx, session, request.question(),
                     intent, decision.clarifyText(), sink, startNanos);
+            return;
+        }
+
+        // ★★ 工具分支（阶段 9）—— 与非流式路径【同序、同判据】：
+        //   澄清之后、检索之前。那三条位置理由见 ask() 里对应位置的长注释，
+        //   这里不重复；要点是「工具意图必须短路掉检索」——
+        //   否则模型会拿通用规则编一个具体的订单状态出来（ADR-044）。
+        //
+        //   ⚠️⚠️ 在此之前，这条路上的工具意图是【静默降级】的：
+        //   askStream 没有 userId、不挂 tools，于是它走成一次普通的 KB 问答，
+        //   而 qa_log 里 intent=ORDER_STATUS、status=1，看起来完全正常。
+        //   这是阶段 5.8 划下的边界（当时只把工具接进非流式），
+        //   而前端只用流式 —— 所以线上从来没有一条工具问答走到过用户面前。
+        if (isToolIntent(intent)) {
+            answerStreamWithTools(ctx, session, request, memory, intent, userId, sink, startNanos);
             return;
         }
 
@@ -1000,13 +1149,46 @@ public class ChatServiceImpl implements ChatService {
      * <p>传了但查不到时也新建（并把 sessionNo 用上传的那个）——
      * 这样前端缓存了一个已经不存在的会话号时不会直接报错，
      * 而是无声地开一个新会话。
+     *
+     * <h3>★★ 阶段 9：会话的归属（{@code chat_session.user_id}）</h3>
+     *
+     * <p>在此之前这一列<b>恒为 NULL</b>（写着「阶段 2 还没有登录体系」）。
+     * 阶段 9 起它记的是<b>会话归属</b>，规则是 <b>write-once</b>：
+     *
+     * <pre>
+     *   新建 + 身份有效       →  记下它
+     *   新建 + 身份无效/缺席   →  NULL（匿名是合法的，不是失败）
+     *   已有 + 该列是 NULL     →  认领（条件 UPDATE，并发安全、幂等）
+     *   已有 + 已是别人的      →  【不覆盖】，打 WARN
+     * </pre>
+     *
+     * <p>★ 最后一条是关键：覆盖会让一个会话的历史归属<b>随最后一个请求漂移</b>，
+     * 而那种漂移没有任何日志能看出来。同 ADR-055「会话 ID 与身份绑定」的判据 ——
+     * 先声明的赢。
+     *
+     * <p>⚠️⚠️ <b>它和 {@code qa_log.user_id} 是两个不同粒度的东西，不要合并：</b>
+     *
+     * <pre>
+     *   chat_session.user_id   会话粒度，write-once，回答「这个会话是谁开的」
+     *   qa_log.user_id         请求粒度，逐条写，回答「这一问是谁提的」
+     * </pre>
+     *
+     * <p>客户端在同一个 sessionNo 上换了头时，两者会不同 ——
+     * 那是两个问题的两个答案，不是数据不一致。{@code qa_log} 取的是
+     * {@code ctx.userId()}（和工具那条路同源），理由见 {@code baseLog}。
      */
-    private ChatSession resolveSession(String sessionNo, String question) {
+    private ChatSession resolveSession(String sessionNo, String question, Long userId) {
+        // ★ 先把身份核对成「真的存在的人」，不存在就是 null（匿名）。
+        //   不做这一步的话，一个伪造的 X-Xbla-User-Id 会让【每一次】对话
+        //   在建会话那一步撞 FK 约束 → 500。见本类 appUserService 字段的说明。
+        Long owner = verifiedUserId(userId);
+
         if (sessionNo != null && !sessionNo.isBlank()) {
             ChatSession existing = chatSessionService.lambdaQuery()
                     .eq(ChatSession::getSessionNo, sessionNo)
                     .one();
             if (existing != null) {
+                claimSession(existing, owner);
                 return existing;
             }
             log.debug("sessionNo={} 不存在，将新建会话", sessionNo);
@@ -1018,15 +1200,77 @@ public class ChatServiceImpl implements ChatService {
                 //   没有理由为它再写一份 UUID 处理。★ 但两者【语义不同】——
                 //   一个标识会话，一个标识这一次请求，别把它们当成同一个东西。
                 ? sessionNo : TraceId.newId());
-        session.setUserId(null);            // 阶段 2 还没有登录体系，支持匿名会话
+        session.setUserId(owner);
         session.setTitle(truncateTitle(question));
         session.setMessageCount(0);
         session.setStatus(1);               // 1 = 进行中
         session.setLastActiveAt(OffsetDateTime.now());
         chatSessionService.save(session);
 
-        log.debug("新建会话 id={} sessionNo={}", session.getId(), session.getSessionNo());
+        log.debug("新建会话 id={} sessionNo={} 归属={}",
+                session.getId(), session.getSessionNo(),
+                owner == null ? "匿名" : "user#" + owner);
         return session;
+    }
+
+    /**
+     * 身份核对 —— 查得到才认，查不到就是匿名。
+     *
+     * <p>★ 成本是每次问答一次主键查询。它换来的是「伪造的头不会让服务 500」，
+     * 而那是 FK 约束逼出来的必答题（见本类 {@code appUserService} 字段的说明）。
+     *
+     * <p>⚠️ 查不到时写 <b>NULL 而不是抛异常</b>：{@code X-Xbla-User-Id}
+     * 不是认证，一个不存在的 id 和一个没带头在语义上没有区别 ——
+     * 都是「我们不知道你是谁」。工具那条路也照旧会拿请求头里的值去查，
+     * 查不到就照它自己的既有逻辑回一句实话。
+     */
+    private Long verifiedUserId(Long userId) {
+        if (userId == null) {
+            return null;
+        }
+        boolean exists = appUserService.getById(userId) != null;
+        if (!exists) {
+            log.debug("身份 user#{} 在 app_user 里不存在，本次按匿名处理", userId);
+            return null;
+        }
+        return userId;
+    }
+
+    /**
+     * 认领一个还没有归属的会话；已经有归属的一律不动。
+     *
+     * <p>★ 认领用条件 UPDATE（{@code ... AND user_id IS NULL}）而不是
+     * 先读后写：两个请求同时认领同一个会话时，先读后写会两个都以为自己赢了，
+     * 而条件 UPDATE 的第二个会更新 0 行、静默让位。<b>幂等且并发安全。</b>
+     */
+    private void claimSession(ChatSession existing, Long owner) {
+        Long current = existing.getUserId();
+        if (current != null) {
+            if (owner != null && !current.equals(owner)) {
+                // ★ 这是「改绑」意图 —— 不覆盖，只报告。见方法注释上面的规则表
+                log.warn("★ 会话 id={} 已归属 user#{}，本次请求身份是 user#{} —— 不覆盖",
+                        existing.getId(), current, owner);
+            }
+            return;
+        }
+        if (owner == null) {
+            return;                     // 没身份可认领，保持匿名
+        }
+        try {
+            boolean claimed = chatSessionService.lambdaUpdate()
+                    .eq(ChatSession::getId, existing.getId())
+                    .isNull(ChatSession::getUserId)
+                    .set(ChatSession::getUserId, owner)
+                    .update();
+            if (claimed) {
+                existing.setUserId(owner);      // 让内存里的对象和库里一致
+                log.debug("会话 id={} 被 user#{} 认领", existing.getId(), owner);
+            }
+        } catch (Exception e) {
+            // ★ 认领失败不该让问答失败 —— 它只是一条归属信息，
+            //   而且失败时那一列仍然是 NULL，是「不知道」的诚实表达
+            log.warn("会话 id={} 认领失败：{}", existing.getId(), e.getMessage());
+        }
     }
 
     /** 更新会话的活跃时间与消息计数 */
@@ -1213,7 +1457,40 @@ public class ChatServiceImpl implements ChatService {
         }
 
         log.setSessionId(session.getId());
-        log.setUserId(session.getUserId());
+
+        // ★★ 身份（阶段 9 起才真的有值）—— 取【请求粒度】的 ctx.userId()，
+        //    而不是会话粒度的 session.getUserId()。
+        //
+        //    两个数在「同一个 sessionNo 上换了头」时会不同，而那不是数据不一致：
+        //       session.user_id  这个会话是谁开的（write-once）
+        //       qa_log.user_id   这一问是谁提的（逐条）
+        //    评测要回答的是后者（「这道题是谁问的」），所以取 ctx。
+        //    ★ 它和工具那条路用的是同一个值 —— 工具查的是谁的订单，
+        //      这一列就该记谁，否则「查了 A 的订单但记成 B」会静默成立。
+        //
+        // ★★ 这一列从阶段 9 起是一张【形状表】，不是一句「它总是 X」：
+        //      阶段 9 之前的行        恒为 NULL（历史不可追）
+        //      之后 · 头缺席           NULL（匿名，合法）
+        //      之后 · 头指向不存在的人  【原样记下那个值】（如 999999）—— 见下
+        //      之后 · 正常             请求头里那个 id
+        //
+        // ★★★ 最后那一格和 chat_session.user_id 【刻意不同】，别去「修」它：
+        //      chat_session.user_id 在写之前会核对 app_user（那一列上有 FK），
+        //      查不到就记 NULL；而这一列不核对，原样记。
+        //
+        //      理由是「工具那条路拿的就是这个值」：
+        //        QueryOrderStatusTool 执行的是 WHERE user_id = <请求头里的值>，
+        //      所以 999999 才是【这一次真正被使用的身份】。
+        //      记成 NULL 的话，「这次用的是哪个身份」就答不出来了。
+        //
+        //      ★ 而且「没有身份」和「伪造了身份」是两件不同的事 ——
+        //        合并成 NULL 会把「有人拿伪造的头打了一发」这个证据毁掉，
+        //        而那正是排查坑 33 时唯一想看的线索。
+        //
+        //      ⚠️ 代价（用时必须知道）：这一列【可能不存在于 app_user】。
+        //        所以任何 JOIN app_user 都会静默丢掉那些行，
+        //        distinct(user_id) 也会被伪造的头灌水。
+        log.setUserId(ctx.userId());
         log.setQuestion(question);
 
         // ★ trace 为 null 表示【没有发生生成调用】（澄清反问路径）——
@@ -1381,6 +1658,36 @@ public class ChatServiceImpl implements ChatService {
     /** 意图 code，没分类时为 {@code null}。★ 不填占位串，理由见 {@code ChatAskResponse.intent} */
     private static String intentCode(IntentClassification intent) {
         return intent == null ? null : intent.code();
+    }
+
+    /**
+     * 把「方法参数里的身份」和「上下文里的身份」收敛成一个（阶段 9）。
+     *
+     * <h3>★ 为什么会有两个来源</h3>
+     *
+     * <p>线上<b>不会有</b>：两条流式接口和非流式接口都在控制器里解析<b>一次</b>请求头，
+     * 同一个值分别塞进 {@code Admission}（进而进 {@code CallContext}）和
+     * 方法参数。所以正常路径上两者逐字相同。
+     *
+     * <p>不一致只可能来自<b>调用方写错了</b> —— 测试、探针、或者将来的新入口。
+     * 所以这里的处理是：<b>以参数为准 + 打 WARN</b>，而不是静默择一。
+     * 静默择一的后果是「工具查了别人的订单」，而日志里一行异常都没有。
+     *
+     * <p>★ 参数为 {@code null} 时<b>什么都不做</b>（保留上下文里的）。
+     * 这与 {@code CallContext.withUserId} 的语义一致：null 是「不改」，不是「清空」。
+     * 反过来写的话，{@code ask(request, null, ctx)} 会把排队层解析好的身份擦掉 ——
+     * 而那个调用形态在测试里很常见。
+     */
+    private static CallContext convergeIdentity(Long userId, CallContext ctx) {
+        if (userId == null) {
+            return ctx;
+        }
+        if (ctx.userId() != null && !ctx.userId().equals(userId)) {
+            log.warn("★ 身份有两个来源且不一致：方法参数=user#{} 上下文=user#{}（traceId={}）"
+                            + " —— 以方法参数为准",
+                    userId, ctx.userId(), ctx.traceId());
+        }
+        return ctx.withUserId(userId);
     }
 
     private ChatAskResponse buildStreamResponse(String traceId, ChatSession session,

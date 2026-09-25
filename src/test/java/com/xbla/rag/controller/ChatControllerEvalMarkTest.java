@@ -185,7 +185,7 @@ class ChatControllerEvalMarkTest {
                 sink.onStart("t-1", "s-1");
                 sink.onComplete(plainAnswer());
                 return null;
-            }).when(chatService).askStream(any(ChatAskRequest.class), any(), any(CallContext.class));
+            }).when(chatService).askStream(any(ChatAskRequest.class), any(), any(), any(CallContext.class));
         }
 
         @Test
@@ -247,7 +247,7 @@ class ChatControllerEvalMarkTest {
     private CallContext capturedStreamContext() {
         ArgumentCaptor<CallContext> captor = ArgumentCaptor.forClass(CallContext.class);
         verify(chatService, timeout(5_000))
-                .askStream(any(ChatAskRequest.class), any(), captor.capture());
+                .askStream(any(ChatAskRequest.class), any(), any(), captor.capture());
         return captor.getValue();
     }
 }

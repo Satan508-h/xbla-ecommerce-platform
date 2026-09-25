@@ -30,6 +30,33 @@ import com.xbla.rag.common.TraceId;
  * <p>收成一个对象之后，传的是「这一个请求的全部上下文」，
  * 加字段不会改任何签名。
  *
+ * <h2>★★ 阶段 9 加的第五样：{@code userId} —— 身份为什么也走这里</h2>
+ *
+ * <p>在它之前，身份是 {@code ask(request, userId, ctx)} 的<b>方法参数</b>，
+ * 而流式那条路根本没有它（{@code askStream} 只有三个参数），
+ * 症状是 {@code retrieval = TOOL} 的意图在 SSE 上<b>静默降级成普通 KB 问答</b>。
+ *
+ * <p>补它的方式有两种，本项目选了后者：
+ *
+ * <pre>
+ *   ① 给 askStream 加第四个参数
+ *      → 同一个请求里身份有了【两个来源】：排队层解析的那个（Admission 里带着，
+ *        被限流那条路正拿它写 qa_log）和控制器传下去的那个。
+ *        两者不一致时以谁为准，会变成一个新问题 —— 而 ADR-065 已经为
+ *        「身份只能有一个出处」打过一次架。
+ *   ② 放进本对象（采纳）
+ *      → 排队层构造它的时候顺手带上，服务层直接用。
+ *        一次解析、一处存放、两条路同源。
+ * </pre>
+ *
+ * <p>★ <b>这不违反 ADR-065 那条纪律。</b>那条防的是「身份变成单例 Bean 的字段 →
+ * 并发下 A 看到 B 的数据」。本对象是<b>每请求一次</b>的不可变记录，
+ * 从不被存进任何字段，生命周期就是一次问答。
+ *
+ * <p>★★ 顺带买到的一条：本类是 {@code record}，<b>加一个分量会让所有构造点在
+ * 编译期一起报错</b>。而 ADR-081 记的正是「漏一个构造点 → 编译通过、无日志、
+ * 评测流量伪装成真实用户」—— record 的规范构造器就是那个坑的结构性防御。
+ *
  * <h2>★★ 什么时候它是「没有排队」</h2>
  *
  * <p>{@link #queueMs()} 和 {@link #queuePosition()} 都是 <b>Integer 而不是 int</b>，
@@ -52,8 +79,15 @@ import com.xbla.rag.common.TraceId;
  * @param eval          评测运行标记；<b>null = 真实用户的提问</b>（常态）。
  *                      见 {@link EvalMark} —— 它只被透传进 {@code qa_log}，
  *                      不参与任何业务判断
+ * @param userId        身份，来自 {@code X-Xbla-User-Id} 请求头；<b>null = 匿名</b>（常态）。
+ *                      <p>★ 它<b>不是认证</b>（明文未签名，见 {@code McpToolContext}），
+ *                      做到的是「身份不进模型的可控范围」。
+ *                      <p>★ 它的用途有两处：① 工具那条路查「我的订单/我的券」；
+ *                      ② {@code qa_log.user_id} —— 阶段 9 起才真的有值，
+ *                      在那之前那一列恒为 NULL。
  */
-public record CallContext(String traceId, Integer queueMs, Integer queuePosition, EvalMark eval) {
+public record CallContext(String traceId, Integer queueMs, Integer queuePosition,
+                          EvalMark eval, Long userId) {
 
     /**
      * 没经过排队层的调用（测试、探针、以及 {@code xbla.ratelimit.enabled=false}）。
@@ -62,7 +96,7 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
      * 如果这里填 0，阶段 7 就分不清「没开排队」和「开了但没排队」了。
      */
     public static CallContext fresh(String traceId) {
-        return new CallContext(traceId, null, null, null);
+        return new CallContext(traceId, null, null, null, null);
     }
 
     /**
@@ -72,11 +106,29 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
      * 「评测标记落不落库」，不必把排队层拉起来。
      */
     public static CallContext fresh(String traceId, EvalMark eval) {
-        return new CallContext(traceId, null, null, eval);
+        return new CallContext(traceId, null, null, eval, null);
     }
 
     /** 自动生成一个 traceId 的「没排队」上下文 */
     public static CallContext fresh() {
         return fresh(TraceId.newId());
+    }
+
+    /**
+     * 换一个身份，其余分量一个字不动。
+     *
+     * <p>★★ <b>{@code null} 是「不改」，不是「清空」。</b>这两个语义都说得通，
+     * 但选后者的代价是：任何一处写了 {@code ctx.withUserId(someNullableValue)}
+     * 都能把上游解析好的身份<b>悄悄擦掉</b>，而症状是「工具题答不出我的订单」，
+     * 日志里一切正常。选前者之后，擦除这个动作<b>在本类型里不可表达</b>。
+     *
+     * <p>★ 它<b>不</b>判断新旧哪个对 —— 那是调用点的事。
+     * {@code ChatServiceImpl} 那边会比对方法参数与上下文里的身份，
+     * 不一致时打 WARN（见那个收敛方法）。
+     */
+    public CallContext withUserId(Long userId) {
+        return userId == null
+                ? this
+                : new CallContext(traceId, queueMs, queuePosition, eval, userId);
     }
 }

@@ -74,17 +74,15 @@ public interface ChatService {
     ChatAskResponse ask(ChatAskRequest request, Long userId, CallContext ctx);
 
     /**
-     * 流式问答。正文通过 {@code sink} 逐段推出。
+     * 流式问答（<b>不带身份</b>）。正文通过 {@code sink} 逐段推出。
      *
-     * <p>⚠️ <b>它还没有 {@code userId} 参数 —— 而且这不是遗漏。</b>
-     * 阶段 5.8 只把工具接进了非流式路径（用户拍板的边界），
-     * 所以这条路上的 {@code retrieval = TOOL} 意图会走成一条
-     * <b>没有工具的普通问答</b>。
+     * <p>★★ <b>它是一条「没有身份」的路径，不是「忘了传身份」。</b>
+     * 留给测试和探针 —— 它们不起 Web 环境，也就没有请求头可解析。
+     * 线上那两条流式接口（GET/POST {@code /api/chat/stream}）走的都是下面那个
+     * 四参版本。
      *
-     * <p>★ 5.9 接流式时要做的第一件事就是<b>补上这个参数</b>。
-     * 把它写在签名旁边，是因为「两条平行路径少改了一条」是本项目
-     * 已经踩过的坑（见 {@code ADR-047}），而那种漏改
-     * <b>编译能过、测试能绿、只有演示的时候才看得出来</b>。
+     * <p>⚠️ 走这里的调用方拿不到任何「我的」东西：工具那条路会回一句
+     * 「需要先知道你是哪位」（{@code ToolLoop} 的既定行为，不是异常）。
      *
      * <p><b>方法返回时代表流程结束</b>（成功或失败），
      * 但结束的「通知」是通过 {@link ChatStreamSink#onComplete} /
@@ -98,19 +96,40 @@ public interface ChatService {
     void askStream(ChatAskRequest request, ChatStreamSink sink);
 
     /**
-     * 流式问答，<b>由调用方指定 traceId</b>（阶段 6 新增的重载）。
+     * 流式问答，<b>由调用方指定身份与 traceId</b>。
      *
      * <p>存在的理由和 {@link #ask(ChatAskRequest, Long, CallContext)} 完全一样：
-     * 排队层先拿到 id，问答层沿用同一个。**两条路必须一起加重载** ——
+     * 排队层先拿到 id，问答层沿用同一个。两条路必须一起改 ——
      * 这是刻意的，因为「只改了一条」在本项目已经发生过（ADR-047），
      * 而那种漏改编译能过、测试能绿，只有演示的时候才看得出来。
      *
-     * <p>★ 阶段 6 的流式路径是<b>排队层在主调它</b>，所以这个重载就是
-     * 流式路上真正被调用的那个；两参版本留给「不走排队的调用方」（测试、探针）。
+     * <p>★ 阶段 6 的流式路径是<b>排队层在主调它</b>，所以它就是流式路上
+     * 真正被调用的那个；两参版本留给「不走排队的调用方」（测试、探针）。
      *
-     * @param ctx 调用上下文（链路 ID + 排队信息）。★ traceId 为空时回落到自己生成一个
+     * <h3>★★ 阶段 9：为什么 {@code userId} 是一个新参数，而不是从 {@code ctx} 里读</h3>
+     *
+     * <p>因为<b>两个来源不能都留着</b>。{@code ctx} 里已经有身份了
+     * （排队层放进去的，和 {@code Admission} 同源），如果这里不再要一个参数、
+     * 只从 {@code ctx} 读，那么「测试/探针想指定一个身份」就得先伪造一个
+     * 完整的 {@code CallContext} —— 那比多一个参数难用得多。
+     *
+     * <p>★ 而如果改成<b>重载</b>（保留三参版本），控制器漏传一个参数就<b>编译通过</b>，
+     * 症状正好是 9.1 要修的那个：{@code retrieval = TOOL} 的意图在流式路上
+     * 静默降级成普通 KB 问答。<b>「忘了传身份」必须是编译错误。</b>
+     * —— 所以三参版本被删掉，而不是被重载。
+     *
+     * <p>★ 两个来源不一致时以<b>参数</b>为准并打 WARN（见
+     * {@code ChatServiceImpl} 的收敛方法）。线上两者必然相同（同一个头、
+     * 同一次解析），不一致只可能是调用方写错了。
+     *
+     * @param request 提问
+     * @param sink    事件接收器，由 controller 适配到 SseEmitter
+     * @param userId  身份，<b>可为 null</b>（匿名）。同
+     *                {@link #ask(ChatAskRequest, Long, CallContext)} 那条的说明
+     * @param ctx     调用上下文（链路 ID + 排队信息 + 身份）。
+     *                ★ traceId 为空时回落到自己生成一个
      */
-    void askStream(ChatAskRequest request, ChatStreamSink sink, CallContext ctx);
+    void askStream(ChatAskRequest request, ChatStreamSink sink, Long userId, CallContext ctx);
 
     /**
      * 流式事件的接收端。

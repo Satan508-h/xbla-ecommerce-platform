@@ -113,7 +113,13 @@ public class ChatAdmissionService {
      *
      * @param traceId 链路 ID。<b>排队层生成，一路用到 {@code qa_log.trace_id}</b>
      * @param question 用户原话，只为写那一行记录
-     * @param userId  身份，可为 null（流式路径目前不带身份）
+     * @param userId  身份，可为 null（匿名）。
+     *                <p>★ 阶段 9 起它被<b>两个</b>下游带上：{@link #contextOf}（正常路径，
+     *                转进 {@code CallContext}）和 {@link #rateLimitedLog}（拒绝路径，
+     *                直接写 {@code qa_log.user_id}）。在那之前只有后者用它，
+     *                所以流式那条路上工具意图查不到「我的订单」。
+     *                <p>★★ <b>它是身份在这一次请求里的唯一出处。</b>控制器解析一次、
+     *                塞进这里，往下不再有第二个来源 —— 这是 ADR-065 那条纪律的兑现。
      * @param eval    评测运行标记（阶段 7）；<b>null = 真实用户的提问</b>。
      *                见 {@link com.xbla.rag.common.EvalMark}。
      *                <p>★ 它在<b>这一层</b>而不是 {@code CallContext} 里就出现，
@@ -249,7 +255,14 @@ public class ChatAdmissionService {
             //   这正是「没开排队」该有的样子。记 0 的话，阶段 7 分不清
             //   「没开排队」和「开了但没排队」，而那是两个不同的实验条件。
             //   （同 ADR-010「拿不到就记 NULL」、以及 rewritten_question 的处置。）
-            runWithRelease(admission, listener, CallContext.fresh(admission.traceId(), admission.eval()), work);
+            //
+            //   ★ 身份仍然要带上（阶段 9）：排队关了、身份没关。
+            //     漏了这一步的症状是「关掉限流之后工具题全部答不出我的订单」——
+            //     而限流开关和身份本来是两件毫不相干的事，没人会往那边查。
+            runWithRelease(admission, listener,
+                    CallContext.fresh(admission.traceId(), admission.eval())
+                            .withUserId(admission.userId()),
+                    work);
             return;
         }
 
@@ -783,7 +796,11 @@ public class ChatAdmissionService {
      */
     private static CallContext contextOf(Admission admission, long waited, Integer initialPosition) {
         Integer queueMs = initialPosition == null ? null : (int) waited;
-        return new CallContext(admission.traceId(), queueMs, initialPosition, admission.eval());
+        // ★ 身份在这里转进上下文（阶段 9）—— 这是它唯一的一处「入队」动作。
+        //   加上这个分量之后，下方 ChatService 那条链路（含工具路径和 qa_log.user_id）
+        //   用的都是【控制器解析的那一次】，不再有第二个来源。
+        return new CallContext(admission.traceId(), queueMs, initialPosition, admission.eval(),
+                admission.userId());
     }
 
     /** 被限流挡掉的累计次数 —— 出在探针上 */

@@ -307,11 +307,14 @@ public class ChatController {
         //    同一个 id 一路用到 qa_log.trace_id，见 TraceId 类注释。
         String traceId = TraceId.newId();
 
-        // ★ 身份在这里解析（和 /api/chat 同一个头），带进排队层只为
-        //   在被拒绝时能写出一行完整的 qa_log —— 见 Admission 的说明。
+        // ★ 身份在这里解析（和 /api/chat 同一个头）。★ 阶段 9 起它有两个去处：
+        //   ① 排队层 —— 被拒绝时能写出一行完整的 qa_log（见 Admission 的说明）；
+        //   ② 服务层 —— 工具那条路查「我的订单」，以及 qa_log.user_id。
+        //   ★★ 两处用的是【同一次解析的同一个值】，所以不存在「以谁为准」的问题。
         //   ★ 评测标记走同一个来源（resolveEvalMark），理由见那个方法。
+        Long userId = resolveUserId(http);
         admission.submit(
-                new ChatAdmissionService.Admission(traceId, request.question(), resolveUserId(http),
+                new ChatAdmissionService.Admission(traceId, request.question(), userId,
                         resolveEvalMark(http)),
                 new QueueEventListener(channel, traceId),
                 // ★★ 这段 work 跑在 answer- 线程上，而【名额的释放在它外面的 finally 里】——
@@ -320,7 +323,11 @@ public class ChatController {
                 // ★ 参数是 CallContext 而不是 traceId：排队时长和初始位置只有
                 //   ChatAdmissionService 知道，由它构造好传进来，再原样交给
                 //   ChatService 落进 qa_log.queue_ms / queue_position。
-                ctx -> runStream(channel, request, ctx));
+                //
+                // ★ userId 被 lambda 【捕获】而不是从 ctx 里读 —— 理由见
+                //   ChatService#askStream(ChatAskRequest, ChatStreamSink, Long, CallContext)：
+                //   让「忘了传」成为编译错误，而不是一次静默降级。
+                ctx -> runStream(channel, request, userId, ctx));
 
         return emitter;
     }
@@ -384,7 +391,7 @@ public class ChatController {
     }
 
     /** 在 answer- 线程上执行的流式流程 */
-    private void runStream(SseChannel channel, ChatAskRequest request, CallContext ctx) {
+    private void runStream(SseChannel channel, ChatAskRequest request, Long userId, CallContext ctx) {
         ChatService.ChatStreamSink sink = new ChatService.ChatStreamSink() {
 
             @Override
@@ -416,10 +423,12 @@ public class ChatController {
         };
 
         try {
-            // ★ 三参重载：沿用排队层那个 traceId，让「排队 90 秒」和
-            //   「回答 3 秒」在日志和 qa_log 里是同一条记录。
-            //   同时把 queue_ms / queue_position 带进去落库。
-            chatService.askStream(request, sink, ctx);
+            // ★ 四参：沿用排队层那个 traceId（让「排队 90 秒」和「回答 3 秒」
+            //   在日志和 qa_log 里是同一条记录），并把 queue_ms / queue_position
+            //   带进去落库。
+            //   ★ 阶段 9 起还带上 userId —— 少了它，流式路上的工具意图会
+            //     静默降级成普通 KB 问答（那正是 9.1 要修的东西）。
+            chatService.askStream(request, sink, userId, ctx);
         } catch (Exception e) {
             // service 内部已经把失败写进 qa_log 并调用过 onError 了，
             // 走到这里通常是「连 onError 都发不出去」，记日志即可
