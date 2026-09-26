@@ -3,6 +3,7 @@ package com.xbla.rag.rag.eval;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xbla.rag.agent.intent.IntentTree;
+import com.xbla.rag.agent.intent.RetrievalGate;
 import com.xbla.rag.entity.EvalQuestion;
 import com.xbla.rag.entity.QaLog;
 import com.xbla.rag.mapper.EvalQuestionMapper;
@@ -1003,7 +1004,23 @@ public class EvalReportService {
         long rowsNoBank = 0;
         long noModeQuestions = 0;
 
+        // ★★★ 六个 gate 分支【先全部填 0】再计数 —— 让「这一支没被走到」变成可见的 0。
+        //
+        //   不填的话它只是【缺席】，而缺席和「没有这一支」在报告里长得一样。
+        //   实测（2026-09-26，954 行）：只出现过 KB / NONE_INTENT / TOOL 三支，
+        //   另外三支的 0 各自是一条**有价值的证据**，全都印不出来：
+        //     PLAN_OFF      = 模型主动关掉检索。0 = 这一支从没被验证过（★ 待办）
+        //     NONE_DISABLED = 「NONE 也检索」= 9.2 之前的行为。0 = **开关是开的**
+        //     NO_CLASSIFY   = 分类失败 / 没开意图识别 / 模型编了个 code。
+        //                     0 = 分类【一次都没失败过】—— 这条现在是隐形的
+        //   ★ 名字直接引用 {@link RetrievalGate} 的常量，不重打一遍：
+        //     两处各写一份的漂移是静默的（ADR-057 的同一条道理）。
         Map<String, Long> gateCount = new TreeMap<>();
+        for (String reason : List.of(RetrievalGate.REASON_KB, RetrievalGate.REASON_PLAN_OFF,
+                RetrievalGate.REASON_TOOL, RetrievalGate.REASON_NONE_INTENT,
+                RetrievalGate.REASON_NONE_DISABLED, RetrievalGate.REASON_NO_CLASSIFY)) {
+            gateCount.put(reason, 0L);
+        }
         Map<String, Long> shapeCount = new TreeMap<>();
         List<String> gateIgnored = new ArrayList<>();
         Map<String, Set<String>> decisions = new TreeMap<>();
@@ -1120,7 +1137,13 @@ public class EvalReportService {
                 + "而回退路径的 retrieve 是默认值，不是模型说的）。"
                 + " ★★ 「跨次决策翻转」那一栏【排除多轮题】：多轮题的几行是"
                 + "不同的轮次、不是同一句话的重复测量，所以「首轮不检索、次轮检索了」"
-                + "是设计而不是抖动 —— 实测它报过 5 道纯假阳性。被排除的题号单列一栏。");
+                + "是设计而不是抖动 —— 实测它报过 5 道纯假阳性。被排除的题号单列一栏。"
+                + " ★★★ gate 分布【六支全部印出来，包括 0】—— 缺席和「没有这一支」"
+                + "长得一样。三支零的读法完全不同："
+                + "PLAN_OFF（模型主动关掉检索）为 0 = 这一支【从没被数据验证过】；"
+                + "NONE_DISABLED（NONE 也检索 = 9.2 之前的行为）为 0 = 开关是开的，是好消息；"
+                + "NO_CLASSIFY（分类失败/没开意图识别/模型编了个 code）为 0 = "
+                + "分类【一次都没失败过】—— 这条在六支填 0 之前是隐形的。");
         return out;
     }
 

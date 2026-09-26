@@ -461,7 +461,13 @@ def compute(run_id: str):
     rd_q_den = {"不检索": 0, "要检索": 0}
     rd_skipped = rd_no_bank = rd_nomode = 0
     rd_clarify = 0
-    rd_gate, rd_shape = {}, {}
+    # ★★★ 六支 gate 先全部填 0 —— Java 侧同样这么做。不填的话
+    #   「这一支没被走到」只是【缺席】，和「没有这一支」长得一样。
+    #   ⚠️ 这份清单要跟着 `RetrievalGate.REASON_*` 走：Java 多一支而这里没加，
+    #     对拍会报出来（那一支 Java=0 / Python=None）—— 那正是它该报的。
+    rd_gate = {k: 0 for k in ("KB", "PLAN_OFF", "TOOL",
+                              "NONE_INTENT", "NONE_DISABLED", "NO_CLASSIFY")}
+    rd_shape = {}
     rd_ignored, rd_flipped = [], []
     for v in views:
         if not v["in_bank"]:

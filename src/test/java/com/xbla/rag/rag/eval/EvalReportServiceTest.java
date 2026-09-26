@@ -1414,6 +1414,37 @@ class EvalReportServiceTest {
                             + "变成一个假阳性 —— 而那个数看起来像个实实在在的缺陷");
         }
 
+        /**
+         * ★★★ {@code gate} 分布必须【六支全在】，哪怕某几支一次都没走到。
+         *
+         * <p>缺席和「没有这一支」在报告里长得一样 —— 而三支零的读法完全不同：
+         * {@code NO_CLASSIFY} 为 0 = 分类一次都没失败过（**好消息**），
+         * {@code PLAN_OFF} 为 0 = 这一支从没被数据验证过（**待办**）。
+         * 少了这一格，这两件事都印不出来。</p>
+         */
+        @Test
+        @DisplayName("★★★ gate 分布六支全在 —— 零也要印出来，缺席和「没有这一支」不一样")
+        void gateDistributionKeepsZeroBranches() {
+            List<EvalQuestion> bank = List.of(q("A", "LEAF_A", 1L));
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            QaLog one = row("A", 1, "LEAF_A", d);
+            one.setIntentPlan(plan("KB", true, "JSON", "[]", null));
+
+            Map<String, Object> gate = sub(
+                    section(run(List.of(one), bank), "检索决策"), "gate分布");
+
+            assertEquals(1L, num(gate, "KB"));
+            for (String zero : List.of("PLAN_OFF", "TOOL", "NONE_INTENT",
+                    "NONE_DISABLED", "NO_CLASSIFY")) {
+                assertTrue(gate.containsKey(zero),
+                        "★★ 六支里 `" + zero + "` 缺席了 —— 实测 954 行只走到过 3 支，"
+                                + "另外 3 支的 0 各自是一条证据（分类从没失败过 / 开关是开的 /"
+                                + " 模型从没主动关过检索），缺席的话它们全印不出来");
+                assertEquals(0L, num(gate, zero));
+            }
+            assertEquals(6, gate.size(), "★ 多一支少一支都要在这里红");
+        }
+
         @Test
         @DisplayName("★★ shape 分布是「门控到底有没有生效」的唯一判据")
         void shapeDistribution() {
