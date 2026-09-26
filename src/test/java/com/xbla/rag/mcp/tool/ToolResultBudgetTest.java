@@ -1,11 +1,19 @@
 package com.xbla.rag.mcp.tool;
 
 import com.xbla.rag.agent.tool.ToolLoop;
+import com.xbla.rag.entity.AppUser;
+import com.xbla.rag.entity.OrderItem;
+import com.xbla.rag.entity.Orders;
 import com.xbla.rag.entity.Product;
+import com.xbla.rag.entity.ProductSku;
 import com.xbla.rag.mcp.McpArguments;
 import com.xbla.rag.mcp.McpToolContext;
 import com.xbla.rag.mcp.McpToolResult;
+import com.xbla.rag.service.AppUserService;
+import com.xbla.rag.service.OrderItemService;
+import com.xbla.rag.service.OrdersService;
 import com.xbla.rag.service.ProductService;
+import com.xbla.rag.service.ProductSkuService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -88,6 +96,18 @@ class ToolResultBudgetTest {
 
     @Autowired
     private RecommendProductsTool recommendProductsTool;
+
+    @Autowired
+    private AppUserService appUserService;
+
+    @Autowired
+    private OrdersService ordersService;
+
+    @Autowired
+    private OrderItemService orderItemService;
+
+    @Autowired
+    private ProductSkuService productSkuService;
 
     // ============================================================
     // 夹具
@@ -181,6 +201,66 @@ class ToolResultBudgetTest {
     private static java.util.List<Map<String, Object>> rows(McpToolResult result, String key) {
         assertThat(result.data()).as("结构化数据不该为空").isNotNull();
         return (java.util.List<Map<String, Object>>) ((Map<String, Object>) result.data()).get(key);
+    }
+
+    /**
+     * 造一个「有购买证据」的用户：3 笔有效订单，买的都是 {@code category} / {@code brand}
+     * 顶格商品（阶段 9.5 的偏好最坏形状）。
+     *
+     * <p>★ 3 笔是 {@code xbla.agent.profile.min-orders} 的下限 —— 少一笔
+     * 这个人就没有偏好，而那样偏好的那几段正文一个字都不会出现。
+     */
+    private long userWithHistoryOf(String category, String brand) {
+        AppUser user = new AppUser();
+        user.setUserNo("S-BG-" + System.nanoTime());
+        user.setNickname("预算测试用户");
+        user.setMemberLevel(4);
+        appUserService.save(user);
+
+        for (int i = 0; i < 3; i++) {
+            Product p = new Product();
+            p.setProductNo(padTail("BGAFF" + i + System.nanoTime(), schemaMax("product_no")));
+            p.setName("预算偏好历史" + i);
+            p.setCategory(category);
+            p.setBrand(brand);
+            // 和历史成交价一致 —— 让「价格量级相符」那一分也命中
+            p.setPrice(new BigDecimal("9999999.99"));
+            p.setStatus(1);
+            p.setDeleted(0);
+            productService.save(p);
+
+            ProductSku sku = new ProductSku();
+            sku.setProductId(p.getId());
+            sku.setSkuNo("BGSKU-" + p.getId());
+            sku.setSpecName("标准版");
+            sku.setPrice(new BigDecimal("9999999.99"));
+            sku.setStatus(1);
+            sku.setDeleted(0);
+            productSkuService.save(sku);
+
+            Orders order = new Orders();
+            order.setOrderNo("SOBG" + System.nanoTime() + "-" + i);
+            order.setUserId(user.getId());
+            order.setTotalAmount(new BigDecimal("9999999.99"));
+            order.setDiscountAmount(BigDecimal.ZERO);
+            order.setPayAmount(new BigDecimal("9999999.99"));
+            order.setStatus(40);
+            order.setCreatedAt(java.time.OffsetDateTime.now());
+            order.setDeleted(0);
+            ordersService.save(order);
+
+            OrderItem item = new OrderItem();
+            item.setOrderId(order.getId());
+            item.setProductId(p.getId());
+            item.setSkuId(sku.getId());
+            item.setProductName(p.getName());
+            item.setSpecName("标准版");
+            item.setPrice(new BigDecimal("9999999.99"));
+            item.setQuantity(1);
+            item.setSubtotal(new BigDecimal("9999999.99"));
+            orderItemService.save(item);
+        }
+        return user.getId();
     }
 
     /** 把「正文多少字 / 上限多少」写进断言消息 —— 红了要一眼看出差多少 */
@@ -308,6 +388,51 @@ class ToolResultBudgetTest {
             assertThat(result.text()).contains("为什么是它");
 
             assertWithinBudget(result, "recommend_products");
+        }
+
+        /**
+         * ★★ <b>阶段 9.5 的最坏形状：这个用户还有偏好</b>。
+         *
+         * <p>偏好会让每条推荐多一句「你的历史：…」，正文尾部还要多两段说明。
+         * 实测多出来的是<b>尾巴上的一截</b> —— 而超预算的症状正是
+         * 「最后的推荐被静默截掉」，所以这一条必须单独测。
+         *
+         * <p>⚠️ 上面那条用例（{@code userId=1}，库里不存在的人）<b>覆盖不到</b>它：
+         * 没有偏好时正文里一个「你的历史」都没有。这正是本类开头那句
+         * 「夹具必须真的是最坏形状」的又一次应用。
+         */
+        @Test
+        @DisplayName("★★ 带偏好时也在预算内（正文会长出一截）")
+        void worstCaseWithAffinityStaysWithinBudget() {
+            String keyword = "bg推荐偏好";
+            createWorstCaseProducts(keyword, 10);
+
+            // 和 createWorstCaseProducts 用【同一套】顶格类目/品牌 ——
+            // 这样偏好的三条理由全都能命中，长出来的那截才是完整的
+            String category = keyword + fill('类', schemaMax("category") - keyword.length());
+            String brand = keyword + fill('牌', schemaMax("brand") - keyword.length());
+            long user = userWithHistoryOf(category, brand);
+
+            Map<String, Object> args = new LinkedHashMap<>();
+            args.put("need", NEED_HIT);
+            args.put("category", category);
+            args.put("top_n", 5);
+            McpToolResult result = recommendProductsTool.call(
+                    McpArguments.of(args, recommendProductsTool.inputFields()),
+                    new McpToolContext(user));
+
+            assertThat(rows(result, "picks"))
+                    .as("★ 先证明夹具够重：满 5 条，且偏好真的生效了")
+                    .hasSize(5);
+            assertThat(result.text())
+                    .as("★ 没有这一条，这个用例测的是「无偏好」那个形状")
+                    .contains("你的历史")
+                    .contains("只用来在【已经匹配上的】商品之间分先后");
+
+            // ★★ 实测值：2986 字（2026-09-25，带满三条偏好理由 + 组内细排那两句话）。
+            //   比不带偏好的那条多约 250 字 —— 而多出来的全在【尾巴】上，
+            //   超预算的症状正是「末尾的推荐被静默截掉」
+            assertWithinBudget(result, "recommend_products（带偏好）");
         }
     }
 }

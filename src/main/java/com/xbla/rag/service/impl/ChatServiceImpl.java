@@ -22,6 +22,8 @@ import com.xbla.rag.rag.RetrievalPipeline;
 import com.xbla.rag.rag.RetrievalTrace;
 import com.xbla.rag.rag.facts.PolicyFactProvider;
 import com.xbla.rag.rag.facts.StructuredFacts;
+import com.xbla.rag.rag.profile.UserAffinity;
+import com.xbla.rag.rag.profile.UserAffinityProvider;
 import com.xbla.rag.rag.prompt.RagPromptBuilder;
 import com.xbla.rag.rag.retrieve.RetrievalOptions;
 import com.xbla.rag.rag.retrieve.RetrievedChunk;
@@ -168,6 +170,15 @@ public class ChatServiceImpl implements ChatService {
      * 查不到就如实记 NULL（= 匿名），这才是与「它不是认证」相符的处置。
      */
     private final AppUserService appUserService;
+
+    /**
+     * 用户偏好（阶段 9.5 新增）。
+     *
+     * <p>★ 它只在 {@link #affinitySafely} 一处被调用，而那个方法在两条路上
+     * 各被调用<b>恰好一次</b>，结果放回 {@code ctx} ——
+     * 于是 prompt 和 {@code qa_log.affinity} 读的是同一个字符串。
+     */
+    private final UserAffinityProvider userAffinityProvider;
 
     // ============================================================
     // ★ 意图识别（阶段 5.3 新增）
@@ -320,15 +331,21 @@ public class ChatServiceImpl implements ChatService {
      * @param facts  结构化事实（阶段 5.9）。传 {@link StructuredFacts#EMPTY} 表示没有 ——
      *               ★ 不要传 null，那两个含义不同的东西在这里是同一个，
      *               而 null 会让「忘了传」和「确实没有」长得一样
+     * @param ctx    调用上下文（阶段 9.5）。★ 偏好块<b>从它上面取</b>，
+     *               而不是再加一个参数 —— 那一段文字同时要进
+     *               {@code qa_log.affinity}，两边读同一个字段才不可能分叉。
+     *               ⚠️ 它必须在四个调用点上都传同一个 {@code ctx}
+     *               （两条主路各两个），传错一个的症状是「那条路上的人不被个性化」
      */
     private String ragSystemPrompt(String requestSystemPrompt, List<RetrievedChunk> chunks,
-                                   MemoryContext memory, StructuredFacts facts) {
+                                   MemoryContext memory, StructuredFacts facts, CallContext ctx) {
         return ragPromptBuilder.build(
                 systemPromptOrDefault(requestSystemPrompt),
                 chunks,
                 memory.hasHistory(),
                 memory.sessionSummary(),
-                facts);
+                facts,
+                ctx.affinity());
     }
 
     /**
@@ -368,6 +385,49 @@ public class ChatServiceImpl implements ChatService {
             log.error("★ 读取结构化事实失败，本次不带硬数据继续（检索部分不受影响）"
                     + "意图={}: {}", intent.code(), e.getMessage(), e);
             return StructuredFacts.EMPTY;
+        }
+    }
+
+    /**
+     * 派生这位用户的偏好块<b>并渲染成 prompt 里的那一段</b>（阶段 9.5）。
+     *
+     * <h3>★ 为什么渲染也在这里做</h3>
+     *
+     * <p>返回值同时是两样东西：拼进 prompt 的那一段，和
+     * {@code qa_log.affinity} 里存的那一份。<b>它们必须逐字相同</b>，
+     * 而「渲染一次、两处引用」是唯一能保证这件事的形状 ——
+     * 在落库那一层再渲染一遍就是第二个事实来源（同 {@code factsSection}
+     * 那条「只写一次」的纪律）。
+     *
+     * <p>★ 渲染方法本身在 {@link RagPromptBuilder#affinitySection} ——
+     * 它<b>属于 prompt 层</b>（决定模型看到什么），这里只是调用它。
+     * 同 {@code EvalAnswerService} 调 {@code RagPromptBuilder.factsSection} 的形状。
+     *
+     * <h3>★★ 吞异常，和 structuredFactsSafely 完全同一条理由</h3>
+     *
+     * <p>偏好块的异常冒到外层那个 {@code catch} 会被记成「模型链路失败」，
+     * 于是阶段 7 把「订单表读挂了」统计成「模型挂了」——
+     * 归因彻底错乱。而且它比硬数据更边缘：<b>偏好只是锦上添花，
+     * 缺了它检索、生成、工具全都照常工作</b>，没有任何理由让它影响一次问答。
+     *
+     * <p>⚠️ 和硬数据有一处不同，值得写下来：<b>偏好块也进工具那条路</b>
+     * （{@code recommend_products} 的排序要用它）。所以它必须返回一段
+     * 可以安全地放回 {@code ctx} 的东西 —— 失败时返回 {@code null}，
+     * 而 {@code withAffinity(null)} 是「不改」（不是「清空」）。
+     *
+     * @return 渲染好的那一段；{@code null} = 这次没有偏好块
+     *         （匿名 / 用户不存在 / 订单不足 / 开关关掉 / 读挂了）
+     */
+    private String affinitySafely(CallContext ctx) {
+        try {
+            UserAffinity affinity = userAffinityProvider.load(ctx.userId());
+            // ★ EMPTY 有四种来源，对下游是同一件事：这一段不出现。
+            //   它们的区别在 provider 的日志里（那才是能分辨它们的地方）
+            return affinity.isEmpty() ? null : RagPromptBuilder.affinitySection(affinity);
+        } catch (Exception e) {
+            log.error("★ 派生用户偏好失败，本次不带偏好块继续（检索/工具都不受影响）"
+                    + "user={}: {}", ctx.userId(), e.getMessage(), e);
+            return null;
         }
     }
 
@@ -473,6 +533,37 @@ public class ChatServiceImpl implements ChatService {
                     intent, decision, startNanos);
         }
 
+        // ★★ 阶段 9.5：派生这位用户的偏好块，拼进 system prompt 的固定段。
+        //
+        //   ① ★★ 【位置的判据是「这一轮有没有生成调用」】——必须在
+        //      【澄清分支之后】：澄清反问不调生成模型，也就没有 prompt，
+        //      而 {@code qa_log.affinity} 的用途是「还原模型当时看到了什么」。
+        //      放在澄清之前的话，库里会出现一行「带了偏好块，但那一轮
+        //      一个字都没生成」—— 评测拿着它去算 faithfulness，
+        //      而模型【从来没见过】那段文字。
+        //      ⚠️ 这个错位置是本项目最典型的失败形态：不报错、断言全绿，
+        //         直到有人问「这一列到底代表什么」。
+        //
+        //   ② 同时它必须在【检索之前】：纯工具轮也要看得见它
+        //      （推荐工具的排序用的是同一份偏好），而两个分支都在下面。
+        //
+        //   ③ ★★ 【为什么把结果放回 ctx，而不是就地传给下面】——
+        //      同一个字符串要进两个地方：{@code ragSystemPrompt} 和
+        //      {@code qa_log.affinity}。放回 ctx 之后，那两处读的是
+        //      【同一个字段】，于是「prompt 里有、日志里没有」这件事
+        //      在结构上不可能发生。
+        //      ⚠️ 反过来说：忘了这一行的那条路，个性化在那条路上不生效，
+        //         而它的 prompt 与日志会一致地说「没有」—— 自洽，但不撒谎。
+        //         所以两条路各有一条集成测试钉着这一行。
+        //
+        //   ④ 【代价】——一次带索引的聚合查询（实测毫秒级）。
+        //      匿名、开关关掉、用户不存在时它一次库都不查。
+        //      不缓存的理由见 UserAffinity 类注释第二节。
+        //
+        //   ★ 它和 {@code clarifyResumed} 挨着不是巧合：两者都是
+        //     「服务层自己发现、要落进 qa_log 的那一格」。
+        ctx = ctx.withAffinity(affinitySafely(ctx));
+
         // ★★ 工具分支（阶段 5.8）—— 插在【澄清之后、检索之前】。
         //
         //   三个位置都是刻意选的：
@@ -536,7 +627,7 @@ public class ChatServiceImpl implements ChatService {
         ModelCallTrace trace = new ModelCallTrace(traceId);
         ChatRequest modelRequest = ChatRequest.of(
                 ragSystemPrompt(request.systemPrompt(), chunks, memory,
-                        structuredFactsSafely(intent)),
+                        structuredFactsSafely(intent), ctx),
                 memory.history(),
                 request.question());
 
@@ -637,7 +728,7 @@ public class ChatServiceImpl implements ChatService {
         //     那条不变式现在由【意图树】保证，不再由这一行代码保证 ——
         //     这正是它该待的地方。
         String systemPrompt = ragSystemPrompt(request.systemPrompt(), chunks, memory,
-                structuredFactsSafely(intent));
+                structuredFactsSafely(intent), ctx);
 
         try {
             ToolLoop.Result result = toolLoop.run(
@@ -854,7 +945,7 @@ public class ChatServiceImpl implements ChatService {
         //   混合轮在流式路径上同样要看得见切片与硬数据。
         //   ⚠️ 这两处是平行代码，本项目的教训是「只改了一条」编译能过、测试能绿
         String systemPrompt = ragSystemPrompt(request.systemPrompt(), chunks, memory,
-                structuredFactsSafely(intent));
+                structuredFactsSafely(intent), ctx);
 
         try {
             ToolLoop.Result result = toolLoop.run(
@@ -1015,6 +1106,12 @@ public class ChatServiceImpl implements ChatService {
             return;
         }
 
+        // ★★ 阶段 9.5：偏好块 —— 与 ask() 【同序、同判据】（澄清之后、检索之前）。
+        //   四条理由见 ask() 里对应位置的长注释，这里不重复；要点是
+        //   它【必须在澄清分支之后】（澄清轮没有 prompt，那一格的诚实值是 NULL），
+        //   而且同一个字符串要同时进 prompt 和 qa_log.affinity，所以它落在 ctx 上。
+        ctx = ctx.withAffinity(affinitySafely(ctx));
+
         // ★★ 工具分支（阶段 9）—— 与非流式路径【同序、同判据】：
         //   澄清之后、检索之前。那三条位置理由见 ask() 里对应位置的长注释，
         //   这里不重复；要点是「工具意图必须短路掉检索」——
@@ -1061,7 +1158,7 @@ public class ChatServiceImpl implements ChatService {
         ModelCallTrace trace = new ModelCallTrace(traceId);
         ChatRequest modelRequest = ChatRequest.of(
                 ragSystemPrompt(request.systemPrompt(), chunks, memory,
-                        structuredFactsSafely(intent)),
+                        structuredFactsSafely(intent), ctx),
                 memory.history(),
                 request.question());
 
@@ -1785,6 +1882,25 @@ public class ChatServiceImpl implements ChatService {
         //   看起来像 bug。★ 模型的原话在 shape/retrieve 的原始值里另有体现
         //   （见 IntentPlan），而这里要的是「实际发生了什么」。
         log.setIntentPlan(serializeIntentPlan(intent, ctx.clarifyResumed()));
+
+        // ── ★★ 偏好块原文（阶段 9.5 新增）──
+        //
+        // ★ 它和 queue_ms / intent_plan 是同一个理由：在【这一处】填。
+        //   成功、失败、工具、澄清都从这里经过；写在别处的话，
+        //   每加一条路径就多一次「忘了填」的机会。
+        //
+        // ★★ 但它和那两列有一处关键不同：{@code ctx.affinity()} 是
+        //    【从调用点带上来的】，不是在这里重算的。原因见 CallContext 的说明 ——
+        //    重算要读库（订单还会变），因此它不满足「纯函数才能重算」那条前提。
+        //
+        // ★ 它是 NULL 的四种情形都【正常】，而且都是「本来就没有」：
+        //     澄清路径      没生成、没 prompt（ctx 上还没填过）
+        //     匿名          没有「谁」可以个性化
+        //     用户不存在    同上（伪造的头也是这一格）
+        //     订单不足      证据不够，整块省略（xbla.agent.profile.min-orders）
+        //   ⇒ 所以它【不能】填空串：那会让「一次都没注入过」这件事
+        //     在数据上完全看不出来（同 9.2 的 shape、9.4 的 resumed）。
+        log.setAffinity(ctx.affinity());
 
         // ── ★ 意图（阶段 5.3 新增）──
         //

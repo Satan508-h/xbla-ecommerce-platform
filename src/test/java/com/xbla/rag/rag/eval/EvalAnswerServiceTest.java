@@ -362,6 +362,110 @@ class EvalAnswerServiceTest {
     }
 
     // ============================================================
+    // 三之二、★★ 偏好块（阶段 9.5）
+    // ============================================================
+
+    /**
+     * <b>偏好块进不进 {@code contexts}</b>（阶段 9.5）。
+     *
+     * <h3>★★★ 它和硬数据那一节最大的区别：来源是<b>快照</b>，不是重建</h3>
+     *
+     * <p>{@code PolicyFactProvider.load()} 是<b>无参</b>的，所以评测敢现场重建
+     * 「模型当时看到的那一段」；偏好块 per-user 且随订单变，
+     * <b>事后重建出来的不是当时那一段</b>。
+     *
+     * <p>所以这里的判据只能是 {@code qa_log.affinity} 有没有值 ——
+     * 而它<b>就是</b>当时拼进 prompt 的那个字符串（同一个字符串，不是两次渲染）。
+     */
+    @Nested
+    @DisplayName("三之二、★★ 偏好块读的是快照")
+    class AffinitySnapshot {
+
+        private static final String AFFINITY =
+                "【这位用户的购买记录】\n近 180 天内 3 笔已付款订单（共 3 件商品），"
+                        + "涉及 1 个类目：手机×3\n会员等级：银卡";
+
+        /** 给一行打上偏好快照 —— 真实链路上它由 ChatServiceImpl 填（V16 那一列） */
+        private static QaLog withAffinity(QaLog r, String affinity) {
+            r.setAffinity(affinity);
+            return r;
+        }
+
+        @Test
+        @DisplayName("★★★ 有快照 → 它在 contexts 里，排在硬数据与切片之前")
+        void snapshotGoesIntoContextsFirst() {
+            Map<String, Object> r = run(FACTS,
+                    List.of(withAffinity(row("A-1", QaLog.STATUS_SUCCESS, "FACTS_LEAF",
+                            "选这款", detail(1L), 1L), AFFINITY)),
+                    bank(q("A-1", "FACTS_LEAF", "参考")), contents(1));
+
+            Map<String, Object> row = rows(r).get(0);
+
+            assertThat(contexts(row))
+                    .as("★ 顺序按 prompt 里的顺序：偏好 → 硬数据 → 切片。"
+                            + "顺序不影响 faithfulness 的计算，但报告是给人看的，"
+                            + "和 prompt 一致能让「这一行还原了什么」一眼对上")
+                    .containsExactly(AFFINITY, FACTS, "正文1");
+            assertThat(contextsOnly(row))
+                    .as("★★ 和硬数据同一条纪律：context_precision / context_recall 量的是"
+                            + "【检索】质量，偏好是注入的，算进去是循环论证")
+                    .containsExactly("正文1");
+            assertThat(row.get("affinityInjected")).isEqualTo(true);
+        }
+
+        @Test
+        @DisplayName("★★ 反对照：同一批数据，只把快照去掉 → contexts 里就没有它")
+        void withoutSnapshotItIsNotThere() {
+            Map<String, Object> r = run(FACTS,
+                    List.of(row("A-2", QaLog.STATUS_SUCCESS, "FACTS_LEAF", "选这款",
+                            detail(1L), 1L)),
+                    bank(q("A-2", "FACTS_LEAF", "参考")), contents(1));
+
+            Map<String, Object> row = rows(r).get(0);
+
+            assertThat(contexts(row))
+                    .as("★★ 少了这一条，「把偏好无脑拼进去」这个实现也能让上面那条通过 ——"
+                            + "而它会给【每一道】题凭空加一段模型从没见过的上下文，"
+                            + "faithfulness 于是虚高，且没有任何症状")
+                    .containsExactly(FACTS, "正文1");
+            assertThat(row.get("affinityInjected")).isEqualTo(false);
+        }
+
+        @Test
+        @DisplayName("★ 空白快照按「没有」处理 —— 守 V16「这一列不能是空串」那条")
+        void blankSnapshotCountsAsAbsent() {
+            Map<String, Object> r = run(null,
+                    List.of(withAffinity(row("A-3", QaLog.STATUS_SUCCESS, "LEAF_A", "答案",
+                            detail(1L), 1L), "   ")),
+                    bank(q("A-3", "LEAF_A", "参考")), contents(1));
+
+            Map<String, Object> row = rows(r).get(0);
+
+            assertThat(contexts(row)).containsExactly("正文1");
+            assertThat(row.get("affinityInjected")).isEqualTo(false);
+        }
+
+        @Test
+        @DisplayName("★★ 快照是【逐行】的，不是全局参数 —— 同一批里两行各带各的")
+        void snapshotIsPerRowNotPerRun() {
+            String other = "【这位用户的购买记录】\n近 180 天内 5 笔已付款订单（共 6 件商品）";
+            Map<String, Object> r = run(null,
+                    List.of(withAffinity(row("A-4", QaLog.STATUS_SUCCESS, "LEAF_A", "答案1",
+                                    detail(1L), 1L), AFFINITY),
+                            withAffinity(row("A-5", QaLog.STATUS_SUCCESS, "LEAF_A", "答案2",
+                                    detail(2L), 2L), other)),
+                    bank(q("A-4", "LEAF_A", "参考1"), q("A-5", "LEAF_A", "参考2")),
+                    contents(1, 2));
+
+            assertThat(contexts(rows(r).get(0))).startsWith(AFFINITY);
+            assertThat(contexts(rows(r).get(1)))
+                    .as("★★ 偏好是 per-user 的 —— 做成「整轮一个参数」的接口"
+                            + "（像 factsSection 那样）在这里就会把两个人的偏好混起来")
+                    .startsWith(other);
+        }
+    }
+
+    // ============================================================
     // 四、正文还原
     // ============================================================
 

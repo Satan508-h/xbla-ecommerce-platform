@@ -144,6 +144,28 @@ public class QaLog {
     private String intentPlan;
 
     /**
+     * 偏好块原文（阶段 9.5）。
+     *
+     * <p>★★ <b>它是「这一次问答里，模型看到的偏好那一段」的快照</b> ——
+     * 不是从用户当前订单重算出来的。两者的区别是评测能不能复现：
+     * 偏好 per-user 且随订单变，事后重建出来的<b>不是当时那一段</b>，
+     * 而用它算 faithfulness 会让报告里的数字<b>静默偏低</b>。
+     *
+     * <p>★ 它与拼进 prompt 的那一段<b>逐字相同</b>（同一个字符串，
+     * 见 {@code ChatServiceImpl.affinitySafely}）——
+     * 所以评测敢直接把它塞进 RAGAS 的 {@code retrieved_contexts}。
+     * 详见 {@code RagPromptBuilder.affinitySection}（渲染它的唯一方法）。
+     *
+     * <p>★★ <b>{@code NULL} 表示「这次没有偏好块」</b>，不是空串。
+     * 四种正常情形都会走到 NULL：澄清路径（没生成）、匿名、
+     * 身份指向不存在的人、有效订单不足 {@code xbla.agent.profile.min-orders}。
+     * ⚠️ 填一个 {@code ""} 会让「偏好一次都没注入过」这件事
+     * 在数据上完全看不出来 —— 同 {@code intent_plan} 的 {@code shape}
+     * 与 {@code resumed} 要防的那件事。
+     */
+    private String affinity;
+
+    /**
      * 排队等待毫秒数（阶段 6）。
      *
      * <p>★★ <b>{@code NULL} 表示「没排队」，不是 0。</b>

@@ -18,12 +18,19 @@
 **8.7（内网穿透）未做**（选型已定 cpolar，但**没有开** —— 开它 = 把服务暴露到公网，是外向动作）。
 ★ 测试数 824 → **860**。前端在 `frontend/`（Vue 3 + Vite + Element Plus），部署在 `deploy/`。
 
-★★ **阶段 9（Agentic RAG）进行中 —— 9.1 / 9.2 / 9.3 / 9.4 已完成并实测 ✅ 2026-09-25，
-测试数 860 → 870 → 915 → 999 → **1049**。9.5~9.6（个性化 / 离线+在线指标）见 `docs/10`。
+★★ **阶段 9（Agentic RAG）进行中 —— 9.1 / 9.2 / 9.3 / 9.4 / 9.5 已完成并实测 ✅ 2026-09-25，
+测试数 860 → 870 → 915 → 999 → 1049 → 1087 → **1092**。只剩 9.6（离线 + 在线指标）见 `docs/10`。
 ★ 工具从 3 个扩到 **6 个**，并且**按意图裁剪**（白名单，见下 §九）。
 ★ 唯一一个**混合轮**叶子：`SCENARIO_PICK`（先检索、再给工具）。
 ★ 9.4 让澄清反问变成**多轮**：反问的槽位状态存一列、下一轮读出来拼进分类 prompt
   （读后即清、只出现一轮）。实测「追问被挡回去」从 **2/3 掉到 0/3**（n=3）。
+★ 9.5 让个性化**从订单实时派生**（不建画像表、不缓存），落在**推荐排序**和
+  **prompt 偏好块**两处；偏好块**必须快照**（`qa_log.affinity`，V16）——
+  它 per-user 且随订单变，**不能**像硬数据那样事后重建。
+★ 推荐排序是**三层**：总分 → 同分按「买过几次 / 价格多近」细排 → 编号。
+  实测（`docs/05` §9.12 ⑧）：6 个组合 **3 变好 / 1 变差 / 2 持平**，
+  细排单独贡献 **甲 +3、丙 +1**。⚠️ 它**修不了**「历史类目与需求反向」那一格 ——
+  2026-09-26 查明那一格是**语料成因**（见下面 ★★★ 那条），拍板**停手不改**。
 ★ 用户已拍板的边界：检索决策**复用分类那一次调用**（不新增往返）、个性化**从订单实时派生**、
 在线指标**前端埋点 + 事件表**、工具轮流式**先只做一次推完**。
 
@@ -182,7 +189,7 @@ python scripts/probe_stage8.py --url http://localhost -u xbla:<口令>
 # 前端（开发，5173，已配 /api 代理 → 8080）
 cd frontend && npm install && npm run dev
 
-# 跑测试（1049 个）
+# 跑测试（1092 个）
 # ★ 改了接口或方法签名后【必须先 clean】—— 不 clean 时 maven 报
 #   "Nothing to compile" 并返回成功，然后拿【针对旧签名编译的旧 class】去跑。
 #   ⚠️ 同一个坑 `./mvnw test-compile` 也有（见 docs/10 坑 12）。
@@ -214,6 +221,17 @@ curl -s localhost:8080/api/debug/agent/intent-tree | python -m json.tool
 curl -s localhost:8080/api/debug/agent/intent-prompt         # 分类 prompt 原文 —— 「分类不准」先看这个
 curl -s localhost:8080/api/debug/agent/memory | python -m json.tool
 curl -s "localhost:8080/api/debug/agent/memory?sessionNo=xxx" | python -m json.tool  # 摘要的接缝
+curl -s "localhost:8080/api/debug/profile/affinity?userId=8" | python -m json.tool
+#   ★★ 阶段 9.5：这个人现在会拿到哪一段偏好 —— 【就是拼进 prompt 的那一段原文】。
+#      ★ 不花钱、不写库。❌ 传 userId=null（或省略）看的是「匿名」那一格。
+#      ⚠️ 「没有偏好」有四种原因（匿名/用户不存在/订单不足/开关关掉），
+#         它们在 qa_log.affinity 上都是 NULL，只有这个接口 + DEBUG 日志分得开
+python scripts/probe_recommend.py --out eval_results/recommend-profile-on.json
+#   ★★ 阶段 9.5 的 A/B：推荐排序有没有变好 —— 判据在 data/eval/recommend-gold.yml。
+#      ★ 不花钱（只走 /api/debug/mcp/call）。⚠️ 开关是【启动时读】的，所以要比两次：
+#        XBLA_AGENT_PROFILE_ENABLED=false ./mvnw spring-boot:run 再跑一遍 --out ...
+#        python scripts/probe_recommend.py --compare <关.json> <开.json>   ← 结论只在这里
+#      ★ 三个自检：开关自检 / 确定性自检（--repeat 3）/ 池子自检（matched_count 对不对得上）
 
 # ── 花钱的（调模型）──
 python scripts/probe_kb.py search 退货要几天         # ★ 中文走脚本，别直接 curl
@@ -235,7 +253,8 @@ curl -s localhost:8080/api/debug/mcp/tools | python -m json.tool   # 模型看�
 # ── 阶段 5.8 / 5.9：MCP Client + 工具调用 + 结构化硬数据 ──
 python scripts/probe_tool.py                        # ★★ 真实验收：30 项，会调模型（花钱）
 curl -s "localhost:8080/api/debug/mcp/client?userId=8" | python -m json.tool  # ★ 模型实际收到的报文
-curl -s "localhost:8080/api/debug/mcp/qa-log?traceId=xxx" | python -m json.tool  # 看 tool_calls 落库没有
+curl -s "localhost:8080/api/debug/mcp/qa-log?traceId=xxx" | python -m json.tool
+#   ★ 看 tool_calls / intent_plan / affinity 落库没有（★ affinity 就是 prompt 里那一段原文）
 # ★ 直调工具看它的返回原文（走完整 MCP 链路，和模型拿到的一模一样）——【不花钱】
 curl -s "localhost:8080/api/debug/mcp/call?tool=query_my_coupons&userId=8" | python -m json.tool
 #   ★ 9.3 的三个商品工具：search_products / compare_prices / recommend_products
@@ -600,6 +619,65 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
 - ⚠️ `intent_plan` 的 `v` 现在是 **3**（8 格）。v=1 六格 / v=2 七格 —— 下游按 `v` 分派。
 - ⚠️ **改分类 prompt 就要问一句「这次是不是条件式的」**：条件式的（如 9.4）
   不动基线；无条件的（如 9.2）基线当场作废。
+
+### 用户偏好（阶段 9.5）
+
+- ★★★ **偏好只能【重排】，不能【召回】** —— 加分只加在 `matchScore > 0`
+  **之后**。放到之前：买过 3 次吸尘器的人问「送长辈」会收到一台吸尘器，
+  而那个列表**读起来像一份很贴心的推荐**，没有任何东西会报错。
+- ★★★ **`qa_log.affinity` 与 prompt 里那一段是【同一个字符串】。**
+  渲染一次 → `ctx.withAffinity(...)` → prompt 与落库读**同一个字段**。
+  在落库那层重渲染 = 第二个事实来源，症状是报告里的 faithfulness 静默偏低。
+  ★ 判据：集成测试断言 `qa_log.affinity` **是捕获到的 system prompt 的子串**。
+- ★★★ **它的位置在【澄清分支之后】** —— 澄清轮不生成、没有 prompt，
+  那一格的诚实值是 NULL。⚠️ 位置约束**违反起来不报错**（注释写对了、
+  代码放错了一次，是测试抓出来的，坑 44）。
+- ★★ **偏好块只能【快照】，不能重建** —— 它 per-user 且随订单变
+  （硬数据 `PolicyFactProvider.load()` 是无参、可重建的，**别照抄那一套**）。
+- ★★ **会员等级不进打分** —— 它是**用户级常数**：给每个商品加同一个数
+  **不改任何排序**，而正文里「按你的会员等级推荐」会是一句假话。它只进偏好块。
+- ★★ **价格带用【量级】：`[最低×0.5, 最高×2]`**，不用「均价 ± 百分数」——
+  实测单人成交价跨度可达 **30 倍**（user 8：484~15065），紧口径会把
+  用户**真买过**的两头判成不相符。
+- ★★ **状态口径 `{20,30,40}`** —— ⚠️ 实测 **50 已取消的那 10 笔连 `paid_at` 都有**：
+  它们是「付过又退掉」，退款是最强的**反向**证据。判 `paid_at` 会把它收进来。
+- ★★ **截断的清单必须留下痕迹**（`（其余略）`）—— 实测漏过一次（品牌那行少一个，
+  而那句话**读起来就是完整的**，坑 45）。凡是 `top-N` / `limit` / `subList`，
+  都要问「读的人怎么知道我砍掉了一部分」。
+- ★ **`min-orders`（默认 3）：有效订单不足就整块省略。** 单类目单订单的人
+  只能收到「你只买过 X」—— 一句关于平台的假话。**设成 1 = 关掉保护**。
+- ⚠️ **`affinity` 也必须在 `QaLogMapper.selectByEvalRun` 的显式列清单里**
+  （那个方法坏过两次，坑 18 的第四次预防）—— 漏了的症状又是一个「看起来合法的空」。
+- ⚠️ **`xbla.agent.profile.enabled=false` = 不查库、不注入、不落库**（= 与 9.4 逐字节相同）。
+  ★ 个性化**不进分类 prompt**，所以与 5.2 / 9.2 / 9.4 的基线无关。
+- ⚠️ **V16 只加了 `qa_log.affinity`**（TEXT，不是 JSONB —— 它要逐字还给 RAGAS 当上下文）。
+- ★★ **排序键是三层**：总分降序 → **同分时按 类目频次 → 品牌频次 → 价格距离**
+  （「组内细排」）→ 编号兜底。★ 没有偏好时后两层**全部相等** ⇒ 退回 9.4 的
+  「总分 + 编号」，**基线仍然是 id 升序**（这个性质不能弄丢）。
+  ⚠️ 细排**只管组内次序**：「谁进了这个组」是加分那一步决定的，
+  所以它修不了「收窄本身推错方向」（user 8 × 运动健身 丙 0→3）。
+- ★★ **正文里那句关于排序的话必须【现算】** —— 排序规则一改，写死的
+  「同分只按编号排」就变成假话，而**没有任何东西会报错**（坑 49）。
+  判据不是「有没有偏好」：有偏好但组内键全相等时，**仍然是编号说了算**。
+- ⚠️ **改 gold 的档位/池子 = 结论会变**（实测两次：除菌除螨 2→1 个组合变好；
+  「运动健身」池子从 189 改到 30 后甲档 4→15）。⇒ 改完必须**重跑 ⑧ 那张表并贴出来**。
+- ★★ **判据里的「池子」必须是工具真正搜的那个池子**（坑 48）——
+  `matched_count`（字面重合 > 0）≠ `candidate_count`（全部在售）。
+  ⚠️ 一个 need 里的**「适合」**这种词会和**每一个** `suitable_for` 撞上，
+  池子当场变成整个目录（实测 19 → 189）。
+- ⚠️ **推荐工具的同分商品极多**（一个 need 下 12~28 件字面重合分**完全相同**）——
+  所以「推荐得更好」没有外部判据就测不出来（`docs/06` 噪声底那套在这里不适用）。
+  ★ 判据 = `data/eval/recommend-gold.yml`，跑分 = `scripts/probe_recommend.py`，
+  实测 = `docs/05` §9.12 ⑧。当前：**基线 → 加分 → 加分+细排** 三列，
+  6 个组合 = **3 变好 / 1 变差 / 2 持平**。
+- ★★★ **「判据与实现正交」的前提是「两边看的是同一套资料」** —— 资料自相矛盾时，
+  正交的两套证据**必然分歧**，而那与实现的优劣无关。实测（2026-09-26）：
+  `product.suitable_for` 是**跨类目随机撒**的（`SeedDataFactory.java:276-278` 相邻两行，
+  卖点按类目取、它不按；19/189 = 10.05% ≈ 1/10）⇒ 4 件家电带着「适合运动健身、防水防汗」，
+  而工具排序的第一依据（+3）**正是**这个字段、gold 又**刻意不看**它（防自证）
+  ⇒ ⑧ 那一格负例是**结构性**的，三条候选修法全部不成立或代价在别处。
+  ★ **拿 A/B 数字前先问一句「两边看的是同一套资料吗」**；★ 判「一个字段可不可信」
+  不看它像不像真的，看它和**旁边那些字段**打不打得通。（`docs/10` 坑 50）
 
 ### 工具绑定与混合轮（阶段 9.3）
 

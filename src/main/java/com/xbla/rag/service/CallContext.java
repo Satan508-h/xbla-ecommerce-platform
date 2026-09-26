@@ -70,10 +70,42 @@ import com.xbla.rag.common.TraceId;
  * 而「改漏了一条路」正是本项目反复栽的那个坑（ADR-047 / ADR-081 / 坑 40）。
  * 放进本对象之后 {@code ctx} 本来就贯穿所有路径，漏一条在结构上不可能。
  *
- * <p>⚠️ 边界（写下来是为了防止这里变成一个杂物间）：<b>只放「这一请求的事实」，
- * 并且必须满足两条 —— ① 两条路（{@code ask} / {@code askStream}）都会读到它；
- * ② 落库或路由要用它</b>。会话级的状态（比如待澄清内容本身）<b>不属于这里</b>，
- * 它在 {@code chat_session} 上。
+ * <h2>★★ 阶段 9.5 加的第七样：{@code affinity} —— 偏好块的原文</h2>
+ *
+ * <p>它是 {@code UserAffinityProvider.load(userId)} 派生出来、再由
+ * {@code RagPromptBuilder.affinitySection} 渲染好的那几百字。
+ *
+ * <p>★ 它<b>满足上面那两条边界</b>：两条路都会读到（都进 prompt），
+ * 落库要用它（{@code qa_log.affinity}）。会话级状态？不是 ——
+ * 它由「这一次请求的身份」派生，逐请求算一次。
+ *
+ * <p>★★ <b>那为什么不干脆在落库那一层再算一遍？</b>——因为那会引入第二个事实来源，
+ * 而这次连「重算」这条路都走不通：
+ *
+ * <pre>
+ *   RetrievalGate.decide()   纯函数  → 敢在 baseLog 里再算一次（9.2 就是这么做的）
+ *   UserAffinityProvider     要读库，而且订单【会变】
+ * </pre>
+ *
+ * <p>重算和调用点那次可能不一致，而症状是「prompt 里有偏好块、
+ * 日志里写着 NULL」—— 评测拿着日志去还原文档，于是 faithfulness 偏低，
+ * 而看报告的人会去调一个没坏的东西。放进本对象之后，
+ * <b>prompt 和落库读的是同一个字段，分叉在结构上不可能</b>。
+ *
+ * <p>⚠️ 代价要说清楚：<b>忘了在本对象上调用 {@link #withAffinity} 的那条路，
+ * 个性化在那个路径上不生效</b>（prompt 和日志会一致地说「没有」——
+ * 自洽，但功能是关的）。所以两条路各有一条集成测试钉着它，
+ * 而那个「自洽」正是它<b>不撒谎</b>的证据：它不会写出
+ * 「日志说有、prompt 里没有」这种东西。
+ *
+ * <p>★ 它<b>只能被设置成非空白</b>，没有「清空」的版本 —— 同
+ * {@link #withUserId} / {@link #withClarifyResumed} 那条纪律。
+ *
+ * <h2>⚠️ 边界（写下来是为了防止这里变成一个杂物间）</h2>
+ *
+ * <p>只放「这一请求的事实」，并且必须满足两条 —— ① 两条路
+ * （{@code ask} / {@code askStream}）都会读到它；② 落库或路由要用它。
+ * 会话级的状态（比如待澄清内容本身）<b>不属于这里</b>，它在 {@code chat_session} 上。
  *
  * <h2>★★ 什么时候它是「没有排队」</h2>
  *
@@ -112,9 +144,22 @@ import com.xbla.rag.common.TraceId;
  *                      在数据上和「触发了但没用」长得一模一样（同 9.2 的 shape）。
  *                      <p>★ 它是<b>服务层自己发现并填上的</b>（不像上面四个来自排队层），
  *                      所以它是一个可变的标记位而不是构造参数 —— 见 {@link #withClarifyResumed()}。
+ * @param affinity      ★ 阶段 9.5：<b>这一次拼进 system prompt 的偏好块原文</b>
+ *                      （见 {@link com.xbla.rag.rag.profile.UserAffinity}）。
+ *                      <b>null = 这次没有偏好块</b>（常态：匿名、订单不足、开关关掉）。
+ *                      <p>★ 它的唯一用途是落进 {@code qa_log.affinity} ——
+ *                      那一列回答的是「偏好块到底进没进 prompt」，
+ *                      而这个问题<b>事后无法重建</b>（per-user 且随订单变）。
+ *                      <p>★★ <b>它存的是渲染好的字符串，不是对象</b>：
+ *                      prompt 与落库要用<b>同一份</b>字节，中间不能有第二次渲染。
+ *                      <p>⚠️ 和 {@code clarifyResumed} 一样，它在两条路上
+ *                      （{@code ask} / {@code askStream}）由服务层填，
+ *                      位置在<b>澄清分支之后、检索之前</b> ——
+ *                      澄清那条路不生成、也就没有 prompt，它的这一格必须是 null。
  */
 public record CallContext(String traceId, Integer queueMs, Integer queuePosition,
-                          EvalMark eval, Long userId, boolean clarifyResumed) {
+                          EvalMark eval, Long userId, boolean clarifyResumed,
+                          String affinity) {
 
     /**
      * 没经过排队层的调用（测试、探针、以及 {@code xbla.ratelimit.enabled=false}）。
@@ -123,7 +168,7 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
      * 如果这里填 0，阶段 7 就分不清「没开排队」和「开了但没排队」了。
      */
     public static CallContext fresh(String traceId) {
-        return new CallContext(traceId, null, null, null, null, false);
+        return new CallContext(traceId, null, null, null, null, false, null);
     }
 
     /**
@@ -133,7 +178,7 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
      * 「评测标记落不落库」，不必把排队层拉起来。
      */
     public static CallContext fresh(String traceId, EvalMark eval) {
-        return new CallContext(traceId, null, null, eval, null, false);
+        return new CallContext(traceId, null, null, eval, null, false, null);
     }
 
     /** 自动生成一个 traceId 的「没排队」上下文 */
@@ -156,7 +201,8 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
     public CallContext withUserId(Long userId) {
         return userId == null
                 ? this
-                : new CallContext(traceId, queueMs, queuePosition, eval, userId, clarifyResumed);
+                : new CallContext(traceId, queueMs, queuePosition, eval, userId,
+                        clarifyResumed, affinity);
     }
 
     /**
@@ -176,6 +222,32 @@ public record CallContext(String traceId, Integer queueMs, Integer queuePosition
     public CallContext withClarifyResumed() {
         return clarifyResumed
                 ? this
-                : new CallContext(traceId, queueMs, queuePosition, eval, userId, true);
+                : new CallContext(traceId, queueMs, queuePosition, eval, userId, true, affinity);
+    }
+
+    /**
+     * 带上这一次的偏好块原文（阶段 9.5）。
+     *
+     * <p>★ 传 null 或空白 = <b>不改</b>（不是「清空」）—— 同 {@link #withUserId}
+     * 那条纪律：一个能把它悄悄擦掉的方法，症状是一条路上的
+     * {@code qa_log.affinity} 恒为 NULL，而从数据上看只是「这个人没有偏好」。
+     *
+     * <p>★ 调用点只有两处（{@code ask} / {@code askStream}），
+     * 位置在<b>澄清分支之后、检索之前</b>：
+     *
+     * <pre>
+     *   澄清分支之前  → 澄清那条路会把偏好写进 qa_log，而它【根本没生成】
+     *   检索之后      → 混合轮仍会读到它（因为读的是 ctx），但纯工具轮就错过了
+     * </pre>
+     *
+     * <p>⚠️ 这一次调用会<b>真的查一次库</b>（{@code UserAffinityProvider}）。
+     * 它不是在每个请求上都发生：匿名、开关关掉、用户不存在都会提前返回，
+     * 代价为零。
+     */
+    public CallContext withAffinity(String affinitySection) {
+        return affinitySection == null || affinitySection.isBlank()
+                ? this
+                : new CallContext(traceId, queueMs, queuePosition, eval, userId,
+                        clarifyResumed, affinitySection);
     }
 }

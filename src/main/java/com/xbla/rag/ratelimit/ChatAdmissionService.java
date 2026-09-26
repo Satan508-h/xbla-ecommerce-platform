@@ -799,11 +799,15 @@ public class ChatAdmissionService {
         // ★ 身份在这里转进上下文（阶段 9）—— 这是它唯一的一处「入队」动作。
         //   加上这个分量之后，下方 ChatService 那条链路（含工具路径和 qa_log.user_id）
         //   用的都是【控制器解析的那一次】，不再有第二个来源。
-        // ★ 6/9.4：最后一个分量 clarifyResumed 恒为 false ——
-        //   它是【服务层读了会话状态之后】才知道的事（见 CallContext 的类注释），
-        //   排队层造这个对象时还不知道会落到哪个会话上。
+        // ★ 6/9.4：clarifyResumed 恒为 false —— 它是【服务层读了会话状态之后】
+        //   才知道的事（见 CallContext 的类注释），排队层造这个对象时
+        //   还不知道会落到哪个会话上。
+        // ★ 7/9.5：affinity 恒为 null —— 同上，它是服务层派生出来的一段文本，
+        //   而且要查一次库。排队层造它的时候连「这个人有没有订单」都还不知道。
+        //   ⚠️ 这一格是 null 不是 ''：那一段的诚实值是「没有」，
+        //      填空串会让「一次都没注入过」在数据上看不出来（见 V16 的列注释）。
         return new CallContext(admission.traceId(), queueMs, initialPosition, admission.eval(),
-                admission.userId(), false);
+                admission.userId(), false, null);
     }
 
     /** 被限流挡掉的累计次数 —— 出在探针上 */

@@ -115,6 +115,16 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
      * <p>⚠️ 另外注意：{@code tool_calls} <b>不在这份清单里</b>，这是刻意的 ——
      * 报告目前不用它。哪天真要按「有没有调工具」切片，记得连它一起加。
      *
+     * <h3>★★ 阶段 9.5 加了 {@code affinity}（第四次）</h3>
+     *
+     * <p>{@code EvalAnswerService} 要拿偏好块当「模型当时看到的上下文」交给 RAGAS。
+     * ★ 和硬数据不同，它<b>不能</b>在评测里重建（per-user、随订单变），
+     * 所以只有这一列能回答「那一次到底注入了什么」。
+     *
+     * <p>⚠️ 漏了它的症状<b>又是</b>「一个看起来合法的空」：
+     * 偏好块不进 {@code contexts}，faithfulness 偏低，而报告里
+     * 那个数字和「这次本来就没有偏好」长得一模一样。
+     *
      * @param runId 评测运行 ID（{@code qa_log.eval_run_id}）
      */
     @Select("""
@@ -123,7 +133,7 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
                    intent, intent_confidence, status, error_msg,
                    queue_ms, queue_position,
                    retrieval_latency_ms, rerank_latency_ms, llm_latency_ms, total_latency_ms,
-                   retrieval_detail, intent_plan, final_answer, "references",
+                   retrieval_detail, intent_plan, affinity, final_answer, "references",
                    provider, model, prompt_tokens, completion_tokens, total_tokens, cost,
                    created_at
             FROM qa_log

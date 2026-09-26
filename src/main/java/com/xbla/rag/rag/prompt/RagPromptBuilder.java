@@ -1,9 +1,11 @@
 package com.xbla.rag.rag.prompt;
 
 import com.xbla.rag.rag.facts.StructuredFacts;
+import com.xbla.rag.rag.profile.UserAffinity;
 import com.xbla.rag.rag.retrieve.RetrievedChunk;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 /**
@@ -47,6 +49,8 @@ import java.util.List;
  * <pre>
  *   [固定指令]     base + 会话历史约束（有历史上下文时）  ← 每轮都一样，命中
  *   [半固定]       更早对话的摘要（阶段 5.6）             ← 每 N 轮变一次，大多能命中
+ *   [半固定]       这位用户的购买记录（阶段 9.5）         ← 随订单变，但多数轮次里相同
+ *   [半固定]       售后政策硬数据（阶段 5.9）             ← 只有那一类问题才有
  *   [可变上下文]   本次检索到的资料                       ← 从这里起必然未命中
  *   [固定指令]     回答要求                               ← 已经是固定尾块，缓存不到
  * </pre>
@@ -55,6 +59,21 @@ import java.util.List;
  * 之后一直不变，直到游标再次推进。所以它比资料稳定得多，
  * 排在资料<b>之前</b>能让这段缓存前缀在大多数轮次里命中。
  * 反着放（资料之后）就等于它每轮都是新的，一点都缓存不到。
+ *
+ * <p>★★ <b>中间那三段（摘要 / 偏好 / 硬数据）之间的先后，判据只有一条：
+ * 谁【更常在】谁就往前排。</b>不是「谁更稳定」、也不是「谁更重要」——
+ * 把不常在的放前面，它出现的那一次会把后面所有段整体往后推，
+ * 而那一段的缓存就全丢了。三段的常在程度是：
+ *
+ * <pre>
+ *   摘要   有这个用户的任何历史                → 最常
+ *   偏好   有身份 ∧ 有效订单 ≥ min-orders      → 其次（实测 20/30 人）
+ *   硬数据 意图是售后退换货那一类              → 最少
+ * </pre>
+ *
+ * <p>★ 偏好段排在硬数据之前还有一个附带好处：偏好是<b>每一轮都可能用到</b>的
+ * （推荐、比价、找同类），而硬数据只在那一类问题上用得到。
+ * 两条理由指向同一个位置。
  *
  * <p>会话历史的约束放在<b>第一段</b>而不是和「回答要求」并在一起，有两个理由：
  * 它是关于<b>整场对话</b>的常设规则，不是关于「上面的资料」的使用说明；
@@ -152,6 +171,31 @@ public class RagPromptBuilder {
     private static final String FACTS_HEADER = "【售后政策硬数据】";
 
     /**
+     * 用户偏好那一节的标题（阶段 9.5）。
+     *
+     * <p>★ 措辞是「购买记录」而不是「偏好」—— 因为这一段里装的是
+     * <b>事实</b>（他买过什么），不是结论（他喜欢什么）。
+     * 标题写成「偏好」，模型就会把它当成一份用户画像去引用，
+     * 而 {@link UserAffinity} 的注释里写着这份数据的样本有多小。
+     */
+    private static final String AFFINITY_HEADER = "【这位用户的购买记录】";
+
+    /**
+     * 偏好块里类目/品牌最多各列几个。
+     *
+     * <p>★ 它是<b>契约不是旋钮</b>（同 {@link #MAX_CHARS_PER_CHUNK}）：
+     * 这一段进的是<b>每一轮</b>的 prompt，长度直接乘上全部请求数。
+     *
+     * <p>⚠️ <b>截断只在渲染层发生</b>：{@link UserAffinity} 里的列表是完整的，
+     * 所以「一共几个类目」这个数仍然是确切的 ——
+     * 渲染出来是「涉及 4 个类目，最多的是：A、B、C」，
+     * 而不是一句悄悄少了一个的枚举（{@code ADR-094} 那条
+     * 「每个数字要么确切、要么标明它是样本」）。
+     */
+    public static final int MAX_CATEGORY_ITEMS = 3;
+    public static final int MAX_BRAND_ITEMS = 5;
+
+    /**
      * 组装（不带对话历史）。等价于 {@code build(base, chunks, false, null, EMPTY)}。
      *
      * <p>保留这个重载是为了让「不关心历史」的调用方（测试、调试探针）
@@ -178,6 +222,19 @@ public class RagPromptBuilder {
     }
 
     /**
+     * 组装（不带用户偏好）。等价于
+     * {@code build(base, chunks, hasHistory, sessionSummary, facts, null)}。
+     *
+     * <p>保留这个重载是为了让「不关心偏好」的调用方（测试、调试探针）
+     * 不用多写一个参数 —— <b>它刻意不给默认值</b>：偏好块是拼进
+     * {@code fixed} 的一段，默认成「有」会让测试悄悄依赖上一个它没造的数据。
+     */
+    public String build(String baseSystemPrompt, List<RetrievedChunk> chunks,
+                        boolean hasHistory, String sessionSummary, StructuredFacts facts) {
+        return build(baseSystemPrompt, chunks, hasHistory, sessionSummary, facts, null);
+    }
+
+    /**
      * 组装。
      *
      * @param baseSystemPrompt 基础 system prompt（固定部分）
@@ -189,13 +246,31 @@ public class RagPromptBuilder {
      * @param facts            结构化事实（阶段 5.9）。null 或空 = 这一节不出现。
      *                         ★ 它<b>不受「检索为空」的影响</b> ——
      *                         见下面的实现注释
+     * @param affinitySection  <b>用户偏好那一节的【原文】</b>（阶段 9.5），
+     *                         null 或空白 = 这一节不出现。
+     *                         <p>★★ 收的是<b>渲染好的字符串</b>而不是
+     *                         {@link com.xbla.rag.rag.profile.UserAffinity} 对象，这是刻意的：
+     *                         同一段文字要进三个地方 ——
+     *                         prompt、{@code qa_log.affinity}、以及评测交给 RAGAS 的
+     *                         {@code retrieved_contexts} ——
+     *                         <b>只有渲染一次才能保证三处逐字相同</b>。
+     *                         收对象就等于在这里再渲染一遍，而那是一个
+     *                         「评测口径与 prompt 漂移」的机会（同
+     *                         {@link #factsSection} 那条警告的反面：
+     *                         硬数据敢在那里重渲染，是因为它无参可重建，
+     *                         偏好块不是）。
+     *                         <p>⚠️ 调用方负责判「该不该给」——
+     *                         见 {@code UserAffinityProvider}：那四种「不给」
+     *                         全在那一个方法里判完
      * @return 拼好的 system prompt。<b>永远不会是 null</b>；
      *         没有切片时返回「基础 prompt + 一句未检索到的说明」
      */
     public String build(String baseSystemPrompt, List<RetrievedChunk> chunks,
-                        boolean hasHistory, String sessionSummary, StructuredFacts facts) {
+                        boolean hasHistory, String sessionSummary, StructuredFacts facts,
+                        String affinitySection) {
         String base = baseSystemPrompt == null ? "" : baseSystemPrompt.stripTrailing();
         boolean hasSummary = sessionSummary != null && !sessionSummary.isBlank();
+        boolean hasAffinity = affinitySection != null && !affinitySection.isBlank();
 
         // ★ 固定段：基础指令 + （有历史上下文时）历史约束。
         //   两者都在可变内容之前 —— 见类注释第二节
@@ -212,7 +287,26 @@ public class RagPromptBuilder {
                     .append('\n').append(SUMMARY_NOTE);
         }
 
-        // ★★ 半固定段之二：结构化事实（阶段 5.9）。
+        // ★★ 半固定段之二：用户偏好（阶段 9.5）。
+        //
+        //   ① 【为什么排在摘要之后】——判据永远是「谁【更常在】」，
+        //      而不是「谁更重要」：
+        //        摘要   有这个用户的【任何历史】就在
+        //        偏好   有身份 ∧ 有效订单 ≥ min-orders 才在（实测 20/30 人）
+        //      更常在的排在前面，前缀缓存才能一路吃到更远的地方。
+        //      见类注释第二节那条贯穿四段的规则。
+        //
+        //   ② 【为什么排在硬数据之前】——偏好几乎每轮都在（只要这个人在），
+        //      硬数据只有售后退换货那一类问题才有。同一条判据。
+        //
+        //   ③ 【为什么拼进 fixed 而不是 chunks 那一段】——同硬数据：
+        //      下面那个 early return 会把拼在 chunks 分支里的东西一起吞掉，
+        //      而「检索为空 + 恰好有偏好」正是最需要它的时刻之一。
+        if (hasAffinity) {
+            fixed.append("\n\n").append(affinitySection.strip());
+        }
+
+        // ★★ 半固定段之三：结构化事实（阶段 5.9）。
         //
         //   ① 【为什么排在摘要之后，而不是之前】——尽管它比摘要更稳定。
         //      判据不是「谁更稳定」，是「谁【更常在】」：
@@ -300,6 +394,147 @@ public class RagPromptBuilder {
 
         sb.append("条件、流程和例外情况见知识库资料。");
         return sb.toString();
+    }
+
+    /**
+     * 用户偏好那一节（阶段 9.5）。
+     *
+     * <h3>★ 一、它写的是<b>事实</b>，不是偏好</h3>
+     *
+     * <p>这一段里没有一个字是「你喜欢 X」。它写的是「你买过什么」，
+     * 然后把判断留给模型 —— 因为数据支撑不了那个判断：
+     * 实测最活跃的用户也只有 7 笔订单，而且买的 5 个品牌<b>一个都不重</b>。
+     *
+     * <p>⚠️ 措辞上有一处必须守住：<b>不要写「你偏好」「你常买」</b>。
+     * 模型对 prompt 里的话是照单全收的，写成偏好它就会当成既定事实去回答，
+     * 而那是一句<b>关于这位用户的假话</b> —— 同 {@code PolicyTerm.exchangeDays}
+     * 那条「不要在这一层把 null 兜成默认值」。
+     *
+     * <h3>★ 二、样本量必须写出来，而且和计数自洽</h3>
+     *
+     * <p>「7 笔订单、共 7 件商品」里的件数不是装饰：下面那几个「A×3、B×2」
+     * 是<b>件级</b>的计数，两个数都写出来，读的人才能核对它们加起来对不对。
+     * 只写订单数的话那几行看起来对不上，而「数字对不上」正是读的人
+     * 开始怀疑整段数据的起点（{@code ADR-094}：每个数字要么确切、
+     * 要么标明它是样本）。
+     *
+     * <h3>★★ 三、截断只在<b>这一层</b>发生，而且要说破</h3>
+     *
+     * <p>{@link com.xbla.rag.rag.profile.UserAffinity} 里的列表是完整的，
+     * 所以「涉及 4 个类目」这个数<b>永远确切</b>。截断的是后面那个枚举，
+     * 而它有一句「最多的是」把它标记成<b>取的前几个</b> ——
+     * 只说「：A、B、C」的话，读的人会以为一共就这三个。
+     *
+     * <p>★ 另一个选择是干脆不截断（类目一共 6 个、品牌 20 个）。
+     * 不做，因为这一段进的是<b>每一轮</b>的 prompt：长度直接乘上全部请求数，
+     * 而一个买了 20 个品牌的用户的品牌清单，对模型的边际价值接近于零。
+     *
+     * <p>★★ <b>这个方法是 public static，和 {@link #factsSection} 一样</b>：
+     * 评测要拿它当「模型当时看到的上下文」，而<b>不是自己再写一遍渲染</b>。
+     * ⚠️ 但和硬数据有一处关键不同 —— 偏好块<b>不能</b>在评测里重建
+     * （它 per-user 且随订单变），所以评测读的是 {@code qa_log.affinity}
+     * 里那份<b>快照</b>，而快照就是这里渲染出来的同一次输出。
+     */
+    public static String affinitySection(UserAffinity affinity) {
+        StringBuilder sb = new StringBuilder(512);
+        sb.append(AFFINITY_HEADER).append('\n');
+        sb.append("以下是这位用户自己的历史订单，是【事实】不是对他喜好的判断：\n");
+
+        sb.append("近 ").append(affinity.windowDays()).append(" 天内 ")
+                .append(affinity.orderCount()).append(" 笔已付款订单（共 ")
+                .append(affinity.itemCount()).append(" 件商品）");
+        if (!affinity.categories().isEmpty()) {
+            sb.append("，涉及 ").append(affinity.categories().size()).append(" 个类目：")
+                    .append(joinCounts(affinity.categories(), MAX_CATEGORY_ITEMS));
+        }
+        sb.append('\n');
+
+        if (!affinity.brands().isEmpty()) {
+            sb.append("买过的品牌：")
+                    .append(joinCounts(affinity.brands(), MAX_BRAND_ITEMS)).append('\n');
+        }
+
+        // ★ 三个价格要么一起有、要么一起没有（同一个价格列表算出来的）——
+        //   判一个就够，但判 null 而不是判 0：0 是一个合法的价格
+        if (affinity.priceMin() != null) {
+            sb.append("成交单价 ").append(money(affinity.priceMin()))
+                    .append(" ~ ").append(money(affinity.priceMax()))
+                    .append(" 元，平均 ").append(money(affinity.priceAvg())).append(" 元\n");
+        }
+
+        sb.append("会员等级：").append(memberLevelText(affinity.memberLevel())).append('\n');
+
+        sb.append("""
+                ★ 样本很小，买过的不等于下次还想买 —— 这是参考，不是结论。
+                  不要据此断言「你只喜欢 X」，也不要在用户没问的时候主动罗列他的购买记录。""");
+        return sb.toString();
+    }
+
+    /**
+     * {@code A×3、B×2、C×1} 这样的一行；<b>截断时说破它被截断了</b>。
+     *
+     * <p>★★ <b>「（其余略）」这四个字不能省。</b>没有它，一个买了 6 个品牌的用户
+     * 会看到「买过的品牌：A、B、C、D、E」—— 而那句话<b>读起来就是完整的</b>，
+     * 模型会把它当成「他一共买过这五个品牌」。
+     *
+     * <p>★ 这不是假想：<b>实测就漏过一次</b>（2026-09-25，活体验收时用
+     * {@code /api/debug/profile/affinity?userId=8} 打出来的那一段少了
+     * 第 6 个品牌，而当时类目那一行是有标记的、品牌那一行没有）。
+     * ⚠️ 单测当然抓不到 —— 那条用例的夹具恰好只有 2 个品牌，没到上限。
+     * 这正是 {@code ADR-094} 那条「每个数字要么确切、要么标明它是样本」的又一次应用。
+     *
+     * <p>★ 用 {@code ×}（U+00D7）而不是 {@code x}：中文正文里两者都能读，
+     * 但 ASCII 的 x 在等宽字体里会和商品名里的「X1」混起来。
+     */
+    private static String joinCounts(List<UserAffinity.Count> counts, int limit) {
+        StringBuilder sb = new StringBuilder(counts.size() * 8);
+        int n = Math.min(limit, counts.size());
+        for (int i = 0; i < n; i++) {
+            if (i > 0) {
+                sb.append('、');
+            }
+            UserAffinity.Count item = counts.get(i);
+            sb.append(item.name()).append('×').append(item.count());
+        }
+        if (counts.size() > n) {
+            sb.append("（其余略）");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 金额。
+     *
+     * <p>★ 不用 {@code BigDecimal.stripTrailingZeros()} —— 它在整数值上会返回
+     * {@code 5.431E+3} 这种科学计数法（{@code toPlainString()} 能救回来，
+     * 但那是「知道有这个坑才写得对」）。Provider 已经把它们定标到 0 位小数了，
+     * 这里直接 {@code toPlainString()} 就是对的。
+     */
+    private static String money(BigDecimal value) {
+        return value.toPlainString();
+    }
+
+    /**
+     * 会员等级的白话。
+     *
+     * <p>★ <b>null 和越界值都渲染成「未记录」，绝不兜成「普通会员」</b>：
+     * 兜底会把「我们不知道」写成一个具体的等级，而模型分不出它和真值的区别。
+     * ⚠️ 这<b>不是</b>死代码 —— {@code X-Xbla-User-Id: 999999} 这类请求
+     * 会让这条路上拿到一个 {@code app_user} 里不存在的 id。
+     */
+    private static String memberLevelText(Integer level) {
+        if (level == null) {
+            return "未记录";
+        }
+        return switch (level) {
+            case 1 -> "普通";
+            case 2 -> "银卡";
+            case 3 -> "金卡";
+            case 4 -> "钻石";
+            // ★ 数据库上有 CHECK 1..4，所以这一支"不该"走到 ——
+            //   而它仍然要有一句实话，不能抛异常（这一段只是锦上添花）
+            default -> "未记录";
+        };
     }
 
     /**

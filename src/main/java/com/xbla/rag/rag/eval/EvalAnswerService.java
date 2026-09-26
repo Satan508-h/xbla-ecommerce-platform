@@ -180,6 +180,7 @@ public class EvalAnswerService {
 
         List<Map<String, Object>> out = new ArrayList<>();
         int factsUsed = 0;
+        int affinityUsed = 0;
         int missingChunkRefs = 0;
         int refsDifferFromFinalTopK = 0;
 
@@ -247,7 +248,23 @@ public class EvalAnswerService {
             boolean useFacts = factsSection != null
                     && tree.structuredFactOf(picked.getIntent()) == IntentTree.StructuredFact.POLICY;
 
-            List<String> contexts = new ArrayList<>(retrieved.size() + 1);
+            // ★★ 偏好块（阶段 9.5）—— 读的是【快照】，不是重建。
+            //   和上面那条 useFacts 的关键差别在这里：硬数据无参可重建
+            //   （PolicyFactProvider.load()），偏好块 per-user 且随订单变，
+            //   事后重建出来的不是当时那一段。
+            //   ⇒ 所以判据只能是 qa_log.affinity 有没有值，而它【就是】
+            //     当时拼进 prompt 的那段字符串（同一个字符串，不是两次渲染）。
+            String affinitySection = picked.getAffinity();
+            boolean useAffinity = affinitySection != null && !affinitySection.isBlank();
+
+            // ★ 顺序按【prompt 里的顺序】：偏好 → 硬数据 → 切片。
+            //   顺序不影响 faithfulness 的计算，但报告是给人看的，
+            //   和 prompt 一致能让「这一行到底还原了什么」一眼对上
+            List<String> contexts = new ArrayList<>(retrieved.size() + 2);
+            if (useAffinity) {
+                contexts.add(affinitySection);
+                affinityUsed++;
+            }
             if (useFacts) {
                 contexts.add(factsSection);
                 factsUsed++;
@@ -274,6 +291,7 @@ public class EvalAnswerService {
             row.put("cost", picked.getCost());
             row.put("chunkIds", refIds);
             row.put("factsInjected", useFacts);
+            row.put("affinityInjected", useAffinity);
             row.put("contexts", contexts);
             row.put("contextsRetrievedOnly", retrieved);
             out.add(row);
@@ -284,6 +302,7 @@ public class EvalAnswerService {
         summary.put("进 RAGAS 的题数", out.size());
         summary.put("被排除", excluded);
         summary.put("带硬数据的题数", factsUsed);
+        summary.put("带偏好块的题数", affinityUsed);
         summary.put("引用里取不到正文的切片数", missingChunkRefs);
         summary.put("references 与 final_top_k 不一致的行数", refsDifferFromFinalTopK);
 
@@ -315,6 +334,12 @@ public class EvalAnswerService {
                 + "（它们量的是【检索】质量，把注入的硬数据算进去是循环论证）");
         d.put("硬数据来源", "PolicyFactProvider.load() 无参重建 + RagPromptBuilder.factsSection 渲染"
                 + "（与 prompt 同一个方法）。⚠️ 政策表改动后还原更早的 run 会失真");
+        d.put("偏好块来源", "★★ 读 qa_log.affinity 那份【快照】，不是重建 —— "
+                + "偏好是逐用户、且随订单变的，事后重建出来的不是当时那一段。"
+                + "快照就是当时拼进 prompt 的那个字符串本身（同一个字符串，不是两次渲染）");
+        d.put("偏好的作用范围", "只有带快照的行进 contexts（affinityInjected=true）。"
+                + "⚠️ 匿名提问、订单不足 min-orders、以及 9.5 之前的 run 全都是 NULL —— "
+                + "对那些行来说「没有偏好块」是【当时的事实】，不是这里漏读了");
         return d;
     }
 

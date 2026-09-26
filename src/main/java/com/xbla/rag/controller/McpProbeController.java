@@ -306,6 +306,11 @@ public class McpProbeController {
         //   「门控到底有没有生效」和「恢复路径触发过几次」都【只能】从这一列看出来，
         //   而在此之前要回答它们只能去连 psql（那条路对克隆仓库的人不成立）。
         data.put("intentPlan", log.getIntentPlan());
+        // ★ 阶段 9.5：偏好块的原义那一份快照。★ 它和系统提示里那一段【逐字相同】，
+        //   所以这里看到的既是「注入了没有」，也是「注入的是什么」。
+        //   ⚠️ null = 这一次没有偏好块（匿名 / 身份不存在 / 订单不足 / 开关关掉）——
+        //      想知道是哪一种，用 /api/debug/profile/affinity?userId=…
+        data.put("affinity", log.getAffinity());
         data.put("references", log.getReferences());
         data.put("finalAnswer", log.getFinalAnswer());
         response.put("code", 0);

@@ -168,7 +168,10 @@ class RecommendProductsToolIntegrationTest {
                     .containsExactly(first, second);
             assertThat(result.text())
                     .as("★★ 不说的话，模型会把「第 3 名排在前面」当成「它更好」")
-                    .contains("得分相同")
+                    // ★ 措辞是「总分相同」不是「得分相同」：总分（= 字面重合 + 偏好加分）
+                    //   才是排序键，而这两件商品【字面重合】也一样 —— 说「得分」会让人
+                    //   分不清说的是哪一层（9.5 之后这两层是两个数）
+                    .contains("第 1~2 个总分相同")
                     .contains("不代表谁更好");
         }
     }
