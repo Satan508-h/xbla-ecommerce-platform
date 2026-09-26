@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import ChatView from './views/ChatView.vue'
+import MetricsView from './views/MetricsView.vue'
 import ReportView from './views/ReportView.vue'
 import StatusView from './views/StatusView.vue'
 
@@ -35,6 +36,8 @@ const routes = [
   { path: '/', name: 'chat', component: ChatView },
   { path: '/report', name: 'report', component: ReportView },
   { path: '/status', name: 'status', component: StatusView },
+  // ★ 阶段 9.6b：在线指标。和 /status 并列 —— 两页都是「生产也存在的只读出口」
+  { path: '/metrics', name: 'metrics', component: MetricsView },
   // ★ 兜底：认不出的路径回首页，而不是留一个空白页
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

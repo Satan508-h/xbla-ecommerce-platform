@@ -319,6 +319,7 @@ curl -s localhost:8080/api/status/ratelimit | python -m json.tool       # ★ �
 python scripts/probe_stage96.py              # ★★ 26 项；第 3 段要真的问一句（≈0.0002 元）
 python scripts/probe_stage96.py --no-model   # 跳过第 3 段，完全不花钱
 curl -s "localhost:8080/api/status/metrics?window=all" | python -m json.tool
+#   浏览器：http://localhost/metrics  ← ★ 这一页的默认窗口是 all（不是端点的缺省 24h）
 #   ★ window = 24h（缺省）| 7d | all；⚠️ 非法值不报错，换成 24h 并写进 requestedWindow
 #   ★★ 两组数【分开看】：traffic/latency 来自 qa_log（有历史），
 #      behavior 来自 user_event（★ 从零开始）。notes 里带着口径一起发。

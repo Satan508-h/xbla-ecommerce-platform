@@ -53,6 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 # ★ Windows 上 Python 读服务端响应可能按 GBK 解码而报错 —— 显式钉死 UTF-8。
 for _s in (sys.stdout, sys.stderr):
@@ -106,6 +107,31 @@ def new_event_no():
     return "probe-" + uuid.uuid4().hex
 
 
+def now_iso():
+    """
+    ★★★ 客户端时间戳 —— **必须是【现在】**，不能写死。
+
+    ## 写死的后果实测过一次（2026-09-26）
+
+    本脚本原来把它写成 `"2026-09-26T15:00:00+08:00"` 这个常量。
+    跑了几轮之后，库里 10 条事件里 **7 条的偏差是几十万毫秒**
+    （我探针写的假时间），只有 3 条是浏览器报的真时间（8~11ms）。
+
+    于是 `clockSkewP50` 报的是 **176130 ms** ——
+    而这个指标的全部用途是「检查客户端时钟准不准」。
+    **探针在污染它自己要验的那个指标**，而且症状是
+    「偏差三百秒」这种**看起来像真发现了问题**的数字。
+
+    ⇒ 一个自称「检查时钟」的指标，被自己写的假时间喂成了
+      「时钟有毛病」。修法就是这一行：取现在。
+
+    ⚠️ 顺带记住：探针会**真的往 `user_event` 写几行**（`eventNo` 前缀 `probe-`）。
+    那是有意的 —— 它要验的就是写入路径。但这也意味着
+    **跑完探针之后，在线指标里会多出几条探针造的事件**。
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
 def post_event(body, ctype="application/json", raw=None, user_id=USER_ID):
     return call("POST", "/api/events", body, ctype, raw, user_id)
 
@@ -136,7 +162,7 @@ def probe_ingest():
         "sessionNo": "probe-sess",
         "traceId": "probe-trace-" + uuid.uuid4().hex[:8],
         "payload": {"chunkId": 1, "no": 1},
-        "occurredAt": "2026-09-26T15:00:00+08:00",
+        "occurredAt": now_iso(),
     }
 
     r = post_event(body)
@@ -164,6 +190,15 @@ def probe_ingest():
     check("★ 缺 occurredAt → DISCARDED（服务端【不】代填 now()）",
           r[0] == 200 and outcome_of(r) == "DISCARDED",
           f"HTTP={r[0]} outcome={outcome_of(r)}")
+
+    # ★★★ 探针自己的时间戳必须是【现在】—— 它曾经是个写死的常量
+    skew_self = abs(
+        (datetime.now(timezone.utc)
+         - datetime.fromisoformat(now_iso().replace("Z", "+00:00"))).total_seconds())
+    check("★★ 探针打的时间戳是【现在】（不是写死的常量）", skew_self < 5,
+          f"自检偏差 {skew_self:.3f}s"
+          "  ← ★ 写死的后果实测过：clockSkewP50 报到 176130ms，"
+          "而那个指标的全部用途就是检查时钟准不准")
 
     r = post_event(None, raw=b"{bad json")
     check("⚠️ 畸形 JSON → 400（★ 记录事实，不是要求）", r[0] == 400, f"HTTP={r[0]}")
@@ -261,7 +296,7 @@ def probe_end_to_end():
     r = post_event({
         "eventNo": new_event_no(), "eventType": "ref_click", "userId": 8,
         "traceId": trace_id, "payload": {"chunkId": chunk_id, "no": refs[0].get("no")},
-        "occurredAt": "2026-09-26T15:00:00+08:00",
+        "occurredAt": now_iso(),
     })
     check("给这条回答发一个 ref_click → WRITTEN",
           outcome_of(r) == "WRITTEN", f"HTTP={r[0]} outcome={outcome_of(r)}")
@@ -285,7 +320,7 @@ def probe_end_to_end():
         "eventNo": new_event_no(), "eventType": "ref_click", "userId": 8,
         "traceId": "probe-uncited-" + uuid.uuid4().hex[:8],
         "payload": {"chunkId": 1, "no": 1},
-        "occurredAt": "2026-09-26T15:00:00+08:00",
+        "occurredAt": now_iso(),
     })
     clicked2 = (metrics("all").get("behavior") or {}).get("clickedCitedReplies")
     check("★★★ 反：点一条【没有引用】的回答 → 分子不动（否则率会 > 1）",
@@ -296,12 +331,12 @@ def probe_end_to_end():
     post_event({
         "eventNo": new_event_no(), "eventType": "feedback", "userId": 8,
         "traceId": trace_id, "payload": {"vote": "up"},
-        "occurredAt": "2026-09-26T15:00:00+08:00",
+        "occurredAt": now_iso(),
     })
     post_event({
         "eventNo": new_event_no(), "eventType": "feedback", "userId": 8,
         "traceId": trace_id, "payload": {},
-        "occurredAt": "2026-09-26T15:00:00+08:00",
+        "occurredAt": now_iso(),
     })
     b2 = metrics("all").get("behavior") or {}
     check("★ 正常的 👍 进 feedbackUp", b2.get("feedbackUp", 0) == up0 + 1,
@@ -335,6 +370,66 @@ def extract_done_event(raw: bytes):
     return None
 
 
+# ============================================================
+# 四、★★ 前端页面的字段契约
+# ============================================================
+
+# ★ `MetricsView.vue` 里读的每一个路径，一条不多一条不少地列在这里。
+#   ⚠️ 加新字段时两处都要改 —— 而这条判据就是用来抓「改了一处」的。
+FRONTEND_PATHS = [
+    "generatedAt", "from", "notes", "requestedWindow", "window",
+    "traffic.questions", "traffic.sessions", "traffic.byStatus",
+    "latency.queueP50Ms", "latency.queueP95Ms", "latency.queueN",
+    "latency.retrievalP50Ms", "latency.retrievalP95Ms", "latency.retrievalN",
+    "latency.rerankP50Ms", "latency.rerankP95Ms", "latency.rerankN",
+    "latency.llmP50Ms", "latency.llmP95Ms", "latency.llmN",
+    "latency.totalP50Ms", "latency.totalP95Ms", "latency.totalN",
+    "behavior.refClicks", "behavior.feedbackUp", "behavior.feedbackDown",
+    "behavior.feedbackOther", "behavior.byEventType", "behavior.referenceClickRate",
+    "behavior.clickedCitedReplies", "behavior.citedReplies", "behavior.clockSkewP50Ms",
+]
+
+
+def probe_frontend_contract():
+    """
+    ★★ 页面读的每个字段，响应里都得真的有。
+
+    ## 为什么这条判据值得单独一段
+
+    字段名写错的症状是**一片「—」**，而它看起来**完全正常** ——
+    读的人会以为「这段还没有数据」，不会想到「模板里的键名打错了」。
+
+    ★ 这是本项目反复防的那一类（`QaLogMapper.selectByEvalRun` 的显式列清单
+      坏过两次，症状都是「一个看起来合法的空」）。区别只是这次发生在
+      前端和 JSON 之间，而不是 Java 和 SQL 之间。
+    """
+    print("\n【4】★★ 前端页面的字段契约（MetricsView.vue 读的每一个路径）")
+
+    d = metrics("all")
+    missing = []
+    for p in FRONTEND_PATHS:
+        cur, ok = d, True
+        for k in p.split("."):
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if not ok:
+            missing.append(p)
+
+    check(f"页面读的 {len(FRONTEND_PATHS)} 个字段全部存在", not missing,
+          ("缺失：" + ", ".join(missing)) if missing
+          else "★ 少一个的症状是那格显示「—」，而它看起来像「没有数据」")
+
+    # ★ 顺带：固定键集里的键，页面是当表头用的 —— 少一个就是少一列
+    bs = (d.get("traffic") or {}).get("byStatus") or {}
+    be = (d.get("behavior") or {}).get("byEventType") or {}
+    check("★ 页面当表头用的固定键集也在（byStatus 四格 / byEventType 两格）",
+          set(bs) >= {"1", "2", "3", "4"} and set(be) >= {"ref_click", "feedback"},
+          f"byStatus={sorted(bs)} byEventType={sorted(be)}")
+
+
 def main():
     global BASE, AUTH
     ap = argparse.ArgumentParser()
@@ -353,6 +448,7 @@ def main():
 
     probe_ingest()
     probe_metrics()
+    probe_frontend_contract()
     if args.no_model:
         print("\n【3】已跳过（--no-model）")
     else:

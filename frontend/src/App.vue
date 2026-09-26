@@ -11,10 +11,15 @@
  *   聊天页     —— 功能
  *   评测报告   —— 阶段 7 的交付物本体（159 题 / 可复算 / 三个受控实验）
  *   限流实况   —— 阶段 6 的名额与队列（100 并发无超卖的那个装置）
+ *   在线指标   —— 阶段 9.6b：真实流量 + 用户行为（★ 两组数分开摆）
  * ```
  *
- * ★ 换句话说，导航的这三项**就是简历上那三行**。
+ * ★ 换句话说，导航的这几项**就是简历上那几行**。
  * 面试官点开就能自己看，不用我在旁边讲。
+ *
+ * ⚠️ **「评测报告」和「在线指标」是两件事，别混**：
+ * 前者是【离线】的（同一批题、同一配置，量检索与生成质量）；
+ * 后者是【在线】的（这段时间里发生了什么）。两页的副标题都写着这句。
  */
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
@@ -46,6 +51,7 @@ const activeNav = computed(() => route.name)
         <el-menu-item index="chat" :route="{ name: 'chat' }">问答</el-menu-item>
         <el-menu-item index="report" :route="{ name: 'report' }">评测报告</el-menu-item>
         <el-menu-item index="status" :route="{ name: 'status' }">限流实况</el-menu-item>
+        <el-menu-item index="metrics" :route="{ name: 'metrics' }">在线指标</el-menu-item>
       </el-menu>
     </el-header>
 

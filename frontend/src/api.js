@@ -98,6 +98,26 @@ export const getReferenceDetail = (traceId, chunkId) =>
 export const getRateLimitStatus = () => getJson('/api/status/ratelimit')
 
 /**
+ * 在线指标快照（9.6b）。★ 零成本、只读，生产也存在的端点。
+ *
+ * ## ★★ 两组数在同一个响应里，但【不要混着读】
+ *
+ * ```
+ *   traffic / latency   来自 qa_log     —— 服务端一直在记，【有历史】
+ *   behavior            来自 user_event —— 前端埋点，【从零开始】
+ * ```
+ *
+ * ## ⚠️ `window` 传非法值时服务端【不报错】
+ *
+ * 它会换成缺省（24h）并把原值放进 `requestedWindow`、
+ * 在 `notes` 里加一句说明。所以判据不是「请求成没成功」，
+ * 而是 `requestedWindow === window`。
+ *
+ * @param {'24h'|'7d'|'all'} window 时间窗
+ */
+export const getMetrics = (window) => getJson('/api/status/metrics', { window })
+
+/**
  * 解析一个 SSE 事件块（`parseSseBlock` 的输入是**完整**的一段，
  * 以空行结束，见下面的缓冲逻辑）。
  *
