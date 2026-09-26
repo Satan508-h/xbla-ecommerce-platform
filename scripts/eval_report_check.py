@@ -98,6 +98,12 @@ def fetch_rows(run_id: str):
              q.intent,
              q.status,
              q.retrieval_detail,
+             -- ★ 阶段 9.6：决策那两段要的三列。
+             --   session_id 是多轮分组的唯一依据；intent_plan / tool_calls
+             --   是「该不该」与「做没做」的两个来源。
+             q.intent_plan,
+             q.tool_calls,
+             q.session_id,
              q.total_latency_ms,
              q.retrieval_latency_ms,
              q.rerank_latency_ms,
@@ -106,6 +112,10 @@ def fetch_rows(run_id: str):
              e.intent                AS gold_intent,
              e.expected_chunk_ids    AS gold_ids,
              e.expect_no_retrieval,
+             -- ★ 多轮题的轮数 —— 判「这次尝试完不完整」要用它
+             e.turns,
+             -- ★ ①「首轮该不该反问」的 gold（V17）。★ 三态：NULL = 没标注 ⇒ 不可判
+             e.expect_clarify,
              -- ★ 「这道题在不在题库里」必须【显式】查出来。用
              --   gold_intent IS NULL 去推是不安全的：那是一个【恰好】
              --   成立的等价（yml 里 intent 必填），而「恰好成立」的等价
@@ -150,14 +160,29 @@ class Tree:
         self.retrieval: dict[str, str] = {}
         self.role: dict[str, str] = {}
         self.business_codes: set[str] = set()
+        # ★ 阶段 9.6：工具白名单。★ 端点在为空时【省掉这个键】，
+        #   所以 `.get(code, [])` 同时覆盖「声明了空」和「压根没有」——
+        #   而 Java 那边两者都是空列表，语义一致（见 IntentTree#toolsOf）
+        self.tools_top: dict[str, list] = {}
+        self.tools_leaf: dict[str, list] = {}
+        # ★ 顶层码的集合 —— is_target() 要用。★ 不能靠 `retrieval` 里有没有它
+        #   来判断：叶子也在那张表里（它们继承父顶层的 retrieval）
+        self.top_codes: set[str] = set()
+        self.top_retrieval: dict[str, str] = {}
         for top in payload["topLevel"]:
+            self.top_codes.add(top["code"])
+            self.top_retrieval[top["code"]] = top["retrieval"]
             self.retrieval[top["code"]] = top["retrieval"]
             self.role[top["code"]] = top["role"]
+            if top.get("tools"):
+                self.tools_top[top["code"]] = list(top["tools"])
             if top["role"] == "BUSINESS":
                 self.business_codes.add(top["code"])
             for leaf in top["leaves"]:
                 self.leaf_doc_types[leaf["code"]] = set(leaf["docTypes"] or [])
                 self.retrieval[leaf["code"]] = top["retrieval"]
+                if leaf.get("tools"):
+                    self.tools_leaf[leaf["code"]] = list(leaf["tools"])
                 if top["role"] == "BUSINESS":
                     self.business_codes.add(leaf["code"])
 
@@ -171,6 +196,35 @@ class Tree:
 
     def retrieval_of(self, code):
         return self.retrieval.get(code)
+
+    def tools_of(self, code) -> list:
+        """镜像 `IntentTree.Tree#toolsOf`：**先查顶层，再查叶子**。
+
+        ★ 两步都要有，而且顺序不能反：TOOL 类意图的分类落点是**顶层**
+          （`ORDER_LOGISTICS`），而混合轮的 KB 叶子（`SCENARIO_PICK`）
+          把 `tools` 声明在**叶子**上。
+        """
+        if not code:
+            return []
+        if code in self.tools_top:
+            return self.tools_top[code]
+        return self.tools_leaf.get(code, [])
+
+    def is_target(self, code) -> bool:
+        """镜像 `Tree#findTarget` —— 这条 code 是不是**模型能输出**的分类目标。
+
+        ★ 规则只有一条「行为相同的不区分」：
+            `retrieval = KB` 的顶层 ⇒ 展开到**叶子**（叶子之间 doc_types 不同）
+            `retrieval ≠ KB` 的顶层 ⇒ 只算**一个**目标，用**顶层 code**
+
+        ★ 它在这套对拍里承重：`intent_plan.resumed` 那一层判「落点对不对」时，
+          gold 若不是合法目标，这一格是【不可判】而不是【错】。
+        """
+        if not code:
+            return False
+        if code in self.top_codes:
+            return self.top_retrieval.get(code) != "KB"
+        return code in self.leaf_doc_types and self.retrieval.get(code) == "KB"
 
 
 # ================================================================
@@ -315,6 +369,327 @@ def compute(run_id: str):
             kb_n += 1
             kb_hit += 1 if equal else 0
     out["检索范围"] = {"KB题": ratio(kb_hit, kb_n), "全体": ratio(all_hit, all_n)}
+
+    # ── 决策三段（阶段 9.6）───────────────────────────────────
+    #
+    # ★★ 判据【逐字镜像】Java 的 EvalReportService，三条都不能记错：
+    #
+    #    「实际检索了」 = retrieval_detail 非空 —— 【不是】intent_plan.retrieve。
+    #                    后者是门控自己的输出，拿它当判据会漏掉
+    #                    「算对了但调用点忘了用」那类只改一半的实现
+    #    「算一次决策」 = status 非空且 ≠ 4 —— 被限流拒掉的那条路上检索压根没跑，
+    #                    把它算成「决定不检索」会让过度检索率凭空归零
+    #    「该有工具」   = retrieval_of(gold) == TOOL ∨ tools_of(gold) 非空
+    #                    （前者覆盖 TOOL 类的叶子、后者覆盖混合轮的 KB 叶子）
+    #
+    # ★ 这三段存在的意义就是「**独立**再算一遍」。所以下面刻意不 import
+    #   EvalReportService 的任何东西，也不复用上面那几段的中间量。
+
+    def _plan(r):
+        """★★ `fetch_rows` 里 jsonb 列经 `json_agg` 出来【已经是对象】，不是字符串。
+
+        ★★★ 第一版写的是 `json.loads(r["intent_plan"])`。对 dict 调 `json.loads`
+        抛的是 `TypeError`，而那个 `except` 把它吞了 ⇒ **每一行都读成「没有计划」**。
+        症状是「Python 侧全是 0」—— 一个**静默的、看起来合法的 0**：
+        对拍会报「25 处不一致」，但每一处都指向「两边算的数不同」，
+        而真相是**这一边什么都没读到**。
+        ⚠️ 所以这里【不回退】：形状不对就抛，别把一个读不到的字段说成「没有」。
+        （同 ADR-092 的口径：解析失败不回退到另一条路。）
+        """
+        v = r.get("intent_plan")
+        if v is None or v == "":
+            return None
+        if isinstance(v, dict):
+            return v
+        raise ValueError("intent_plan 的形状变了：期望 dict，拿到 %s" % type(v).__name__)
+
+    def _plan_tools(p):
+        v = (p or {}).get("tools")
+        return [str(x) for x in v] if isinstance(v, list) else []
+
+    def _tool_calls(r):
+        """同 `_plan`：`tool_calls` 是 jsonb，出来就是 list（或 NULL）。"""
+        v = r.get("tool_calls")
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            return [c for c in v if isinstance(c, dict)]
+        raise ValueError("tool_calls 的形状变了：期望 list，拿到 %s" % type(v).__name__)
+
+    def _call_names(r):
+        return [str(c.get("tool")) for c in _tool_calls(r)]
+
+    def _call_errors(r):
+        return [bool(c.get("isError")) for c in _tool_calls(r)]
+
+    def _turns(v):
+        """这道题在题库里声明的轮次列表。★ 空列表 = 单轮题。
+
+        ⚠️ `eval_question.turns` 是 jsonb ⇒ `fetch_rows` 出来**已经是 list**。
+        第一版写的是 `json.loads(...)`，对 list 抛 `TypeError` 被吞掉
+        ⇒ **每一道多轮题都被 `continue` 掉**，整节读成 0。
+        ★ 同一个形状错在 9.6a 的这段代码里犯了**三次**（`intent_plan` /
+        `tool_calls` / `turns`）—— 因为三处都照着「JSON 列是字符串」的直觉写。
+        判据是**列的类型**，不是直觉。
+        """
+        tv = (v["rows"][0].get("turns") if v["rows"] else None)
+        if tv is None or tv == "":
+            return []
+        if isinstance(tv, list):
+            return tv
+        raise ValueError("turns 的形状变了：期望 list，拿到 %s" % type(tv).__name__)
+
+    def _decided(r):
+        return r["status"] is not None and r["status"] != 4
+
+    def _retrieved(r):
+        return bool(r["retrieval_detail"])
+
+    def _wants_tools(gold):
+        return bool(gold) and (tree.retrieval_of(gold) == "TOOL" or bool(tree.tools_of(gold)))
+
+    def _cells():
+        return {"不检索_没检索": 0, "不检索_检索了": 0,
+                "要检索_检索了": 0, "要检索_没检索": 0}
+
+    def _tool_cells():
+        return {"该有_调了": 0, "该有_没调": 0, "不该有_没调": 0, "不该有_调了": 0}
+
+    # ── 检索决策 ──
+    rd_row, rd_q = _cells(), _cells()
+    rd_row_den = {"不检索": 0, "要检索": 0}
+    rd_q_den = {"不检索": 0, "要检索": 0}
+    rd_skipped = rd_no_bank = rd_nomode = 0
+    rd_clarify = 0
+    rd_gate, rd_shape = {}, {}
+    rd_ignored, rd_flipped = [], []
+    for v in views:
+        if not v["in_bank"]:
+            rd_no_bank += len(v["rows"])
+            continue
+        wants_no = v["no_retrieval"]
+        votes = []
+        for r in v["rows"]:
+            if not _decided(r):
+                rd_skipped += 1
+                continue
+            got = _retrieved(r)
+            key = "不检索" if wants_no else "要检索"
+            rd_row_den[key] += 1
+            rd_row["%s_%s" % (key, "没检索" if not got else "检索了")] += 1
+            # ★★ 「声明要检索而没检索」里混着【对的澄清短路】和【真的关太狠】
+            if not wants_no and not got and r["status"] == 3:
+                rd_clarify += 1
+            votes.append("检索" if got else "不检索")
+            p = _plan(r)
+            shape = "无计划" if p is None else str(p.get("shape") or "(缺这一格)")
+            rd_shape[shape] = rd_shape.get(shape, 0) + 1
+            if p is not None:
+                g = str(p.get("gate") or "(缺这一格)")
+                rd_gate[g] = rd_gate.get(g, 0) + 1
+                if p.get("retrieve") is False and got:
+                    rd_ignored.append(v["no"])
+        if not votes:
+            continue
+        verdict = mode_of(votes)
+        if verdict is None:
+            rd_nomode += 1
+            continue
+        key = "不检索" if wants_no else "要检索"
+        rd_q_den[key] += 1
+        rd_q["%s_%s" % (key, "没检索" if verdict == "不检索" else "检索了")] += 1
+        # ★★ 排除多轮题：它的几行是【不同的轮次】，不是重复测量。
+        #    不排的话首轮「澄清短路不检索 ⇒ 不检索」和第二轮「检索」会被读成
+        #    「同一句话跨次翻转」—— 实测报过 5 道纯假阳性（Java 侧同样的判据）。
+        if len(set(votes)) > 1 and not _turns(v):
+            rd_flipped.append(v["no"])
+    out["检索决策"] = {
+        "四格逐行": dict(rd_row, **{("分母_%s" % k): n for k, n in rd_row_den.items()}),
+        "四格逐题": dict(rd_q, **{("分母_%s" % k): n for k, n in rd_q_den.items()}),
+        "平票题数": rd_nomode,
+        "gate分布": rd_gate,
+        "shape分布": rd_shape,
+        "算对了没用": sorted(rd_ignored),
+        "翻转题号": sorted(rd_flipped),
+        "没算成决策": rd_skipped,
+        "题不在题库": rd_no_bank,
+        "澄清短路": rd_clarify,
+    }
+
+    # ── 工具调用 ──
+    tc_row, tc_q = _tool_cells(), _tool_cells()
+    tc_row_den = {"该有": 0, "不该有": 0}
+    tc_q_den = {"该有": 0, "不该有": 0}
+    tc_silent, tc_over, tc_over_ok = [], [], []
+    tc_dist, tc_err, tc_no_plan = {}, 0, 0
+    for v in views:
+        if not v["in_bank"]:
+            continue
+        wants = _wants_tools(v["gold"])
+        votes = []
+        for r in v["rows"]:
+            names, errs = _call_names(r), _call_errors(r)
+            called = bool(names)
+            key = "该有" if wants else "不该有"
+            tc_row_den[key] += 1
+            tc_row["%s_%s" % (key, "调了" if called else "没调")] += 1
+            votes.append("调了" if called else "没调")
+            p = _plan(r)
+            if p is None:
+                tc_no_plan += 1
+            offered = _plan_tools(p)
+            if offered and not called:
+                tc_silent.append(v["no"])
+            for i, name in enumerate(names):
+                tc_dist[name] = tc_dist.get(name, 0) + 1
+                if i < len(errs) and errs[i]:
+                    tc_err += 1
+                if name not in offered:
+                    tc_over.append("%s:%s" % (v["no"], name))
+                    if i < len(errs) and not errs[i]:
+                        tc_over_ok.append("%s:%s" % (v["no"], name))
+        if not votes:
+            continue
+        verdict = mode_of(votes)
+        if verdict is None:
+            continue
+        key = "该有" if wants else "不该有"
+        tc_q_den[key] += 1
+        tc_q["%s_%s" % (key, "调了" if verdict == "调了" else "没调")] += 1
+    out["工具调用"] = {
+        "四格逐行": dict(tc_row, **{("分母_%s" % k): n for k, n in tc_row_den.items()}),
+        "四格逐题": dict(tc_q, **{("分母_%s" % k): n for k, n in tc_q_den.items()}),
+        "静默降级行数": len(tc_silent),
+        "越权条数": len(tc_over),
+        "越权且成功条数": len(tc_over_ok),
+        "工具分布": tc_dist,
+        "isError条数": tc_err,
+        "没有计划的行": tc_no_plan,
+    }
+
+    # ── 多轮澄清（三层）──
+    #
+    # ★ 轮次边界靠 session_id 分组还原 —— 每次重复新建一个会话，
+    #   所以「同题号 + 同 session」就是一次完整尝试，组内按 id 排就是轮次顺序。
+    mt = {"分母_完整的尝试": 0, "不完整": 0, "没有session": 0,
+          "分母_①可判": 0, "没有gold": 0,
+          "①该反问_反问了": 0, "①该反问_没反问": 0,
+          "①不该反问_没反问": 0, "①不该反问_反问了": 0,
+          "末轮带上状态": 0, "末轮落点": 0, "三层全过": 0,
+          "没有v3": 0, "末轮命中分母": 0, "末轮命中": 0}
+    for v in views:
+        if not v["in_bank"]:
+            continue
+        turns = _turns(v)
+        if not turns:
+            continue
+        gold = v["gold"]
+        by_sess = {}
+        for r in v["rows"]:
+            if r.get("session_id") is None:
+                mt["没有session"] += 1
+                continue
+            by_sess.setdefault(r["session_id"], []).append(r)
+        for _sid, rs in by_sess.items():
+            rs = sorted(rs, key=lambda r: r["id"])
+            if len(rs) != len(turns):
+                # ★ 会话断在中途 ⇒ 这次尝试【不进任何分子分母】。
+                #   先加进分母再减掉是错的写法：中间那一刻它已经在分母里了，
+                #   将来有人在 continue 之前插一句就会静默改变分母。
+                mt["不完整"] += 1
+                continue
+            mt["分母_完整的尝试"] += 1
+            first, last = rs[0], rs[-1]
+            p = _plan(last)
+            if p is not None and "resumed" not in p:
+                mt["没有v3"] += 1
+            asked = first["status"] == 3
+            resumed = bool(p.get("resumed")) if p else False
+            landed = bool(gold) and gold == last["intent"] and tree.is_target(gold)
+            # ★★ ②③ 的分母是【完整的尝试】，不受 ① 有没有 gold 影响
+            mt["末轮带上状态"] += 1 if resumed else 0
+            mt["末轮落点"] += 1 if landed else 0
+
+            # ★★ ① 的 gold 只认显式标注（V17）—— 多轮题的 intent 指【末轮】，
+            #    拿它给首轮下结论必然错，所以【不猜】，判不可判。
+            wants = rs[0].get("expect_clarify")
+            if wants is None:
+                mt["没有gold"] += 1
+            else:
+                mt["分母_①可判"] += 1
+                if wants:
+                    mt["①该反问_反问了" if asked else "①该反问_没反问"] += 1
+                else:
+                    mt["①不该反问_反问了" if asked else "①不该反问_没反问"] += 1
+                # ★ 「三层全过」的 ① 那一半是【判对了】，不是「反问了」
+                if asked == bool(wants) and resumed and landed:
+                    mt["三层全过"] += 1
+            if last["status"] == 1 and v["gold_ids"]:
+                mt["末轮命中分母"] += 1
+                ctx = list((last["retrieval_detail"] or {}).get("final_top_k") or [])
+                if set(v["gold_ids"]) & set(int(c) for c in ctx[:5]):
+                    mt["末轮命中"] += 1
+    den = mt["分母_完整的尝试"]
+    out["多轮澄清"] = {
+        "分母": den,
+        "不完整": mt["不完整"],
+        "没有session": mt["没有session"],
+        "分母_①可判": mt["分母_①可判"],
+        "①没有gold": mt["没有gold"],
+        "①该反问_反问了": mt["①该反问_反问了"],
+        "①该反问_没反问": mt["①该反问_没反问"],
+        "①不该反问_没反问": mt["①不该反问_没反问"],
+        "①不该反问_反问了": mt["①不该反问_反问了"],
+        # ★ ②③ 的分母是完整尝试；「三层全过」的是 ①可判 —— 两个分母不同是刻意的
+        "末轮带上状态": ratio(mt["末轮带上状态"], den),
+        "末轮落点": ratio(mt["末轮落点"], den),
+        "三层全过": ratio(mt["三层全过"], mt["分母_①可判"]),
+        "末轮命中": ratio(mt["末轮命中"], mt["末轮命中分母"]),
+        "没有v3": mt["没有v3"],
+    }
+
+    # ── 槽位声明（`missing` 的去向）──
+    #   ★ 独立复算：只读 `status` 与 `intent_plan.missing` 两样，
+    #     不碰 Java 侧任何中间量（尤其**不读 gate** —— 用 gate 去分组
+    #     等于把 Java 的判据抄一遍，那样对拍就成了自证）。
+    sd_rows = sd_no_plan = sd_declared = sd_asked = sd_answered = 0
+    sd_asked_all = sd_asked_no_missing = 0
+    sd_nos = []
+    for v in views:
+        for r in v["rows"]:
+            sd_rows += 1
+            p = _plan(r)
+            if p is None:
+                sd_no_plan += 1
+                continue
+            miss = p.get("missing")
+            has = isinstance(miss, list) and len(miss) > 0
+            acted = r["status"] == 3
+            if acted:
+                sd_asked_all += 1
+            if has:
+                sd_declared += 1
+                if acted:
+                    sd_asked += 1
+                else:
+                    sd_answered += 1
+                    if v["no"] not in sd_nos:
+                        sd_nos.append(v["no"])
+            elif acted:
+                sd_asked_no_missing += 1
+    out["槽位声明"] = {
+        "分母_行": sd_rows,
+        "没有计划": sd_no_plan,
+        "分母_声明缺槽位": sd_declared,
+        "澄清分支_反问": sd_asked,
+        "业务码_作答": sd_answered,
+        "分母_反问": sd_asked_all,
+        "没缺槽位却反问": sd_asked_no_missing,
+        # ★ 两侧都**排序**：这一侧是按题遍历独立构建的，靠「恰好遍历顺序一致」
+        #   来相等 = 一个会静默失效的等价（而失效的样子是「复算不一致」，
+        #   把人引向数据而不是序）。
+        "声明了却没反问的题": sorted(sd_nos),
+    }
 
     # ── 检索命中率 ────────────────────────────────────────────
     first_try = later = never = 0
@@ -504,6 +879,102 @@ def from_java(report: dict):
         "KB题": {k: dig(sc, "★主数字_KB题", k) for k in ("n", "命中", "值", "可信")},
         "全体": {k: dig(sc, "全体", k) for k in ("n", "命中", "值", "可信")},
     }
+
+    # ── 阶段 9.6：决策三段 ──
+    #   ★ 这一层的键名是**内部短名**，和 Java 侧那串长键名（带 ★ 和全角括号）
+    #     故意不同：长键名是给人读报告的，短名是给比较器用的。
+    #     映射写在这里一处 —— 两处各写一份的话，改一个 ★ 就会让某项
+    #     永远显示 Java=None / Python=X，也就是永远报「不一致」。
+    rd, rdq = dig(r, "检索决策", "四格（逐行）") or {}, dig(r, "检索决策", "四格（逐题·多数票）") or {}
+    out["检索决策"] = {
+        "四格逐行": {
+            "不检索_没检索": dig(rd, "★声明不检索_实际也没检索"),
+            "不检索_检索了": dig(rd, "★声明不检索_实际检索了（过度检索）"),
+            "要检索_检索了": dig(rd, "★声明要检索_实际检索了"),
+            "要检索_没检索": dig(rd, "★声明要检索_实际没检索（过度关闭）"),
+            "分母_不检索": dig(rd, "分母_声明不检索的行"),
+            "分母_要检索": dig(rd, "分母_声明要检索的行"),
+        },
+        "四格逐题": {
+            "不检索_没检索": dig(rdq, "★声明不检索_实际也没检索"),
+            "不检索_检索了": dig(rdq, "★声明不检索_实际检索了（过度检索）"),
+            "要检索_检索了": dig(rdq, "★声明要检索_实际检索了"),
+            "要检索_没检索": dig(rdq, "★声明要检索_实际没检索（过度关闭）"),
+            "分母_不检索": dig(rdq, "分母_声明不检索的题"),
+            "分母_要检索": dig(rdq, "分母_声明要检索的题"),
+        },
+        "平票题数": dig(rdq, "平票的题数"),
+        "gate分布": dict(dig(r, "检索决策", "gate分布") or {}),
+        "shape分布": dict(dig(r, "检索决策", "shape分布") or {}),
+        "算对了没用": sorted(dig(r, "检索决策", "★算对了但没用的行") or []),
+        "翻转题号": sorted(x.split(" → ")[0]
+                         for x in (dig(r, "检索决策", "★跨次决策翻转的题") or [])),
+        "没算成决策": dig(r, "检索决策", "★没算成决策的行"),
+        "题不在题库": dig(r, "检索决策", "★题不在题库里的行"),
+        "澄清短路": dig(r, "检索决策", "★其中·澄清短路（不是错）"),
+    }
+    tc, tcq = dig(r, "工具调用", "四格（逐行）") or {}, dig(r, "工具调用", "四格（逐题·多数票）") or {}
+    out["工具调用"] = {
+        "四格逐行": {
+            "该有_调了": dig(tc, "★该有工具_确实调了"),
+            "该有_没调": dig(tc, "★该有工具_一次没调"),
+            "不该有_没调": dig(tc, "★不该有工具_没调"),
+            "不该有_调了": dig(tc, "★不该有工具_却调了"),
+            "分母_该有": dig(tc, "分母_该有工具的行"),
+            "分母_不该有": dig(tc, "分母_不该有工具的行"),
+        },
+        "四格逐题": {
+            "该有_调了": dig(tcq, "★该有工具_确实调了"),
+            "该有_没调": dig(tcq, "★该有工具_一次没调"),
+            "不该有_没调": dig(tcq, "★不该有工具_没调"),
+            "不该有_调了": dig(tcq, "★不该有工具_却调了"),
+            "分母_该有": dig(tcq, "分母_该有工具的题"),
+            "分母_不该有": dig(tcq, "分母_不该有工具的题"),
+        },
+        # ★ 这一层只比【条数】，不比那几串明细：明细里带 traceId / 题号拼接，
+        #   两个实现的拼法本来就不必逐字相同，而逐字比它只会制造假差异。
+        "静默降级行数": len(dig(r, "工具调用", "★给了工具却一次没调的行") or []),
+        "越权条数": len(dig(r, "工具调用", "★越权的调用") or []),
+        "越权且成功条数": len(dig(r, "工具调用", "★★越权且成功的调用") or []),
+        "工具分布": dict(dig(r, "工具调用", "调用的工具分布") or {}),
+        "isError条数": dig(r, "工具调用", "isError 的调用条数"),
+        "没有计划的行": dig(r, "工具调用", "★没有计划的行"),
+    }
+    mt = dig(r, "多轮澄清") or {}
+    out["多轮澄清"] = {
+        "分母": dig(mt, "分母_完整的尝试"),
+        "不完整": dig(mt, "★不完整的尝试"),
+        "没有session": dig(mt, "★没有 session_id 的行"),
+        "分母_①可判": dig(mt, "分母_①可判的尝试"),
+        "①没有gold": dig(mt, "★★①没有 gold 的尝试"),
+        "①该反问_反问了": dig(mt, "①该反问_反问了"),
+        "①该反问_没反问": dig(mt, "①该反问_没反问（漏）"),
+        "①不该反问_没反问": dig(mt, "①不该反问_没反问"),
+        "①不该反问_反问了": dig(mt, "①不该反问_反问了（假阳）"),
+        # ★ 只投影【数字键】—— 和上面几节同一个规矩。Java 的 ratio() 还会多一格
+        #   `★`（"n<5 不作为结论"那句**给人读的注释**），Python 侧没有它。
+        #   ⚠️ 整份 dict 拿去比会把那一格变成一条恒定的假差异（实测 4 处）。
+        "末轮带上状态": {k: dig(mt, "②末轮带上了状态", k)
+                     for k in ("n", "命中", "值", "可信")},
+        "末轮落点": {k: dig(mt, "③末轮落点对了", k)
+                   for k in ("n", "命中", "值", "可信")},
+        "三层全过": {k: dig(mt, "★★三层全过", k)
+                   for k in ("n", "命中", "值", "可信")},
+        "末轮命中": {k: dig(mt, "末轮命中@5", k)
+                   for k in ("n", "命中", "值", "可信")},
+        "没有v3": dig(mt, "★计划里没有 resumed 这一格的尝试"),
+    }
+    sd = dig(r, "槽位声明") or {}
+    out["槽位声明"] = {
+        "分母_行": dig(sd, "分母_行"),
+        "没有计划": dig(sd, "★其中·没有计划的行"),
+        "分母_声明缺槽位": dig(sd, "分母_声明缺槽位的行"),
+        "澄清分支_反问": dig(sd, "声明缺槽位_落在澄清分支（反问了）"),
+        "业务码_作答": dig(sd, "★★声明缺槽位_落在业务码（直接作答）"),
+        "分母_反问": dig(sd, "分母_反问的行"),
+        "没缺槽位却反问": dig(sd, "★其中·没声明缺槽位却反问了"),
+        "声明了却没反问的题": list(dig(sd, "★声明了却没反问的题") or []),
+    }
     rt = dig(r, "检索")
     out["检索"] = {
         "分母": dig(rt, "分母", "★分母_测到的题数"),
@@ -634,7 +1105,8 @@ def main() -> int:
 
     print()
     print("-" * 78)
-    for section in ("意图", "澄清边界", "检索范围", "检索", "归因", "过度检索", "延迟"):
+    for section in ("意图", "澄清边界", "槽位声明", "检索范围", "检索", "归因",
+                    "过度检索", "延迟"):
         for line in render(section, java.get(section), py.get(section)):
             print(line)
     print("-" * 78)

@@ -94,6 +94,13 @@
 #      印出来，但标注「不作为结论」—— 不允许直接引用。
 # ============================================================
 
+# ★ 阶段 9.6 起，这个目录里每个 *.yml 都要先自报家门：
+#   kind: bank = 题库（还要 question_set / source / annotated_by）
+#   kind: gold = 判据/标注文件，不进任何指标
+#   ⚠️ 不写 kind 会【当场报错】，没有「默认是题库」这回事 ——
+#      成因是 9.5 的 recommend-gold.yml 让每一次 reload 都失败，
+#      而报错内容指向的修法是错的。见 EvalQuestionLoader#KIND_BANK
+kind: bank
 question_set: stage7
 source: corpus_driven_manual
 annotated_by: Claude 读语料手写；用户抽查

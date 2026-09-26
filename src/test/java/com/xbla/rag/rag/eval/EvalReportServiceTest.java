@@ -1063,6 +1063,79 @@ class EvalReportServiceTest {
             assertEquals(num(comparable, "命中"), correct);
         }
 
+        /**
+         * ★★ 阶段 9.6 加的两个决策段，也必须能由逐题行重算出来。
+         *
+         * <p>★ 为什么这条测试<b>非有不可</b>：它守的是那两段和 {@code verdictRow}
+         * 用的是<b>同一套判据</b>。两处各写一份的话，症状是
+         * 「检索决策段说 3/4、逐题表数出来 2/4」—— 两个数各自自洽，
+         * 合起来是谎话，而<b>没有任何东西会报错</b>。
+         *
+         * <p>★★ 它还兜住另一件更远的事：A/B 的翻转矩阵<b>只看逐题行</b>。
+         * 汇总段加了、逐题行忘了加，新指标就<b>静默地不进任何对比</b> ——
+         * 报告上一切正常，只是那两栏永远不参与「变了没有」的判定。
+         */
+        @Test
+        @DisplayName("★★ 决策段（检索 / 工具）同样由逐题行重算得出")
+        void decisionSectionsAreReproducibleFromRows() {
+            Map<String, Object> report = fixture();
+            List<Map<String, Object>> rows = detailRows(report);
+
+            Map<String, Object> retrieval = sub(section(report, "检索决策"), "四格（逐题·多数票）");
+            long shouldRetrieve = rows.stream()
+                    .filter(r -> Boolean.TRUE.equals(r.get("该检索"))).count();
+            long shouldNot = rows.stream()
+                    .filter(r -> Boolean.FALSE.equals(r.get("该检索"))).count();
+            assertEquals(4, shouldRetrieve, "★ K1/K2/K3/K4 都声明了要检索");
+            assertEquals(2, shouldNot, "★ T1/N1 声明不检索");
+
+            // ── 逐题：四格 + 分母，全部由逐题行的两列重算 ──
+            assertEquals(shouldRetrieve, num(retrieval, "分母_声明要检索的题"));
+            assertEquals(shouldNot, num(retrieval, "分母_声明不检索的题"));
+
+            long wantHit = rows.stream()
+                    .filter(r -> Boolean.TRUE.equals(r.get("该检索"))
+                            && "检索".equals(r.get("检索决策"))).count();
+            assertEquals(3, wantHit, "★ K1/K2/K3 检索了；K4 三次全被挡 ⇒ 检索没发生");
+            assertEquals(wantHit, num(retrieval, "★声明要检索_实际检索了"));
+            long noHit = rows.stream()
+                    .filter(r -> Boolean.FALSE.equals(r.get("该检索"))
+                            && "不检索".equals(r.get("检索决策"))).count();
+            assertEquals(2, noHit);
+            assertEquals(noHit, num(retrieval, "★声明不检索_实际也没检索"));
+
+            // ── 逐行：分母 = 题数 × 重复次数（这里每一题都是 3 次）──
+            Map<String, Object> rowCells = sub(section(report, "检索决策"), "四格（逐行）");
+            assertEquals(12L, num(rowCells, "分母_声明要检索的行"), "★ 4 道题 × 3 次重复");
+            assertEquals(6L, num(rowCells, "分母_声明不检索的行"), "★ 2 道题 × 3 次重复");
+            assertEquals(9L, num(rowCells, "★声明要检索_实际检索了"), "★ K1/K2/K3 各 3 次");
+            assertEquals(3L, num(rowCells, "★声明要检索_实际没检索（过度关闭）"),
+                    "★ K4 三次全被闸门挡 ⇒ 三次都「声明要检索而没检索」");
+
+            // ── 工具：gold 是 TOOL_LEAF 才能推出「该有工具」──
+            Map<String, Object> tools = sub(section(report, "工具调用"), "四格（逐题·多数票）");
+            long shouldHaveTools = rows.stream()
+                    .filter(r -> Boolean.TRUE.equals(r.get("该有工具"))).count();
+            assertEquals(1, shouldHaveTools,
+                    "★★ 只有 T1。判据是 retrievalOf(gold)==TOOL —— "
+                            + "gold 是【叶子码】TOOL_LEAF，它自己没声明 tools，"
+                            + "要抬到父顶层 TOOL_TOP 才看得出这一类走工具");
+            assertEquals(shouldHaveTools, num(tools, "分母_该有工具的题"));
+            assertEquals(rows.size() - shouldHaveTools, num(tools, "分母_不该有工具的题"));
+
+            long toolMiss = rows.stream()
+                    .filter(r -> Boolean.TRUE.equals(r.get("该有工具"))
+                            && "没调".equals(r.get("工具决策"))).count();
+            assertEquals(1L, toolMiss,
+                    "★★ 这个夹具里没有任何 tool_calls ⇒ T1 落在「该调却没调」那一格。"
+                            + "★ 那正是 9.1 修掉的那个的模式（静默降级）—— "
+                            + "所以真实数据上它非 0 时要先分清「真降级了」和「工具链没跑」，"
+                            + "判据是 工具调用.★给了工具却一次没调的行（那一栏看的是"
+                            + "生效白名单，不是 gold）");
+            assertEquals(toolMiss, num(tools, "★该有工具_一次没调"));
+            assertEquals(0L, num(tools, "★该有工具_确实调了"));
+        }
+
         @Test
         @DisplayName("★★★ 反对照：把 null 当成 false 会得出【不一样的数】—— 三态确实在承重")
         void treatingNullAsFalseWouldChangeTheNumber() {
@@ -1203,12 +1276,6 @@ class EvalReportServiceTest {
                     "★ 不排序会印出 [4, 2]，而报告印的是 [2, 4] —— "
                             + "两者不同，所以上面那条断言测的是真实的差异，不是一句恒真的话");
 
-            // ★★ 另一条确定性判据：Set 的打印顺序与【声明顺序】无关。
-            //    它说明报告里的 [2, 4] 不可能是「原样转述声明顺序」来的。
-            assertEquals(Set.copyOf(List.of(4, 2)).toString(),
-                    Set.copyOf(List.of(2, 4)).toString(),
-                    "同一个集合的两种声明顺序，Set 必须印出同一个串");
-
             // ⚠️ 残余盲区，记下来别假装它不存在：
             //    上面那条报告级断言（印 [2, 4]）**不是** 100% 的检测器 ——
             //    如果哪天 sorted() 被删掉，「直接拼 Set」的写法在
@@ -1218,5 +1285,646 @@ class EvalReportServiceTest {
             //    （另有 §检索范围 的一致性判据从另一侧兜底：排序与否不影响
             //      集合相等，所以那条永不受影响。）
         }
+    }
+
+    // ================================================================
+    // 十一、★★ 检索决策：该不该检索（阶段 9.6）
+    // ================================================================
+
+    @Nested
+    @DisplayName("十一、★★ 检索决策：该不该检索")
+    class RetrievalDecision {
+
+        /**
+         * ★★ 四个格子必须【各自成数】。
+         *
+         * <p>并成一个「准确率」会把两个方向完全不同的错压成一个数：
+         * 「过度检索」要收窄，而「过度关闭」要放宽 —— 一个数字同时代表这两件事时，
+         * 它掉下来你<b>不知道该往哪边调</b>。
+         */
+        @Test
+        @DisplayName("★★ 四个格子各自成数")
+        void fourCellsAreSeparate() {
+            List<EvalQuestion> bank = List.of(
+                    q("D1", "LEAF_A"), q("D2", "LEAF_A"), q("D3", "LEAF_A"),
+                    q("S1", "LEAF_A", 1L), q("S2", "LEAF_A", 1L), q("S3", "LEAF_A", 1L));
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<QaLog> rows = List.of(
+                    row("D1", 1, "FALLBACK", null),   // 声明不检索，也没检索 ✓
+                    row("D2", 1, "FALLBACK", null),   // 同上 ✓
+                    row("D3", 1, "FALLBACK", d),      // 声明不检索，检索了 ✗ 过度检索
+                    row("S1", 1, "LEAF_A", d),        // 要检索，检索了 ✓
+                    row("S2", 1, "LEAF_A", null),     // 要检索，没检索 ✗ 过度关闭
+                    row("S3", 1, "LEAF_A", null));    // 同上 ✗
+
+            Map<String, Object> cells = sub(section(run(rows, bank), "检索决策"), "四格（逐行）");
+
+            assertEquals(3L, num(cells, "分母_声明不检索的行"),
+                    "★ 分母是【声明不检索的那 3 道题】，不是全部 6 道");
+            assertEquals(2L, num(cells, "★声明不检索_实际也没检索"));
+            assertEquals(1L, num(cells, "★声明不检索_实际检索了（过度检索）"),
+                    "★ 这一格是过度检索 —— 9.2 之前那 7 道兜底题的形状");
+            assertEquals(3L, num(cells, "分母_声明要检索的行"));
+            assertEquals(1L, num(cells, "★声明要检索_实际检索了"));
+            assertEquals(2L, num(cells, "★声明要检索_实际没检索（过度关闭）"),
+                    "★ 这一格是过度关闭，修法和上一格【相反】，所以绝不能并成一个数");
+        }
+
+        @Test
+        @DisplayName("★★★ 反对照：被限流拒掉的行【不算一次决策】")
+        void rateLimitedRowsAreNotDecisions() {
+            List<EvalQuestion> bank = List.of(q("D1", "LEAF_A"), q("D2", "LEAF_A"),
+                    q("D3", "LEAF_A"),
+                    q("S1", "LEAF_A", 1L), q("S2", "LEAF_A", 1L), q("S3", "LEAF_A", 1L));
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+
+            // ★ 只改一个数：D3 / S2 / S3 从 status=1 变成 4（被限流拒掉）
+            List<QaLog> healthy = List.of(
+                    row("D1", 1, "FALLBACK", null), row("D2", 1, "FALLBACK", null),
+                    row("D3", 1, "FALLBACK", d),
+                    row("S1", 1, "LEAF_A", d), row("S2", 1, "LEAF_A", null),
+                    row("S3", 1, "LEAF_A", null));
+            List<QaLog> refused = List.of(
+                    row("D1", 1, "FALLBACK", null), row("D2", 1, "FALLBACK", null),
+                    row("D3", 4, "FALLBACK", d),
+                    row("S1", 1, "LEAF_A", d), row("S2", 4, "LEAF_A", null),
+                    row("S3", 4, "LEAF_A", null));
+
+            Map<String, Object> a = sub(section(run(healthy, bank), "检索决策"), "四格（逐行）");
+            Map<String, Object> b = sub(section(run(refused, bank), "检索决策"), "四格（逐行）");
+            Map<String, Object> bAll = section(run(refused, bank), "检索决策");
+
+            assertEquals(3L, num(a, "分母_声明不检索的行"), "健康那一份：3 道");
+            assertEquals(2L, num(b, "分母_声明不检索的行"),
+                    "★★ 拒掉的那一份必须只剩 2 行 —— 它压根没轮到做决策，"
+                            + "拿它当「决定不检索」会让报告说「要检索的题有 N% 没检索」，"
+                            + "而真相是那一刻名额用完了，结论指向【相反的调优方向】");
+            assertEquals(1L, num(a, "★声明不检索_实际检索了（过度检索）"),
+                    "★ 健康那一份：D3 声明不检索却检索了 ⇒ 过度检索 1/3");
+            assertEquals(0L, num(b, "★声明不检索_实际检索了（过度检索）"),
+                    "★★★ 连分子也一起出局，于是这个格子【归零】—— "
+                            + "一个看起来像好消息的 0（「零过度检索！」），"
+                            + "而它百分之百是容量造成的，跟门控一点关系都没有。"
+                            + "比率上没有任何痕迹，所以必须另有一格把出局的行数出来");
+            assertEquals(3L, num(bAll, "★没算成决策的行"),
+                    "★ 三行被单独数出来了 —— 它们不是被丢掉，是被【记成另一件事】");
+        }
+
+        @Test
+        @DisplayName("★★★ 门控说了「不检索」而实际检索了 —— 应恒 0，且看得见")
+        void gateSaidNoButRetrievalHappened() {
+            List<EvalQuestion> bank = List.of(q("G1", "LEAF_A", 1L));
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+
+            QaLog consistent = row("G1", 1, "LEAF_A", d);
+            consistent.setIntentPlan(plan("KB", true, "JSON", "[]", null));
+            QaLog ignored = row("G1", 1, "LEAF_A", d);
+            ignored.setIntentPlan(plan("PLAN_OFF", false, "JSON", "[]", null));
+
+            List<String> a = strList(section(run(List.of(consistent), bank), "检索决策"),
+                    "★算对了但没用的行");
+            List<String> b = strList(section(run(List.of(ignored), bank), "检索决策"),
+                    "★算对了但没用的行");
+
+            assertTrue(a.isEmpty(), "★ 门控说检索、也确实检索了 —— 一致");
+            assertEquals(1, b.size(),
+                    "★★★ 门控说【不】检索，而 retrieval_detail 非空 —— "
+                            + "这是「算对了但调用点忘了用」，9.2 点名的只改一半的实现。"
+                            + "★ 拿 intent_plan.retrieve 当判据会把它整个漏掉");
+            assertTrue(b.get(0).contains("G1"), "★ 要能指出是哪一道：" + b);
+        }
+
+        @Test
+        @DisplayName("★★ 澄清短路不算「过度关闭」—— 它被单独数出来")
+        void clarifyShortCircuitIsNotOverClosing() {
+            List<EvalQuestion> bank = List.of(q("C1", "LEAF_A", 1L), q("C2", "LEAF_A", 1L));
+            // C1：澄清短路（status=3、没有 retrieval_detail）—— 这是【对的】，用户那句话本来就缺信息
+            // C2：门控关太狠（status=1 却没检索）—— 这是【真的错】
+            List<QaLog> rows = List.of(
+                    row("C1", 3, "CLARIFY_TOP", null),
+                    row("C2", 1, "LEAF_A", null));
+
+            Map<String, Object> s = section(run(rows, bank), "检索决策");
+
+            assertEquals(2L, num(sub(s, "四格（逐行）"), "★声明要检索_实际没检索（过度关闭）"),
+                    "★ 两行都落进这一格 —— 光看这一格分不出谁对谁错");
+            assertEquals(1L, num(s, "★其中·澄清短路（不是错）"),
+                    "★★ 减掉它，剩下的 1 才是真的「关得太狠」。"
+                            + "没有这一栏的话，多轮集上每一道首轮被反问的题都会"
+                            + "变成一个假阳性 —— 而那个数看起来像个实实在在的缺陷");
+        }
+
+        @Test
+        @DisplayName("★★ shape 分布是「门控到底有没有生效」的唯一判据")
+        void shapeDistribution() {
+            List<EvalQuestion> bank = List.of(
+                    q("A", "LEAF_A", 1L), q("B", "LEAF_A", 1L), q("C", "LEAF_A", 1L));
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+
+            QaLog json = row("A", 1, "LEAF_A", d);
+            json.setIntentPlan(plan("KB", true, "JSON", "[]", null));
+            QaLog code = row("B", 1, "LEAF_A", d);
+            code.setIntentPlan(plan("KB", true, "CODE", "[]", null));
+            QaLog none = row("C", 1, "LEAF_A", d);   // 没有计划
+
+            Map<String, Object> shape = sub(section(run(List.of(json, code, none), bank), "检索决策"),
+                    "shape分布");
+
+            assertEquals(1L, num(shape, "JSON"));
+            assertEquals(1L, num(shape, "CODE"),
+                    "★ CODE = 模型没跟上契约，走了裸码回退。"
+                            + "那时 plan.retrieve 是【默认值】不是模型说的 —— "
+                            + "C 这一格涨起来，上面四个格子就都不算数了");
+            assertEquals(1L, num(shape, "(缺这一格)"), "★ 没有计划的行单独数");
+        }
+    }
+
+    // ================================================================
+    // 十二、★★ 工具调用：该不该有工具（阶段 9.6）
+    // ================================================================
+
+    @Nested
+    @DisplayName("十二、★★ 工具调用：该不该有工具")
+    class ToolUsage {
+
+        @Test
+        @DisplayName("★★ 四个格子 + 「给了工具却一次没调」—— 9.1 那个 bug 的形状")
+        void silentDropIsCaught() {
+            List<EvalQuestion> bank = List.of(
+                    q("T1", "TOOL_LEAF"), q("T2", "TOOL_LEAF"), q("K1", "LEAF_A", 1L));
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+
+            QaLog t1 = row("T1", 1, "TOOL_TOP", null);
+            t1.setIntentPlan(plan("TOOL", false, "JSON", "[\"query_x\"]", null));
+            t1.setToolCalls(calls("query_x"));
+            QaLog t2 = row("T2", 1, "TOOL_TOP", null);
+            t2.setIntentPlan(plan("TOOL", false, "JSON", "[\"query_x\"]", null));
+            t2.setToolCalls(null);                       // ★ 一次都没调
+            QaLog k1 = row("K1", 1, "LEAF_A", d);
+            k1.setIntentPlan(plan("KB", true, "JSON", "[]", null));
+
+            Map<String, Object> s = section(run(List.of(t1, t2, k1), bank), "工具调用");
+            Map<String, Object> cells = sub(s, "四格（逐行）");
+
+            assertEquals(2L, num(cells, "分母_该有工具的行"),
+                    "★ 分母由 gold 推出：TOOL_LEAF 抬到父顶层 TOOL_TOP 才是 TOOL 类");
+            assertEquals(1L, num(cells, "★该有工具_确实调了"));
+            assertEquals(1L, num(cells, "★该有工具_一次没调"),
+                    "★★ 这一格是 9.1 修掉的那个的【形状】：工具意图答得跟裸聊一样。"
+                            + "★ 标 「静默降级」要读 final_answer —— "
+                            + "「如实说查不到」和「编一个具体值」在这一格里长得一样");
+            assertEquals(1L, num(cells, "分母_不该有工具的行"));
+            assertEquals(1L, num(cells, "★不该有工具_没调"));
+
+            List<String> drop = strList(s, "★给了工具却一次没调的行");
+            assertEquals(1, drop.size(), "★ 只有 T2：" + drop);
+            assertTrue(drop.get(0).contains("T2"));
+
+            // ★★ 反对照：把 tool_calls 补上，同一个夹具里它就不该再被点名
+            t2.setToolCalls(calls("query_x"));
+            List<String> drop2 = strList(section(run(List.of(t1, t2, k1), bank), "工具调用"),
+                    "★给了工具却一次没调的行");
+            assertTrue(drop2.isEmpty(),
+                    "★★ 补上调用记录之后必须清空 —— 否则上面那条断言可能只是恒真"
+                            + "（比如它压根不看 tool_calls）：" + drop2);
+        }
+
+        /**
+         * ★★★ 这一段是<b>整套工具指标里最要紧的一条</b>。
+         *
+         * <p>白名单拒绝<b>也会留下 {@code CallRecord}</b>（{@code isError=true}）——
+         * 所以「越权的调用」非 0 <b>不代表数据泄露</b>（服务端拒了，ADR-093），
+         * 它代表「模型叫了一个没给它的名字」。
+         *
+         * <p>而「<b>拒了没有</b>」是可观测的：被拒那条必然是 {@code isError=true}。
+         * 所以 {@code ★★越权且成功的调用} 应恒 0 ——
+         * <b>那是 ADR-093 那条不变式在数据上的形状，不是一句「代码里写着所以不会发生」。</b>
+         */
+        @Test
+        @DisplayName("★★★ 越权且成功的调用应恒 0 —— 而它【不是】恒空式")
+        void overreachSucceededIsObservable() {
+            List<EvalQuestion> bank = List.of(q("T1", "TOOL_LEAF"));
+            QaLog refused = row("T1", 1, "TOOL_TOP", null);
+            refused.setIntentPlan(plan("TOOL", false, "JSON", "[\"query_x\"]", null));
+            // ★ query_y 不在本次白名单里 —— 服务端拒了，所以它是 isError=true
+            refused.setToolCalls(calls("query_x", "query_y!"));
+
+            QaLog leaked = row("T1", 1, "TOOL_TOP", null);
+            leaked.setIntentPlan(plan("TOOL", false, "JSON", "[\"query_x\"]", null));
+            // ★★ 同一个越权调用，但这次 isError=false —— 那意味着它【真的跑了】
+            leaked.setToolCalls(calls("query_x", "query_y"));
+
+            Map<String, Object> a = section(run(List.of(refused), bank), "工具调用");
+            Map<String, Object> b = section(run(List.of(leaked), bank), "工具调用");
+
+            assertEquals(1, strList(a, "★越权的调用").size(),
+                    "★ 越权的【尝试】是要报出来的 —— 它是 prompt / 模型行为的信号");
+            assertTrue(strList(a, "★★越权且成功的调用").isEmpty(),
+                    "★★ 被拒的那条必然 isError=true ⇒ 这一格为空");
+            assertEquals(1, strList(b, "★★越权且成功的调用").size(),
+                    "★★★ 反对照：同一个越权调用，只把 isError 改成 false，"
+                            + "这一格就必须有东西 —— 证明它不是一句恒真的话。"
+                            + "真出现这一条 = 白名单在服务端【没拦住】，"
+                            + "模型拿到了不该拿的数据");
+        }
+
+        @Test
+        @DisplayName("★ 「调了」不等于「用上了」：isError 单独数")
+        void erroredCallsAreCounted() {
+            List<EvalQuestion> bank = List.of(q("T1", "TOOL_LEAF"));
+            QaLog row1 = row("T1", 1, "TOOL_TOP", null);
+            row1.setIntentPlan(plan("TOOL", false, "JSON", "[\"query_x\"]", null));
+            // ★ 一条题、两次调用、两次都报错 —— 用来钉住「条数 ≠ 题数」
+            row1.setToolCalls(calls("query_x!", "query_y!"));
+
+            Map<String, Object> s = section(run(List.of(row1), bank), "工具调用");
+            assertEquals(2L, num(s, "isError 的调用条数"),
+                    "★ 条数不是【题数】—— 一轮可以调很多次（这里是 1 题 2 条）");
+            assertEquals(1L, num(sub(s, "调用的工具分布"), "query_x"));
+            assertEquals(1L, num(sub(s, "调用的工具分布"), "query_y"));
+        }
+    }
+
+    // ================================================================
+    // 十三、★★ 多轮澄清：三层（阶段 9.6）
+    // ================================================================
+
+    @Nested
+    @DisplayName("十三、★★ 多轮澄清：三层")
+    class MultiTurn {
+
+        @Test
+        @DisplayName("★★ 三层分开数，且「三层全过」是它们合取")
+        void threeLayers() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<EvalQuestion> bank = List.of(multi("M1", "LEAF_A", 2, true, 1L));
+            List<QaLog> rows = new ArrayList<>();
+
+            // 尝试一（session 100）：该反问 → 反问了 → 末轮恢复且落点对
+            rows.add(srow(1, "M1", 3, "CLARIFY_TOP", null, 100, resume(false)));
+            rows.add(srow(2, "M1", 1, "LEAF_A", d, 100, resume(true)));
+            // 尝试二（session 200）：该反问，但【没】反问 —— ① 错，而 ②③ 仍然成立
+            rows.add(srow(3, "M1", 1, "LEAF_A", d, 200, resume(false)));
+            rows.add(srow(4, "M1", 1, "LEAF_A", d, 200, resume(true)));
+
+            Map<String, Object> s = section(run(rows, bank), "多轮澄清");
+
+            assertEquals(2L, num(s, "分母_完整的尝试"));
+            assertEquals(2L, num(s, "分母_①可判的尝试"));
+            assertEquals(1L, num(s, "①该反问_反问了"), "★ session 100");
+            assertEquals(1L, num(s, "①该反问_没反问（漏）"), "★ session 200 —— 该反问而没反问");
+            assertEquals(0L, num(s, "①不该反问_没反问"));
+            assertEquals(2L, num(sub(s, "②末轮带上了状态"), "命中"), "★ 两次的末轮都带上了");
+            assertEquals(2L, num(sub(s, "③末轮落点对了"), "命中"));
+            assertEquals(1L, num(sub(s, "★★三层全过"), "命中"),
+                    "★ 「三层全过」不是三个率的平均 —— 它要求【同一次尝试】三格都成立");
+            assertEquals(2L, num(sub(s, "末轮命中@5"), "n"), "★ 末轮两次都成功、都有正解");
+        }
+
+        /**
+         * ★★★ 反对照：把 ① 的**标注**翻过来，同一个「没反问」就从错变成对。
+         *
+         * <p>没有这一条的话，「三层全过」的 ① 那一半写成 {@code asked && ...}
+         * 照样能通过上面那个测试 —— 因为那个夹具里 ① 恰好是 true。</p>
+         */
+        @Test
+        @DisplayName("★★★ 反对照：expect_clarify=false 时「没反问」是【对的】")
+        void silenceCanBeCorrect() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            // ★ 一份【完全一样】的行：两个 session 都没反问
+            List<QaLog> rows = List.of(
+                    srow(1, "M1", 1, "LEAF_A", d, 100, resume(false)),
+                    srow(2, "M1", 1, "LEAF_A", d, 100, resume(true)));
+
+            Map<String, Object> wantsIt = section(
+                    run(rows, List.of(multi("M1", "LEAF_A", 2, true, 1L))), "多轮澄清");
+            Map<String, Object> wantsSilence = section(
+                    run(rows, List.of(multi("M1", "LEAF_A", 2, false, 1L))), "多轮澄清");
+
+            assertEquals(1L, num(wantsIt, "①该反问_没反问（漏）"));
+            assertEquals(0L, num(sub(wantsIt, "★★三层全过"), "命中"),
+                    "★ 该反问却没反问 ⇒ 三层不全过");
+
+            assertEquals(1L, num(wantsSilence, "①不该反问_没反问"));
+            assertEquals(1L, num(sub(wantsSilence, "★★三层全过"), "命中"),
+                    "★★★ 同一份行，只把标注从 true 改成 false，「三层全过」就从 0 变成 1 —— "
+                            + "证明它的 ① 那一半读的是【判对了】而不是【反问了】。"
+                            + "写成 `asked && didResume && landed` 的话，这两个数会一模一样，"
+                            + "而那个指标会被优化成「反问得越多越好」");
+        }
+
+        /**
+         * ★★★ 反对照：多轮题没标 {@code expect_clarify} ⇒ ① 判【不可判】。
+         *
+         * <p>这是本段最要紧的一条：多轮题的 gold intent 指的是<b>末轮</b>，
+         * 拿它给首轮下结论会得出「每一道都不该反问」——一个恒为 0 的「反问率」。
+         * <b>猜出来的错值会和真值长得一样地印进报告。</b></p>
+         */
+        @Test
+        @DisplayName("★★★ 反对照：没标 expect_clarify ⇒ ① 不可判，而 ②③ 照样算得出")
+        void missingGoldIsNotJudgedButOthersAre() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<QaLog> rows = List.of(
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100, resume(false)),
+                    srow(2, "M1", 1, "LEAF_A", d, 100, resume(true)));
+
+            Map<String, Object> s = section(
+                    run(rows, List.of(multi("M1", "LEAF_A", 2, null, 1L))), "多轮澄清");
+
+            assertEquals(1L, num(s, "★★①没有 gold 的尝试"));
+            assertEquals(0L, num(s, "分母_①可判的尝试"), "★ ① 的分母是 0 ⇒ 那四格都是不可判");
+            assertEquals(0L, num(s, "①该反问_没反问（漏）"),
+                    "★★ 猜的话这里会变成 1，读起来像「系统漏了一次反问」—— 而那是编出来的");
+            assertEquals(1L, num(sub(s, "②末轮带上了状态"), "命中"),
+                    "★ ② 不依赖 ① 的 gold ⇒ 分母是【完整的尝试】，必须照样算得出来");
+            assertEquals(1L, num(sub(s, "③末轮落点对了"), "命中"));
+            assertEquals(0L, num(sub(s, "★★三层全过"), "n"),
+                    "★ 「三层全过」需要 ① ⇒ n=0（不可判，不是「全没过」）");
+        }
+
+        @Test
+        @DisplayName("★★★ 反对照：会话断在中途的尝试【不进任何分子分母】")
+        void incompleteAttemptIsExcluded() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<EvalQuestion> bank = List.of(multi("M1", "LEAF_A", 2, true, 1L));
+
+            List<QaLog> complete = List.of(
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100, resume(false)),
+                    srow(2, "M1", 1, "LEAF_A", d, 100, resume(true)));
+            // ★ 只改一个数：第二次尝试只落了一行（第 2 轮失败，客户端 break 了）
+            List<QaLog> broken = List.of(
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100, resume(false)),
+                    srow(2, "M1", 1, "LEAF_A", d, 100, resume(true)),
+                    srow(3, "M1", 3, "CLARIFY_TOP", null, 200, resume(false)));
+
+            Map<String, Object> a = section(run(complete, bank), "多轮澄清");
+            Map<String, Object> b = section(run(broken, bank), "多轮澄清");
+
+            assertEquals(1L, num(a, "分母_完整的尝试"));
+            assertEquals(0L, num(a, "★不完整的尝试"));
+            assertEquals(1L, num(b, "分母_完整的尝试"), "★★ 分母【不动】：那半次尝试不算数");
+            assertEquals(1L, num(b, "★不完整的尝试"), "★ 但必须被数出来");
+            assertEquals(1L, num(a, "分母_①可判的尝试"), "★ ① 的分母也不含它");
+            assertEquals(1L, num(b, "分母_①可判的尝试"));
+            assertEquals(1.0, dbl(sub(b, "②末轮带上了状态"), "值"), 1e-9,
+                    "★★★ 反对照：混进去的话 ② 会变成 1/2（看起来像「恢复机制掉了一半」），"
+                            + "而真相是有一轮根本没跑完 —— 失败会被读成模型答不对");
+            assertFalse(((List<?>) b.get("不完整的尝试明细")).isEmpty(),
+                    "★ 要能指出是哪一次：" + b.get("不完整的尝试明细"));
+        }
+
+        @Test
+        @DisplayName("★★ 计划里没有 resumed 这一格的尝试，单独数出来")
+        void missingResumedKeyIsCountedSeparately() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<EvalQuestion> bank = List.of(multi("M1", "LEAF_A", 2, true, 1L));
+
+            // ★ v<3 的计划：根本没有 resumed 那一格（9.4 之前的行）
+            String oldPlan = "{\"v\":1,\"retrieve\":true,\"gate\":\"KB\","
+                    + "\"tools\":[],\"missing\":[],\"shape\":\"JSON\"}";
+            List<QaLog> rows = List.of(
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100, oldPlan),
+                    srow(2, "M1", 1, "LEAF_A", d, 100, oldPlan));
+
+            Map<String, Object> s = section(run(rows, bank), "多轮澄清");
+
+            assertEquals(1L, num(s, "★计划里没有 resumed 这一格的尝试"),
+                    "★ 「0% 带上了状态」有两种成因：功能没生效 / 数据是旧版本。"
+                            + "不把后者数出来，前者就被淹没了");
+            assertEquals(0L, num(sub(s, "②末轮带上了状态"), "命中"),
+                    "★ 缺这一格 ⇒ 不算过（不能拿「没有」当「有」）");
+        }
+    }
+
+    @Nested
+    @DisplayName("十四、★★ 槽位声明（missing 的去向）")
+    class SlotDeclaration {
+
+        /** 一句「缺 product 这个槽位」的模型输出 —— 这一节的夹具里反复用 */
+        private static final String MISSING_PRODUCT = "[\"product\"]";
+
+        @Test
+        @DisplayName("★★ 同一批「声明缺槽位」的行，按【落点】分裂成两格")
+        void splitByWhereItLanded() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<EvalQuestion> bank = List.of(q("M1", "LEAF_A", 1L));
+
+            List<QaLog> rows = List.of(
+                    // 声明缺槽位 + 落在澄清分支 ⇒ 反问
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100,
+                            plan("NONE_INTENT", false, "JSON", "[]", MISSING_PRODUCT, null)),
+                    // 声明缺槽位 + 落在业务码 ⇒ 直接作答
+                    srow(2, "M1", 1, "LEAF_A", d, 100,
+                            plan("KB", true, "JSON", "[]", MISSING_PRODUCT, null)));
+
+            Map<String, Object> s = section(run(rows, bank), "槽位声明");
+
+            assertEquals(2L, num(s, "分母_行"));
+            assertEquals(0L, num(s, "★其中·没有计划的行"));
+            assertEquals(2L, num(s, "分母_声明缺槽位的行"), "★ 两行的 missing 都非空");
+            assertEquals(1L, num(s, "声明缺槽位_落在澄清分支（反问了）"));
+            assertEquals(1L, num(s, "★★声明缺槽位_落在业务码（直接作答）"));
+            assertEquals(1L, num(s, "分母_反问的行"));
+            assertEquals(0L, num(s, "★其中·没声明缺槽位却反问了"));
+        }
+
+        /**
+         * ★★★ 反对照：同一个 {@code missing}，只翻【落点】那一格，去向就变了。
+         *
+         * <p>没有这一条的话，把这一节写成「反过来读 {@code status}」照样能通过
+         * 上面那个测试 —— 因为那个夹具里两件事恰好同步。这里让 <b>{@code missing}
+         * 逐字相同、只有 {@code status} 不同</b>：两个格子的值必须互换。</p>
+         */
+        @Test
+        @DisplayName("★★★ 反对照：missing 逐字相同，只翻落点，去向就互换")
+        void theSameMissingFlipsWithTheLanding() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<EvalQuestion> bank = List.of(q("M1", "LEAF_A", 1L));
+
+            Map<String, Object> answered = section(run(List.of(
+                    srow(1, "M1", 1, "LEAF_A", d, 100,
+                            plan("KB", true, "JSON", "[]", MISSING_PRODUCT, null))), bank),
+                    "槽位声明");
+            Map<String, Object> asked = section(run(List.of(
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100,
+                            plan("NONE_INTENT", false, "JSON", "[]", MISSING_PRODUCT, null))), bank),
+                    "槽位声明");
+
+            assertEquals(1L, num(answered, "★★声明缺槽位_落在业务码（直接作答）"));
+            assertEquals(0L, num(answered, "声明缺槽位_落在澄清分支（反问了）"));
+            assertEquals(1L, num(asked, "声明缺槽位_落在澄清分支（反问了）"));
+            assertEquals(0L, num(asked, "★★声明缺槽位_落在业务码（直接作答）"));
+            assertEquals(1L, num(answered, "分母_声明缺槽位的行"),
+                    "★★ 分母【不动】—— 变的是去向，不是「缺不缺槽位」");
+            assertEquals(1L, num(asked, "分母_声明缺槽位的行"));
+        }
+
+        /**
+         * ★★★ 反对照：分子是 {@code missing}，<b>不是</b> {@code status}。
+         *
+         * <p>反问但没声明缺槽位 —— 那一行必须落进「走了回落文案」那一格，
+         * 而<b>不</b>进「声明缺槽位」的分母。拿 {@code status} 当分子的实现
+         * 会让这条用例的分母变成 1，而两个数在正文里长得一样。</p>
+         */
+        @Test
+        @DisplayName("★★★ 反对照：反问了但没声明缺槽位 ⇒ 不进「声明缺槽位」的分母")
+        void clarifyWithoutMissingIsNotADeclaration() {
+            List<EvalQuestion> bank = List.of(q("M1", "LEAF_A", 1L));
+            List<QaLog> rows = List.of(
+                    srow(1, "M1", 3, "CLARIFY_TOP", null, 100,
+                            plan("NONE_INTENT", false, "JSON", "[]", "[]", null)));
+
+            Map<String, Object> s = section(run(rows, bank), "槽位声明");
+
+            assertEquals(0L, num(s, "分母_声明缺槽位的行"));
+            assertEquals(1L, num(s, "★其中·没声明缺槽位却反问了"),
+                    "★ 这一格 = 走了回落文案（缺 missing 或缺模板）");
+            assertEquals(1L, num(s, "分母_反问的行"), "★ 它仍然是「反问的行」");
+        }
+
+        @Test
+        @DisplayName("★ 没有计划的行单独数，且不进任何分母")
+        void rowsWithoutAPlanAreCountedSeparately() {
+            List<EvalQuestion> bank = List.of(q("M1", "LEAF_A", 1L));
+            List<QaLog> rows = List.of(srow(1, "M1", 1, "LEAF_A", null, 100, null));
+
+            Map<String, Object> s = section(run(rows, bank), "槽位声明");
+
+            assertEquals(1L, num(s, "分母_行"));
+            assertEquals(1L, num(s, "★其中·没有计划的行"));
+            assertEquals(0L, num(s, "分母_声明缺槽位的行"));
+            assertEquals(0L, num(s, "分母_反问的行"));
+        }
+
+        /**
+         * ★★ 分母是【行】不是题 —— 而「题」那一格是去重后的。
+         *
+         * <p>这两个数不同，混起来会让「重复跑 3 次的同一道题」被读成「3 道题」。
+         * 报告里两个都印，且这一条把它们的差钉住。</p>
+         */
+        @Test
+        @DisplayName("★★ 分母是行、题号那一格去重 —— 两个数不是同一个")
+        void theQuestionListIsDeduped() {
+            String d = detail(seg(1), seg(1), flat(1), List.of(2, 4), true, null);
+            List<EvalQuestion> bank = List.of(q("M1", "LEAF_A", 1L));
+            List<QaLog> rows = List.of(
+                    srow(1, "M1", 1, "LEAF_A", d, 100, plan("KB", true, "JSON", "[]", MISSING_PRODUCT, null)),
+                    srow(2, "M1", 1, "LEAF_A", d, 100, plan("KB", true, "JSON", "[]", MISSING_PRODUCT, null)),
+                    srow(3, "M1", 1, "LEAF_A", d, 100, plan("KB", true, "JSON", "[]", MISSING_PRODUCT, null)));
+
+            Map<String, Object> s = section(run(rows, bank), "槽位声明");
+
+            assertEquals(3L, num(s, "★★声明缺槽位_落在业务码（直接作答）"), "★ 行");
+            assertEquals(List.of("M1"), strList(s, "★声明了却没反问的题"), "★ 题");
+        }
+    }
+
+    // ── 9.6 的夹具 ────────────────────────────────────────────────
+    //   ★ num(...) 上面已经有了，直接复用（它会因为键缺失而 NPE —— 那是吵的失败，
+    //     比一个安静的空指针好；这一节不再写第二份）
+
+    private static double dbl(Map<String, Object> m, String key) {
+        Object v = m == null ? null : m.get(key);
+        assertNotNull(v, "报告里缺少这一格：" + key);
+        return ((Number) v).doubleValue();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> strList(Map<String, Object> parent, String key) {
+        Object v = parent.get(key);
+        assertNotNull(v, "报告里缺少这一格：" + key);
+        return (List<String>) v;
+    }
+
+    /**
+     * 一份 {@code intent_plan} 的 JSON。
+     *
+     * <p>★ 键序无关（报告只按键取值），但内容必须合法 —— 这一列的
+     * {@code v} 固定写 3，因为 {@code resumed} 是 9.4 起的第八格。
+     *
+     * @param resumed {@code null} = <b>不写这一格</b>（模拟 9.4 之前的行）
+     */
+    private static String plan(String gate, boolean retrieve, String shape,
+                              String tools, Boolean resumed) {
+        return plan(gate, retrieve, shape, tools, "[]", resumed);
+    }
+
+    /**
+     * ★ 带 {@code missing} 的计划 —— 9.6a「槽位声明」那一节要它非空。
+     *
+     * <p>{@code missing} 是一段**已经拼好的 JSON 数组**（如 {@code ["product"]}）。
+     * 不拆成 varargs 是因为「空数组」和「不写这一格」在这里都要能表达。</p>
+     */
+    private static String plan(String gate, boolean retrieve, String shape,
+                              String tools, String missing, Boolean resumed) {
+        StringBuilder sb = new StringBuilder("{\"v\":3,\"retrieve\":").append(retrieve)
+                .append(",\"gate\":\"").append(gate)
+                .append("\",\"tools\":").append(tools)
+                .append(",\"missing\":").append(missing)
+                .append(",\"shape\":\"").append(shape).append('"');
+        if (resumed != null) {
+            sb.append(",\"resumed\":").append(resumed);
+        }
+        return sb.append('}').toString();
+    }
+
+    /**
+     * 造一份 {@code tool_calls}。
+     *
+     * <p>★ 名字后面带 {@code !} 表示这条 {@code isError=true} ——
+     * 而它正是「被白名单拒掉」在数据上的样子。
+     */
+    private static String calls(String... specs) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < specs.length; i++) {
+            String spec = specs[i];
+            boolean err = spec.endsWith("!");
+            String name = err ? spec.substring(0, spec.length() - 1) : spec;
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("{\"round\":1,\"tool\":\"").append(name).append("\",\"isError\":")
+                    .append(err).append(",\"detail\":\"")
+                    .append(err ? "工具报告失败" : "chars=87").append("\"}");
+        }
+        return sb.append(']').toString();
+    }
+
+    /** 只改 {@code resumed} 那一格的计划 —— 多轮测试里用得最多 */
+    private static String resume(boolean resumed) {
+        return plan("KB", true, "JSON", "[]", resumed);
+    }
+
+    /**
+     * 一道多轮题。★ {@code turns} 的长度必须和测试里给的行数对上。
+     *
+     * @param expectClarify 第 1 轮该不该被反问（V17）。★ {@code null} = 没标注
+     *                      ⇒ 报告判 ① 不可判，而<b>不是</b>当成 false
+     */
+    private static EvalQuestion multi(String no, String intent, int turns,
+                                      Boolean expectClarify, Long... gold) {
+        EvalQuestion e = q(no, intent, gold);
+        e.setQuestionSet("stage7-multi");
+        e.setExpectClarify(expectClarify);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < turns; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("\"第 ").append(i + 1).append(" 轮\"");
+        }
+        e.setTurns(sb.append(']').toString());
+        e.setStandaloneQuestion("把这几轮合成一句");
+        return e;
+    }
+
+    /** 带会话号与计划的一行。★ id 必须显式给 —— 轮次顺序就是 id 升序 */
+    private static QaLog srow(long id, String no, int status, String intent,
+                              String detail, long sessionId, String intentPlan) {
+        QaLog r = row(no, status, intent, detail);
+        r.setId(id);
+        r.setSessionId(sessionId);
+        r.setIntentPlan(intentPlan);
+        return r;
     }
 }

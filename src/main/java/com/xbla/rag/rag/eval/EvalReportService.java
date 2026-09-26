@@ -14,7 +14,9 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -195,16 +197,30 @@ public class EvalReportService {
                     in.chunkDocTypes(), mapper));
         }
 
-        out.put("数据完整性", integrity(in, byQuestion, views));
+        out.put("数据完整性", integrity(in, byQuestion, views, mapper));
         out.put("意图", intentSection(tree, views));
         out.put("澄清边界", clarifyBoundary(clarifyCode, views));
+        // ★ 紧跟「澄清边界」：两者都在讲澄清闸门，但判据不同 ——
+        //   那一段的判据是 gold intent（单轮才有意义），这一段的判据是
+        //   「模型的另一个输出被消费了几次」，两轮集上都算得出来。
+        out.put("槽位声明", slotDeclaration(mapper, views));
         out.put("检索范围", scopeSection(tree, views));
         out.put("兜底", outOfScopeSection(outOfScopeCode, views, tree));
+        // ★ 阶段 9.6：上面几段问的都是「分类对不对」「检索准不准」，
+        //   这两段问的是【Agent 的两个决策做对了没有】—— 该不该检索、该不该调工具。
+        //   它们紧跟在「兜底」后面，是因为「兜底」也是同一个决策家族的：
+        //   OUT_OF_SCOPE 那 7 道题的结果就是「不检索」。
+        out.put("检索决策", retrievalDecisionSection(mapper, views));
+        out.put("工具调用", toolUsageSection(tree, mapper, views));
         out.put("检索", retrievalSection(mapper, views));
         out.put("归因", attributionSection(mapper, views));
         out.put("过度检索", overRetrievalSection(tree, mapper, in, views));
         out.put("延迟", latencySection(in.rows()));
         out.put("成本", costSection(in.rows()));
+        // ★ 多轮放在这里而不是紧跟「澄清边界」：它【单独分母】（ADR-084），
+        //   和上面每一段都不是同一批题。挨着「逐题」是要表明
+        //   「它是另一份材料，不是这一份的一个切片」。
+        out.put("多轮澄清", multiTurnSection(tree, mapper, views));
         // ★ 放最后：它是【原始材料】，上面每一段都是它的汇总。
         //   读报告的人先看结论，需要追一个数怎么来的再往下翻
         out.put("逐题", perQuestionSection(views, tree));
@@ -268,6 +284,31 @@ public class EvalReportService {
         d.put("检索范围准确率的分母",
                 "见 检索范围.note。一句话：TOOL/NONE 的顶层码两侧都是空集，"
                         + "判「一致」是恒真的，所以把它们放进分母等于往里面掺水。");
+        d.put("检索决策准确率",
+                "★ 2×2，四个格子的分母【各不相同】，不要并成一个「准确率」："
+                        + "「声明不检索_实际检索了」的分母是声明不检索的题（28 道），"
+                        + "「声明要检索_实际没检索」的分母是其余题。"
+                        + "★ 判据是【实际发生的检索】（retrieval_detail 非空），不是 intent_plan.retrieve ——"
+                        + "后者是门控自己的输出，拿它当判据会漏掉「算对了但调用点忘了用」那类只改一半的实现。"
+                        + "★ 被限流拒掉的行（status=4）不算一次决策，四个格子都不含它们。"
+                        + "★ shape 分布是配套的诚实性判据：JSON 占比掉下来 = 模型没跟上契约，"
+                        + "那时 retrieve 是回退路径的默认值，不是模型说的。");
+        d.put("工具选择准确率",
+                "★ 又一个 2×2：该有工具×调了/没调、不该有工具×没调/调了。"
+                        + "「该不该有工具」由 gold 意图经意图树推出（retrievalOf == TOOL，"
+                        + "或该叶子自己声明了 tools）——【和运行时那条来源不同】，"
+                        + "所以它才能发现「该有工具却没有」。"
+                        + "★ 「调了」的判据是 qa_log.tool_calls 非空，而它【不等于工具真的跑了】："
+                        + "被白名单拒掉的调用也会留下记录（isError=true）。"
+                        + "所以另有一栏「越权且成功的调用」——【应恒 0】，"
+                        + "那是 ADR-093 那条不变式在数据上的形状。");
+        d.put("多轮澄清三层",
+                "⚠️ 【单独分母】（ADR-084），不进本报告的任何汇总。分母 = 完整的多轮尝试"
+                        + "（同一题号 + 同一 session_id + 行数恰好等于 turns 的长度）。"
+                        + "三层：①首轮 status=3（反问发生了）②末轮 intent_plan.resumed=true"
+                        + "（9.4 的读后即清生效了）③末轮 intent == gold（补全之后判对了）。"
+                        + "★ 三层分开报是因为坏掉时【得知道坏在哪一层】，修法完全不同。"
+                        + "★ 会话断在中途的尝试不进任何分子分母（混进去会让失败看起来像模型答不对）。");
         return d;
     }
 
@@ -284,7 +325,8 @@ public class EvalReportService {
      */
     private static Map<String, Object> integrity(Inputs in,
                                                  Map<String, List<QaLog>> byQuestion,
-                                                 List<QuestionView> views) {
+                                                 List<QuestionView> views,
+                                                 ObjectMapper mapper) {
         Map<String, Object> out = new LinkedHashMap<>();
 
         Map<String, Long> byStatus = new TreeMap<>();
@@ -337,11 +379,38 @@ public class EvalReportService {
         out.put("跑过的题数", views.size());
         out.put("  其中 声明要检索的", ranWithGold);
         out.put("  其中 声明不检索的", ranWithoutGold);
+
+        // ★★ 阶段 9.6：一轮里混了单轮题和多轮题 = 单轮那几段的分母失真。
+        //
+        //   多轮题把 N 轮提交在同一个题号下，于是「这一题有 6 行」——
+        //   而意图/澄清/检索那几段把「同一题的多行」当成【重复测量】。
+        //   结果不是报错，是那几个比率被某几道题的轮数加权。
+        //   ADR-084 要求它们分开跑，这一格是那个要求的执行判据。
+        int multiTurnQuestions = 0;
+        int singleTurnQuestions = 0;
+        for (QuestionView v : views) {
+            if (v.bank() == null) {
+                continue;
+            }
+            if (turnCount(mapper, v.bank().getTurns()) > 0) {
+                multiTurnQuestions++;
+            } else {
+                singleTurnQuestions++;
+            }
+        }
+        out.put("★多轮题", multiTurnQuestions);
+        out.put("★单轮题", singleTurnQuestions);
+        out.put("★★混了两类题（单轮各段的分母会失真）",
+                multiTurnQuestions > 0 && singleTurnQuestions > 0);
+
         out.put("note", "★ 上面两个带★的列表非空 = 这一轮的数据不能用 —— "
                 + "前者说明有人删了题，后者说明跑题器漏发了题。"
                 + "两种都会让报告的分母悄悄小于题库，而【比率看不出任何异常】。"
                 + "对账（scripts/eval_run.py）只保证「发了的都落库了」，"
-                + "保证不了「该发的都发了」—— 这一节补的就是后者。");
+                + "保证不了「该发的都发了」—— 这一节补的就是后者。"
+                + " ★★ 另：单轮题和多轮题混跑时，单轮那几段的分母会把多轮题的多行"
+                + "当成重复测量（同一道 3 轮题 = 3 行 = 权重 3 倍）。"
+                + "按 ADR-084 它们必须分开跑，上面那一格是执行判据。");
         return out;
     }
 
@@ -609,7 +678,111 @@ public class EvalReportService {
                 + (clarifyCode == null ? "树里没有这个分支" : clarifyCode) + "）。"
                 + "★★ 所以这张矩阵与意图混淆矩阵【同源】—— ClarificationDecider 不是一个"
                 + "独立的模型，它读的就是分类结果。区别只在分类失败的行：那里 intent 是 null、"
-                + "而 status 照常是 1（分类失败不澄清，见 ClarificationDecider 类注释第二节）。");
+                + "而 status 照常是 1（分类失败不澄清，见 ClarificationDecider 类注释第二节）。"
+                + "★★ 【多轮题集上这一节不适用】：它的判据是 gold intent，而多轮题的"
+                + "intent 描述的是【末轮】⇒ 按 gold 看「没有一道该反问」，整张矩阵会退化成"
+                + "「不该反问_没反问 = 全部」。多轮题的「首轮该不该反问」在"
+                + "多轮澄清 那一节，判据是题库的 expect_clarify（V17）。"
+                + "⚠️ 这里的「该不该」和那里的「该不该」是【两个问题】："
+                + "这里问「分类有没有判对」，那里问「这一轮该不该反问」——"
+                + "单轮题上两者恰好等价，多轮题上只有后者答得出来。");
+        return out;
+    }
+
+    // ================================================================
+    // 槽位声明（missing）的去向 —— 阶段 9.6a 的第三笔账
+    // ================================================================
+
+    /**
+     * ★★ 「模型自己说缺槽位」的行，最后去了哪里。
+     *
+     * <h3>它记的是一个【结构性事实】，不是一个错误</h3>
+     *
+     * <p>{@code intent_plan.missing} 是模型关于「这句话还缺什么」的输出。
+     * 但当前实现里<b>没有任何东西会因为它非空而去反问</b> —— 反不反问完全由
+     * <b>落点</b>决定：落点 == 树里 {@code role: CLARIFY} 的那个分支 ⟺ {@code status = 3}。
+     * {@code missing} 唯一的消费方是 9.4 的澄清文案（缺哪个槽位、问哪一句，
+     * {@code xbla.agent.slots.questions.*}）。
+     *
+     * <p>于是同一批「模型自己说缺槽位」的行会分裂成两半，
+     * 而<b>分裂的依据与 missing 无关</b>：
+     * <ul>
+     *   <li><b>落在澄清分支</b> → 100% 反问了。★ 这半边是<b>定义性</b>的
+     *       （{@code status=3} 就是那条分支），不构成「发现」，
+     *       它的用途是给另一半当对照。</li>
+     *   <li><b>落在业务码</b> → <b>0% 反问</b>，系统直接作答。</li>
+     * </ul>
+     *
+     * <p>★★ 实测（2026-09-26）：单轮集 66 条 {@code missing} 非空里只有 16 条反问
+     * （50 条直接作答）；多轮集 28 条里 16 条反问（12 条直接作答）。
+     * 「多轮澄清」①那一格漏掉的反问，样本就在这 50 / 12 条里。
+     *
+     * <p>★★ 这一节是<b>形状表</b>，不是判据。要不要让 {@code missing} 参与闸门
+     * 是一个<b>产品决策</b>（代价是「让模型自己决定要不要反问」），
+     * 2026-09-26 拍板<b>先记账、不改行为</b> —— 与 9.5「停手不改」同源：
+     * 先把它变成可复算的数，再决定改不改。
+     *
+     * <p>★ 为什么<b>不</b>做成「落点 × 反问」的 2×2：{@code status=3} 与
+     * 「落点是澄清分支」是同一个判据，那张表有一整轴是恒真的。
+     * 要写的是<b>反过来那一半</b> —— 模型的这个输出有多少次没被消费。
+     */
+    private static Map<String, Object> slotDeclaration(ObjectMapper mapper, List<QuestionView> views) {
+        Map<String, Object> out = new LinkedHashMap<>();
+
+        long rows = 0, noPlan = 0, declared = 0, asked = 0, answered = 0;
+        long askedTotal = 0, askedWithoutMissing = 0;
+        Set<String> answeredNos = new LinkedHashSet<>();
+
+        for (QuestionView v : views) {
+            for (QaLog row : v.rows()) {
+                rows++;
+                JsonNode plan = planOf(mapper, row);
+                if (plan == null) {
+                    noPlan++;
+                    continue;
+                }
+                boolean didClarify = row.getStatus() != null
+                        && row.getStatus() == QaLog.STATUS_CLARIFY;
+                boolean hasMissing = !planStrings(plan, "missing").isEmpty();
+                if (didClarify) {
+                    askedTotal++;
+                }
+                if (hasMissing) {
+                    declared++;
+                    if (didClarify) {
+                        asked++;
+                    } else {
+                        answered++;
+                        answeredNos.add(v.questionNo());
+                    }
+                } else if (didClarify) {
+                    askedWithoutMissing++;
+                }
+            }
+        }
+
+        out.put("分母_行", rows);
+        out.put("★其中·没有计划的行", noPlan);
+        out.put("分母_声明缺槽位的行", declared);
+        out.put("声明缺槽位_落在澄清分支（反问了）", asked);
+        out.put("★★声明缺槽位_落在业务码（直接作答）", answered);
+        out.put("分母_反问的行", askedTotal);
+        out.put("★其中·没声明缺槽位却反问了", askedWithoutMissing);
+        // ★ 这里【不截断】：report.json 是机器可读的那一份，要完整
+        //   （`eval_report_check.py` 逐键对拍，截了就对不上）。
+        //   截断放渲染层，并在正文里留痕（坑 45）。
+        // ★ 排序而不是保留插入序：对拍脚本那一侧是**独立**构建的，
+        //   两边靠「恰好遍历顺序一致」来相等 = 一个会静默失效的等价。
+        out.put("★声明了却没反问的题", new ArrayList<>(new TreeSet<>(answeredNos)));
+        out.put("note", "★★ 中间那两格是这条账的全部内容：同一批「模型自己说缺槽位」的行，"
+                + "落在澄清分支的全部反问了、落在业务码的一次都没反问。"
+                + "★ 分裂的依据是【落点】，而落点是模型自己给的另一个输出 —— "
+                + "⇒ 想让反问更准，要改的不是 missing 的解析，是「落点怎么定的」"
+                + "（分类 prompt 或闸门输入）。"
+                + "★★ 「声明了却没反问的题」那一格**不是缺陷清单** —— "
+                + "落业务码的行本就不该反问（系统答得对），真正的漏反问只是其中的样本。"
+                + "⚠️ 分母是【行】不是题：同一道题重复跑几次会重复计，"
+                + "「题」那一格是去重后的。");
         return out;
     }
 
@@ -776,6 +949,709 @@ public class EvalReportService {
                 + "而逐行版本会被重复次数稀释（同一道题投 3 次票，权重变成 3 倍）。"
                 + (total < MIN_SLICE_N
                         ? " ⚠️ n=" + total + " < " + MIN_SLICE_N + "，【不作为结论】。" : ""));
+        return out;
+    }
+
+    // ================================================================
+    // 检索决策（阶段 9.6）
+    // ================================================================
+
+    /**
+     * ★★ 「这次该不该检索」判对了没有 —— 一个 2×2。
+     *
+     * <h3>判据是「实际检索了没有」，不是 {@code intent_plan.retrieve}</h3>
+     *
+     * <p>两者本该一致，而<b>它们不一致的那个方向正是本段要抓的东西</b>：
+     *
+     * <pre>
+     *   intent_plan.retrieve = false    ← 门控【算出来】的结论
+     *   retrieval_detail     = 非空     ← 【实际发生】的检索
+     * </pre>
+     *
+     * <p>这是「门控算对了，而调用点忘了用它」—— 9.2 的类注释里点名的那类
+     * <b>只改一半</b>的实现。★ 拿 {@code intent_plan.retrieve} 当判据会把它整个漏掉：
+     * 门控的输出永远等于它自己。所以这里用<b>实际发生的检索</b>，
+     * 另把两者不一致的行单列出来（{@code ★算对了但没用的行}，应恒 0）。
+     *
+     * <h3>★ 哪些行算「一次决策」</h3>
+     *
+     * <p><b>被限流拒掉的（{@code status=4}）不算。</b>那条路上检索压根没跑 ——
+     * 它的 {@code retrieval_detail} 是 NULL，拿它当「决定不检索」会得到一个
+     * <b>指向相反方向</b>的结论：报告会说「要检索的题有 5% 没检索」，
+     * 而真相是那一刻名额用完了。<b>「决定不做」和「没轮到做」是两件事。</b>
+     *
+     * <p>其余三态都算：{@code 1} 跑完了 / {@code 2} 模型链路失败（检索已经发生，
+     * 那次决策是真发生过的）/ {@code 3} 澄清短路（NONE 类意图，不检索正是正确行为）。
+     *
+     * <h3>★ 四个格子里有两个是【结构保证】的</h3>
+     *
+     * <p>「声明不检索」的那 28 道题（工具 15 / 兜底 7 / 澄清 6）走的是
+     * {@code TOOL} / {@code NONE} 两条路，<b>代码根本不读模型那一格</b>
+     * （ADR-092 的「不可表达」）。所以它们的「没检索」是设计保证的，
+     * 只有<b>分类判错</b>时才会翻成「检索了」。
+     * <b>换句话说：这一格测的是分类质量，不是门控质量</b> —— 不写清楚的话，
+     * 它会被读成「门控很准」。
+     */
+    private static Map<String, Object> retrievalDecisionSection(ObjectMapper mapper,
+                                                               List<QuestionView> views) {
+        Map<String, Object> out = new LinkedHashMap<>();
+
+        // [0] = gold 说要检索 / [1] = gold 说不检索；第二维 [0] = 实际没检索 / [1] = 实际检索了
+        long[][] byRow = new long[2][2];
+        long[][] byQuestion = new long[2][2];
+        long notDecided = 0;
+        long rowsNoBank = 0;
+        long noModeQuestions = 0;
+
+        Map<String, Long> gateCount = new TreeMap<>();
+        Map<String, Long> shapeCount = new TreeMap<>();
+        List<String> gateIgnored = new ArrayList<>();
+        Map<String, Set<String>> decisions = new TreeMap<>();
+        // ★★ 多轮题不进「跨次决策翻转」那一栏。
+        //    它们的行是【不同的轮次】，不是同一句话的重复测量 ——
+        //    实测（2026-09-26）报了 5 道假阳性：每一道都是
+        //    「首轮澄清短路（没检索）→ 次轮正常检索」，那是【设计】不是抖动。
+        Set<String> multiTurnNos = new TreeSet<>();
+        // ★★ 「声明要检索而没检索」有两个成因，必须拆开：
+        //    ① 门控关得太狠 / 分类失败退化 —— 真错
+        //    ② **澄清短路** —— 对。用户那句话本来就缺信息，反问轮不检索是设计
+        //    ★ 不分的话，多轮集上这一格会显示一个纯粹的假阳性
+        //      （每一道首轮被反问的题都会落进来）。
+        long notRetrievedByClarify = 0;
+
+        for (QuestionView v : views) {
+            if (v.bank() == null) {
+                rowsNoBank += v.rows().size();
+                continue;
+            }
+            boolean goldNoRetrieval = Boolean.TRUE.equals(v.bank().getExpectNoRetrieval());
+            if (turnCount(mapper, v.bank().getTurns()) > 0) {
+                multiTurnNos.add(v.questionNo());
+            }
+            Map<String, Integer> votes = new LinkedHashMap<>();
+
+            for (QaLog row : v.rows()) {
+                if (!countsAsDecision(row)) {
+                    notDecided++;
+                    continue;
+                }
+                boolean actually = retrieved(row);
+                byRow[goldNoRetrieval ? 1 : 0][actually ? 1 : 0]++;
+                decisions.computeIfAbsent(v.questionNo(), k -> new TreeSet<>())
+                        .add(actually ? "检索" : "不检索");
+                votes.merge(actually ? "检索" : "不检索", 1, Integer::sum);
+                if (!goldNoRetrieval && !actually
+                        && row.getStatus() != null && row.getStatus() == QaLog.STATUS_CLARIFY) {
+                    notRetrievedByClarify++;
+                }
+
+                JsonNode plan = planOf(mapper, row);
+                shapeCount.merge(orAbsent(planText(plan, "shape")), 1L, Long::sum);
+                if (plan != null) {
+                    gateCount.merge(orAbsent(planText(plan, "gate")), 1L, Long::sum);
+                    // ★★ 门控说「不检索」，实际却检索了 —— 应恒 0
+                    if (Boolean.FALSE.equals(planBool(plan, "retrieve")) && actually) {
+                        gateIgnored.add(v.questionNo() + "（trace=" + row.getTraceId() + "）");
+                    }
+                }
+            }
+
+            if (votes.isEmpty()) {
+                continue;
+            }
+            String verdict = mode(votes);
+            if (verdict == null) {
+                noModeQuestions++;
+                continue;
+            }
+            byQuestion[goldNoRetrieval ? 1 : 0]["检索".equals(verdict) ? 1 : 0]++;
+        }
+
+        List<String> flipped = new ArrayList<>();
+        for (Map.Entry<String, Set<String>> e : decisions.entrySet()) {
+            if (e.getValue().size() > 1 && !multiTurnNos.contains(e.getKey())) {
+                flipped.add(e.getKey() + " → " + e.getValue());
+            }
+        }
+
+        // ★★ 四格报【裸计数】+ 两个显式分母，和「澄清边界」那张矩阵同一个形状。
+        //
+        //   为什么不给每一格套一个 ratio()：那样【同一个分母会在每一格里重复印一遍】，
+        //   于是「把两个格子的 n 加起来」会得到一个翻倍的分母 —— 一个看起来
+        //   完全合法的数。裸计数不会给人这种错觉，而比率随时可以自己除。
+        Map<String, Object> byRowOut = new LinkedHashMap<>();
+        byRowOut.put("★声明不检索_实际也没检索", byRow[1][0]);
+        byRowOut.put("★声明不检索_实际检索了（过度检索）", byRow[1][1]);
+        byRowOut.put("★声明要检索_实际检索了", byRow[0][1]);
+        byRowOut.put("★声明要检索_实际没检索（过度关闭）", byRow[0][0]);
+        byRowOut.put("分母_声明不检索的行", byRow[1][0] + byRow[1][1]);
+        byRowOut.put("分母_声明要检索的行", byRow[0][0] + byRow[0][1]);
+        out.put("四格（逐行）", byRowOut);
+
+        Map<String, Object> byQuestionOut = new LinkedHashMap<>();
+        byQuestionOut.put("★声明不检索_实际也没检索", byQuestion[1][0]);
+        byQuestionOut.put("★声明不检索_实际检索了（过度检索）", byQuestion[1][1]);
+        byQuestionOut.put("★声明要检索_实际检索了", byQuestion[0][1]);
+        byQuestionOut.put("★声明要检索_实际没检索（过度关闭）", byQuestion[0][0]);
+        byQuestionOut.put("分母_声明不检索的题", byQuestion[1][0] + byQuestion[1][1]);
+        byQuestionOut.put("分母_声明要检索的题", byQuestion[0][0] + byQuestion[0][1]);
+        byQuestionOut.put("平票的题数", noModeQuestions);
+        out.put("四格（逐题·多数票）", byQuestionOut);
+
+        out.put("gate分布", gateCount);
+        out.put("shape分布", shapeCount);
+        out.put("★算对了但没用的行", gateIgnored);
+        out.put("★跨次决策翻转的题", flipped);
+        out.put("★翻转那一栏排除掉的多轮题", new ArrayList<>(multiTurnNos));
+        out.put("★没算成决策的行", notDecided);
+        out.put("★题不在题库里的行", rowsNoBank);
+        // ★★ 这一格是「声明要检索_实际没检索」的解毒剂：
+        //    那一格里混着【对的澄清短路】和【真的关太狠】，只看总数会误判。
+        out.put("★其中·澄清短路（不是错）", notRetrievedByClarify);
+        out.put("note", "★ 四格看的是【独立的两件事】：「声明不检索_实际检索了」是过度检索，"
+                + "「声明要检索_实际没检索」是过度关闭，两者的修法完全相反，不要并成一个「准确率」。"
+                + " ★ 后两格的分母【不含】被限流拒掉的行（那些行没轮到做决策，"
+                + "算进去会得出一个指向调优反方向的结论）。"
+                + " ★★ 「声明要检索_实际没检索」那一格里有【两种东西】，读之前先减掉 "
+                + "「★其中·澄清短路（不是错）」：澄清轮的短路是设计（用户那句话本来就缺信息），"
+                + "减完剩下的才是「门控关得太狠 / 分类失败退化」。"
+                + " ★ shape 分布是「门控到底有没有生效」的唯一判据："
+                + "JSON 占比接近 100% 才算生效，掉下来说明模型没跟上契约（走了裸码回退，"
+                + "而回退路径的 retrieve 是默认值，不是模型说的）。"
+                + " ★★ 「跨次决策翻转」那一栏【排除多轮题】：多轮题的几行是"
+                + "不同的轮次、不是同一句话的重复测量，所以「首轮不检索、次轮检索了」"
+                + "是设计而不是抖动 —— 实测它报过 5 道纯假阳性。被排除的题号单列一栏。");
+        return out;
+    }
+
+    // ================================================================
+    // 工具调用（阶段 9.6）
+    // ================================================================
+
+    /**
+     * ★★ 「该调工具的题，模型调了没有」+「不该调的有没有调」—— 又一个 2×2。
+     *
+     * <h3>为什么必须要它：一次静默降级在旧数据上【完全看不出来】</h3>
+     *
+     * <p>工具意图走进纯 KB 问答时，{@code intent} / {@code status} / {@code provider} /
+     * {@code final_answer} <b>逐字与正常轮相同</b>，而模型会拿通用规则
+     * <b>编一个订单状态出来</b>。9.1 修掉了流式那条路上的它 ——
+     * 而「修完之后有没有复发」在数据上一直是个<b>无法回答</b>的问题。
+     * 这一段就是那个答案。
+     *
+     * <h3>★ 「该有工具」的判据为什么要两条调用</h3>
+     *
+     * <pre>
+     *   retrievalOf(gold) == TOOL         ← 工具题的 gold 是【叶子码】
+     *                                        （ORDER_STATUS），它自己没声明 tools，
+     *                                        要抬到顶层 ORDER_LOGISTICS 才有 ——
+     *                                        而 retrievalOf 本来就会走父顶层
+     *   !toolsOf(gold).isEmpty()          ← 混合轮的 KB 叶子（SCENARIO_PICK）
+     *                                        在【叶子】上声明 tools，retrievalOf 是 KB
+     * </pre>
+     *
+     * <p>两条是<b>或</b>的关系，合起来恰好覆盖「这次该不该有工具」，一条都不能少。
+     *
+     * <h3>★★ 「调了」不等于「用上了」—— 白名单拒绝也会留下记录</h3>
+     *
+     * <p>{@code ToolLoop.invoke} 第 ⓪ 步拦下越权调用之后，<b>照样记一条
+     * {@code CallRecord}</b>（{@code isError=true}），只是那条调用没真的执行。
+     * 所以：
+     *
+     * <ul>
+     *   <li>{@code tool_calls} <b>非空</b>只说明「模型叫过工具」，不说明工具跑过</li>
+     *   <li>{@code ★越权的调用} <b>非 0 不代表数据泄露</b>（服务端拒了，ADR-093）——
+     *       它代表「模型叫了一个没给它的名字」，那是 prompt 或模型行为的问题</li>
+     *   <li>★★ 而「拒了没有」<b>是</b>可观测的：被拒的那条必然是 {@code isError=true}
+     *       （拒绝路径返回 {@code ToolOutcome.failed}）。⇒
+     *       <b>{@code ★越权且成功的调用} 应恒 0</b>，那是 ADR-093 那条不变式
+     *       在数据上的形状，不是一句「代码里写着所以不会发生」</li>
+     * </ul>
+     */
+    private static Map<String, Object> toolUsageSection(IntentTree.Tree tree,
+                                                        ObjectMapper mapper,
+                                                        List<QuestionView> views) {
+        Map<String, Object> out = new LinkedHashMap<>();
+
+        long[][] byRow = new long[2][2];
+        long[][] byQuestion = new long[2][2];
+        long rowsNoBank = 0;
+        long rowsNoPlan = 0;
+
+        List<String> silentDrop = new ArrayList<>();
+        List<String> calledWhenNotOffered = new ArrayList<>();
+        List<String> overreachSucceeded = new ArrayList<>();
+        List<String> missed = new ArrayList<>();
+        List<String> extra = new ArrayList<>();
+        Map<String, Long> callCount = new TreeMap<>();
+        long errored = 0;
+
+        for (QuestionView v : views) {
+            if (v.bank() == null) {
+                rowsNoBank += v.rows().size();
+                continue;
+            }
+            String gold = v.goldIntent();
+            boolean goldWantsTools = gold != null
+                    && (tree.retrievalOf(gold) == IntentTree.Retrieval.TOOL
+                    || !tree.toolsOf(gold).isEmpty());
+            Map<String, Integer> votes = new LinkedHashMap<>();
+
+            for (QaLog row : v.rows()) {
+                List<ToolCallRecord> calls = toolCallsOf(mapper, row);
+                boolean anyCall = !calls.isEmpty();
+                byRow[goldWantsTools ? 1 : 0][anyCall ? 1 : 0]++;
+                votes.merge(anyCall ? "调了" : "没调", 1, Integer::sum);
+
+                JsonNode plan = planOf(mapper, row);
+                if (plan == null) {
+                    rowsNoPlan++;
+                }
+                List<String> offered = planStrings(plan, "tools");
+
+                // ★★ 最尖的那根探针：门控【给了】工具，而模型一次都没叫。
+                //    9.1 的那个 bug 就是这个形状。
+                if (!offered.isEmpty() && !anyCall) {
+                    silentDrop.add(v.questionNo() + "（trace=" + row.getTraceId()
+                            + "，给了 " + offered + "）");
+                }
+                for (ToolCallRecord c : calls) {
+                    callCount.merge(c.tool(), 1L, Long::sum);
+                    if (c.isError()) {
+                        errored++;
+                    }
+                    if (!offered.contains(c.tool())) {
+                        calledWhenNotOffered.add(v.questionNo() + " 叫了 " + c.tool()
+                                + "（本次只给了 " + offered + "）");
+                        // ★ 被拒的那条必然 isError=true ⇒ 这一条【应恒为空】
+                        if (!c.isError()) {
+                            overreachSucceeded.add(v.questionNo() + " 成功地跑了 " + c.tool());
+                        }
+                    }
+                }
+            }
+
+            if (votes.isEmpty()) {
+                continue;
+            }
+            String verdict = mode(votes);
+            if (verdict == null) {
+                continue;
+            }
+            byQuestion[goldWantsTools ? 1 : 0]["调了".equals(verdict) ? 1 : 0]++;
+
+            if (goldWantsTools && !"调了".equals(verdict)) {
+                missed.add(v.questionNo() + "（gold=" + gold + "，该调工具却一次没调）");
+            }
+            if (!goldWantsTools && "调了".equals(verdict)) {
+                extra.add(v.questionNo() + "（gold=" + gold + "，本来不该有工具）");
+            }
+        }
+
+        Map<String, Object> byRowOut = new LinkedHashMap<>();
+        byRowOut.put("★该有工具_确实调了", byRow[1][1]);
+        byRowOut.put("★该有工具_一次没调", byRow[1][0]);
+        byRowOut.put("★不该有工具_没调", byRow[0][0]);
+        byRowOut.put("★不该有工具_却调了", byRow[0][1]);
+        byRowOut.put("分母_该有工具的行", byRow[1][0] + byRow[1][1]);
+        byRowOut.put("分母_不该有工具的行", byRow[0][0] + byRow[0][1]);
+        out.put("四格（逐行）", byRowOut);
+
+        Map<String, Object> byQuestionOut = new LinkedHashMap<>();
+        byQuestionOut.put("★该有工具_确实调了", byQuestion[1][1]);
+        byQuestionOut.put("★该有工具_一次没调", byQuestion[1][0]);
+        byQuestionOut.put("★不该有工具_没调", byQuestion[0][0]);
+        byQuestionOut.put("★不该有工具_却调了", byQuestion[0][1]);
+        byQuestionOut.put("分母_该有工具的题", byQuestion[1][0] + byQuestion[1][1]);
+        byQuestionOut.put("分母_不该有工具的题", byQuestion[0][0] + byQuestion[0][1]);
+        out.put("四格（逐题·多数票）", byQuestionOut);
+
+        out.put("★给了工具却一次没调的行", silentDrop);
+        out.put("★越权的调用", calledWhenNotOffered);
+        out.put("★★越权且成功的调用", overreachSucceeded);
+        out.put("★该调工具却一次没调的题", missed);
+        out.put("★不该有工具却调了的题", extra);
+        out.put("调用的工具分布", callCount);
+        out.put("isError 的调用条数", errored);
+        out.put("★没有计划的行", rowsNoPlan);
+        out.put("★题不在题库里的行", rowsNoBank);
+        out.put("note", "★ 判据是「调了没有」，不是「答对了没有」—— "
+                + "工具答对内容由 probe_tool.py 那 30 项负责，这里只管【工具链有没有走通】。"
+                + " ★ 「该有工具」由 gold 意图经意图树推出（工具题的 gold 是叶子码，"
+                + "要抬到顶层才有 tools 声明），和运行时那一条不是同一个来源 ——"
+                + "这正是它能发现「该有工具却没有」的原因。"
+                + " ★★ 「该有工具_一次没调」那一格【不下「静默降级」的结论】。"
+                + "实测（2026-09-26）MC-002「我的优惠券什么时候过期」的三次都是"
+                + "「用通用规则回答 + 明确说『我这边看不到你账户里具体券的到期时间』」，"
+                + "**那不是编造**。要判「是不是降级」必须读那几行 final_answer ——"
+                + "判据是「它在谈通用规则，还是在编一个具体值」。"
+                + "★ 把「如实说查不到」和「编一个数」并成一个名字，会让修法指错方向。");
+        return out;
+    }
+
+    // ================================================================
+    // 多轮澄清（阶段 9.6）
+    // ================================================================
+
+    /**
+     * ★★ 多轮题：反问有没有发生 → 状态有没有带上 → 最后落到对的意图上。
+     *
+     * <h3>★ 轮次边界靠 {@code session_id} 还原，不靠位置推算</h3>
+     *
+     * <p>一轮多轮题把 N 轮提交在<b>同一个题号</b>下，而 {@code qa_log} 没有轮次列。
+     * 两条路可选，差别在「服务端看得见什么」：
+     *
+     * <pre>
+     *   位置推算：第 r 次重复的第 t 轮 = 第 r×T+t 行
+     *             ↑ 那是【客户端的两层循环顺序】，服务端去依赖它，
+     *               客户端一改循环就静默错位；且任一轮失败时客户端会 break，
+     *               后面的行数当场对不上
+     *   会话分组：每次重复【新建一个会话】，所以「同题号 + 同 session」
+     *             的这几行就是一次完整尝试，组内按 id 排就是轮次顺序  ← 用这个
+     * </pre>
+     *
+     * <h3>★ 三层，而不是一个「成功率」</h3>
+     *
+     * <p>一个笼统的「多轮成功率」坏掉时，你<b>不知道坏在哪一层</b>。
+     * 三层分开报，每一层各自可修：
+     *
+     * <pre>
+     *   ① 首轮反问发生了     status=3 —— 澄清闸门把住了吗（9.3 及之前那条路）
+     *   ② 末轮带上了状态     intent_plan.resumed —— 9.4 的读后即清有没有生效
+     *   ③ 末轮落点对了       intent == gold —— 补全之后判对了没有
+     * </pre>
+     *
+     * <p>★ {@code 三层全过} 才是「这个任务解决了」。前两层是机制，第三层是结果。
+     *
+     * <h3>⚠️ 按 ADR-084：单独分母，不进本报告的任何汇总</h3>
+     *
+     * <p>这一段的数字和上面每一段都<b>不是同一个分母</b>（多轮题一道算一次尝试，
+     * 单轮题一道算一行），所以它只出现在多轮那一节里。
+     */
+    private static Map<String, Object> multiTurnSection(IntentTree.Tree tree,
+                                                        ObjectMapper mapper,
+                                                        List<QuestionView> views) {
+        Map<String, Object> out = new LinkedHashMap<>();
+
+        long attempts = 0;
+        long incompleteAttempts = 0;
+        long rowsWithoutSession = 0;
+        long judgedAttempts = 0;
+        long noGold = 0;
+        long askTp = 0;
+        long askFn = 0;
+        long askTn = 0;
+        long askFp = 0;
+        long resumedOk = 0;
+        long landedOk = 0;
+        long allThreeOk = 0;
+        long planWithoutV3 = 0;
+        long lastTurnJudged = 0;
+        long lastTurnHit = 0;
+
+        List<String> noGoldDetail = new ArrayList<>();
+        List<String> incompleteDetail = new ArrayList<>();
+        List<Map<String, Object>> detailRows = new ArrayList<>();
+        int multiTurnQuestions = 0;
+
+        for (QuestionView v : views) {
+            if (v.bank() == null) {
+                continue;
+            }
+            int turns = turnCount(mapper, v.bank().getTurns());
+            if (turns <= 0) {
+                continue;   // 单轮题不进这一段
+            }
+            multiTurnQuestions++;
+            String gold = v.goldIntent();
+            Boolean goldShouldClarify = goldShouldClarify(v);
+
+            Map<Long, List<QaLog>> bySession = new TreeMap<>();
+            for (QaLog row : v.rows()) {
+                if (row.getSessionId() == null) {
+                    rowsWithoutSession++;
+                    continue;
+                }
+                bySession.computeIfAbsent(row.getSessionId(), k -> new ArrayList<>()).add(row);
+            }
+
+            for (Map.Entry<Long, List<QaLog>> e : bySession.entrySet()) {
+                List<QaLog> rows = new ArrayList<>(e.getValue());
+                rows.sort(Comparator.comparing(QaLog::getId));
+                attempts++;
+
+                // ★ 不完整的尝试【不进任何分子分母】—— 会话断在一半时，
+                //   后面几轮各自开新会话，产生的数据看起来正常但语义全乱。
+                //   混进去会让失败看起来像「模型答不对」。
+                if (rows.size() != turns) {
+                    incompleteAttempts++;
+                    incompleteDetail.add(v.questionNo() + "/session=" + e.getKey()
+                            + "：" + rows.size() + " 行 ≠ " + turns + " 轮");
+                    continue;
+                }
+
+                QaLog first = rows.get(0);
+                QaLog last = rows.get(rows.size() - 1);
+                JsonNode lastPlan = planOf(mapper, last);
+                if (lastPlan != null && planBool(lastPlan, "resumed") == null) {
+                    planWithoutV3++;
+                }
+
+                boolean asked = first.getStatus() != null
+                        && first.getStatus() == QaLog.STATUS_CLARIFY;
+                boolean didResume = Boolean.TRUE.equals(planBool(lastPlan, "resumed"));
+                boolean landed = gold != null && gold.equals(last.getIntent())
+                        && tree.findTarget(gold).isPresent();
+
+                // ★★ ②③ 的分母是【全部完整的尝试】，不受 ① 有没有 gold 影响 ——
+                //    它们各自不依赖 ① 的判据，用 ① 的缺失去裁掉它们纯属丢信息。
+                if (didResume) {
+                    resumedOk++;
+                }
+                if (landed) {
+                    landedOk++;
+                }
+
+                // ── ① 的 2×2（★ 只在有 gold 时才算）──
+                //
+                // ★ 没有 gold 的尝试【不进 ① 和「三层全过」的分子分母】。
+                //   多轮题的 gold intent 描述的是末轮，拿它给首轮下结论必然错 ——
+                //   那一格必须由题库显式声明（见 V17 / EvalQuestion#expectClarify）。
+                //   ★ 与其猜一个，不如让它显示「0/0 = 不可判」+ 一条能解释的计数。
+                if (goldShouldClarify == null) {
+                    noGold++;
+                    if (noGoldDetail.size() < 20) {
+                        noGoldDetail.add(v.questionNo() + "（首轮该不该反问没有 gold）");
+                    }
+                } else {
+                    judgedAttempts++;
+                    if (goldShouldClarify) {
+                        if (asked) {
+                            askTp++;
+                        } else {
+                            askFn++;
+                        }
+                    } else {
+                        if (asked) {
+                            askFp++;
+                        } else {
+                            askTn++;
+                        }
+                    }
+                    // ★★ 「三层全过」的 ① 那一半是【判对了】，不是「反问了」——
+                    //    「不该反问而没反问」同样要算过。写成 `asked && ...` 会让
+                    //    整个指标变成「反问率越高越好」，而那不是它的意思。
+                    if (asked == goldShouldClarify && didResume && landed) {
+                        allThreeOk++;
+                    }
+                }
+
+                boolean lastOk = last.getStatus() != null
+                        && last.getStatus() == QaLog.STATUS_SUCCESS;
+                Boolean hit = null;
+                if (lastOk && !v.goldChunkIds().isEmpty()) {
+                    lastTurnJudged++;
+                    hit = contains(finalTopK(mapper, last), v.goldChunkIds(), 5);
+                    if (hit) {
+                        lastTurnHit++;
+                    }
+                }
+
+                Map<String, Object> r = new LinkedHashMap<>();
+                r.put("题号", v.questionNo());
+                r.put("sessionId", e.getKey());
+                r.put("轮数", (long) rows.size());
+                r.put("①首轮反问", asked);
+                r.put("②末轮带上状态", didResume);
+                r.put("③末轮落点", last.getIntent());
+                r.put("③落点对了", landed);
+                r.put("★三层全过", asked && didResume && landed);
+                r.put("三次status", statusesOf(rows));
+                r.put("末轮命中@5", hit);
+                detailRows.add(r);
+            }
+        }
+
+        out.put("分母_完整的尝试", attempts - incompleteAttempts);
+        out.put("★不完整的尝试", incompleteAttempts);
+        out.put("★没有 session_id 的行", rowsWithoutSession);
+        out.put("★★①没有 gold 的尝试", noGold);
+        out.put("分母_①可判的尝试", judgedAttempts);
+
+        // ★★ ① 也是一个 2×2，不是「反问率」。
+        //    「反问率」写成单个数字会朝一个方向优化 —— 反问得越多它越高，
+        //    而「不该反问却反问了」是另一种错（用户被无谓地打断），修法相反。
+        out.put("①该反问_反问了", askTp);
+        out.put("①该反问_没反问（漏）", askFn);
+        out.put("①不该反问_没反问", askTn);
+        out.put("①不该反问_反问了（假阳）", askFp);
+
+        // ★ ②③ 用【完整的尝试】当分母，① 和「三层全过」用【①可判的尝试】——
+        //   两个分母不同是刻意的（②③ 不依赖 ① 的 gold），而每个比率都自带 n，
+        //   所以读的人不会把两个数当成同一个总体。
+        out.put("②末轮带上了状态", ratio(resumedOk, attempts - incompleteAttempts));
+        out.put("③末轮落点对了", ratio(landedOk, attempts - incompleteAttempts));
+        out.put("★★三层全过", ratio(allThreeOk, judgedAttempts));
+        out.put("末轮命中@5", ratio(lastTurnHit, lastTurnJudged));
+        out.put("★计划里没有 resumed 这一格的尝试", planWithoutV3);
+        out.put("①没有 gold 的尝试明细", noGoldDetail);
+        out.put("不完整的尝试明细", incompleteDetail);
+        out.put("逐次尝试", detailRows);
+        out.put("note", "⚠️ 按 ADR-084：这一段【单独分母】，不进本报告的任何汇总 ——"
+                + "多轮题一道算一次尝试，单轮题一道算一行，两者不是一回事。"
+                + " ★★ ① 是【2×2】不是「反问率」：反问得越多那个数越高，而"
+                + "「不该反问却反问了」是另一种错（用户被无谓地打断），修法相反。"
+                + " ★★ 「三层全过」的 ① 那一半是【判对了】而不是「反问了」——"
+                + "「不该反问而没反问」同样算过。"
+                + " ★★ ① 的 gold 只认【显式标注】（题库的 expect_clarify，V17），"
+                + "不做任何回落：多轮题的 gold intent 描述的是【末轮】，"
+                + "拿它给首轮下结论必然错 —— 而猜出来的错值会和真值长得一样地印进报告，"
+                + "不可判至少会留下一条能解释的计数。"
+                + " ★ ② 只在 intent_plan 的版本 ≥3 上才有这一格（9.4 起）；"
+                + "早期数据上它必然缺席，那种「0%」是数据版本造成的，不是功能坏了 ——"
+                + " 所以另有一栏数「没有这一格的尝试」。"
+                + " ★ 「不完整的尝试」是会话断在中途（任一轮失败后客户端不再往下问），"
+                + "它【不进】任何一个分子分母：混进去会让失败看起来像模型答不对。");
+        return out;
+    }
+
+    /**
+     * ①「首轮该不该被反问」的 gold —— <b>只认题库里的显式声明</b>。
+     *
+     * <p>★★ 它<b>刻意不做任何回落</b>，因为这一段只处理多轮题
+     * （见调用处的 {@code turns <= 0 → continue}），而多轮题没有可回落的来源：
+     * 它们的 {@code intent} 描述的是<b>末轮</b>（{@code EvalQuestion#standaloneQuestion}），
+     * 拿它给首轮下结论<b>必然错</b> —— 错的方向还是「每一道都判成不该反问」，
+     * 于是 ① 会显示一个恒为 0 的「反问率」，读起来像「澄清机制从来没生效」。
+     *
+     * <p>★ 单轮题那边<b>不需要</b>这一格，而且也不需要改一行：它们的 gold
+     * <b>就是</b>这一轮的意图，所以「它是不是澄清分支码」恰好就是答案 ——
+     * 那是 {@code 澄清边界} 那一节的判据，与这里无关。
+     *
+     * <p>★ 为什么「猜一个」比「不可判」更糟：猜出来的错值会和一个真值
+     * 长得一模一样地印进报告，而不可判至少会留下一条能解释的计数。
+     *
+     * @return {@code null} = 不可判（调用方把它排除出 ① 的分子分母，而<b>不是</b>当成 false）
+     */
+    private static Boolean goldShouldClarify(QuestionView v) {
+        return v.bank() == null ? null : v.bank().getExpectClarify();
+    }
+
+    // ================================================================
+    // 解析 {@code intent_plan} / {@code tool_calls}（阶段 9.6）
+    // ================================================================
+
+    /**
+     * 解析一行的 {@code intent_plan}。空值返回 {@code null}。
+     *
+     * <p>★ 「没有计划」和「计划是空的」必须能区分开 —— 这是全库那条约定
+     * （{@code tool_calls} / {@code references} / {@code retrieval_detail} / {@code affinity}）。
+     * 前者是分类整个没产出，后者不会发生（列里存的永远是那八格）。
+     */
+    private static JsonNode planOf(ObjectMapper mapper, QaLog row) {
+        String raw = row.getIntentPlan();
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return mapper.readTree(raw);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String planText(JsonNode plan, String key) {
+        JsonNode node = plan == null ? null : plan.get(key);
+        return node == null || node.isNull() ? null : node.asText();
+    }
+
+    private static Boolean planBool(JsonNode plan, String key) {
+        JsonNode node = plan == null ? null : plan.get(key);
+        return node == null || node.isNull() ? null : node.asBoolean();
+    }
+
+    private static List<String> planStrings(JsonNode plan, String key) {
+        List<String> out = new ArrayList<>();
+        JsonNode node = plan == null ? null : plan.get(key);
+        if (node != null && node.isArray()) {
+            for (JsonNode e : node) {
+                out.add(e.asText());
+            }
+        }
+        return out;
+    }
+
+    /** 计数用的兜底键 —— {@code TreeMap.merge(null, …)} 会 NPE，而缺一格不该让整段崩掉 */
+    private static String orAbsent(String value) {
+        return value == null ? "(缺这一格)" : value;
+    }
+
+    /**
+     * 这一行算不算「做过一次检索决策」。
+     *
+     * <p>★ <b>被限流拒掉的（{@code status=4}）不算</b> —— 那条路上检索压根没跑，
+     * 它的 {@code retrieval_detail} 是 NULL。拿它当「决定不检索」会让
+     * 「要检索的题有 N% 没检索」出现一个<b>纯粹由容量造成的</b>分量，
+     * 而那句话会被读成「门控关得太狠」—— 指向相反的调优方向。
+     */
+    private static boolean countsAsDecision(QaLog row) {
+        Integer status = row.getStatus();
+        return status != null && status != QaLog.STATUS_RATE_LIMITED;
+    }
+
+    /** 这一次问答【实际发生】了检索没有。★ 判据是事实，不是门控的结论 */
+    private static boolean retrieved(QaLog row) {
+        String d = row.getRetrievalDetail();
+        return d != null && !d.isBlank();
+    }
+
+    /** 一条工具调用记录（{@code qa_log.tool_calls} 的一个元素） */
+    private record ToolCallRecord(String tool, boolean isError) {
+    }
+
+    /**
+     * 解析一行的 {@code tool_calls}。
+     *
+     * <p>★★ 非空<b>不等于</b>「工具真的跑了」—— 被白名单拒掉的那条也会留下记录
+     * （{@code isError=true}，见 {@link #toolUsageSection} 的注释）。
+     */
+    private static List<ToolCallRecord> toolCallsOf(ObjectMapper mapper, QaLog row) {
+        List<ToolCallRecord> out = new ArrayList<>();
+        String raw = row.getToolCalls();
+        if (raw == null || raw.isBlank()) {
+            return out;
+        }
+        try {
+            JsonNode arr = mapper.readTree(raw);
+            if (arr.isArray()) {
+                for (JsonNode e : arr) {
+                    out.add(new ToolCallRecord(e.path("tool").asText(), e.path("isError").asBoolean()));
+                }
+            }
+        } catch (Exception e) {
+            log.warn("tool_calls 解析失败，按「没有调用」处理：{}", raw, e);
+        }
+        return out;
+    }
+
+    /** 多轮题的轮数。不是多轮题（没有 turns / 解析不出数组）时返回 0 */
+    private static int turnCount(ObjectMapper mapper, String turnsJson) {
+        if (turnsJson == null || turnsJson.isBlank()) {
+            return 0;
+        }
+        try {
+            JsonNode node = mapper.readTree(turnsJson);
+            return node.isArray() ? node.size() : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static List<Integer> statusesOf(List<QaLog> rows) {
+        List<Integer> out = new ArrayList<>(rows.size());
+        for (QaLog row : rows) {
+            out.add(row.getStatus());
+        }
         return out;
     }
 
@@ -1931,6 +2807,45 @@ public class EvalReportService {
             r.put("意图全票一致", unanimous());
             r.put("gold是合法分类目标", goldIsTarget);
             r.put("意图正确", goldIsTarget ? Boolean.valueOf(goldIntent.equals(mode)) : null);
+
+            // ── 决策：该不该检索 / 该不该有工具（阶段 9.6，各三态）──
+            //
+            // ★★ 判据必须和 检索决策 / 工具调用 两段【逐字相同】——
+            //    否则「逐题表重算不出汇总」，而读报告的人会以为是自己数错了。
+            //    ★ 也【不】复用上面那个「意图正确」：意图对 ≠ 决策对
+            //      （分类对了，而调用点忘了用门控的结论 —— 那正是 9.2 担心的那一类
+            //       「只改一半」，意图那一格完全看不出来）。
+            //    ★ 加这两组格的另一个理由是 A/B：翻转矩阵只看这张表，
+            //      不加的话新指标【静默不进任何对比】。
+            Boolean shouldRetrieve = goldIntent == null ? null : !declared;
+            Boolean shouldHaveTools = goldIntent == null
+                    ? null
+                    : tree.retrievalOf(goldIntent) == IntentTree.Retrieval.TOOL
+                    || !tree.toolsOf(goldIntent).isEmpty();
+
+            Map<String, Integer> retrievalVotes = new LinkedHashMap<>();
+            Map<String, Integer> toolVotes = new LinkedHashMap<>();
+            for (QaLog row : rows) {
+                if (!countsAsDecision(row)) {
+                    continue;
+                }
+                retrievalVotes.merge(retrieved(row) ? "检索" : "不检索", 1, Integer::sum);
+                toolVotes.merge(toolCallsOf(mapper, row).isEmpty() ? "没调" : "调了", 1, Integer::sum);
+            }
+            String retrievalVerdict = mode(retrievalVotes);
+            String toolVerdict = mode(toolVotes);
+
+            r.put("该检索", shouldRetrieve);
+            r.put("检索决策", retrievalVerdict);
+            r.put("检索决策正确", shouldRetrieve == null || retrievalVerdict == null
+                    ? null
+                    : Boolean.valueOf(("检索".equals(retrievalVerdict)) == shouldRetrieve));
+            r.put("该有工具", shouldHaveTools);
+            r.put("工具决策", toolVerdict);
+            r.put("工具决策正确", shouldHaveTools == null || toolVerdict == null
+                    ? null
+                    : Boolean.valueOf(("调了".equals(toolVerdict)) == shouldHaveTools));
+            r.put("多轮题", turnCount(mapper, bank == null ? null : bank.getTurns()) > 0);
 
             // ── 检索（三态）──
             //

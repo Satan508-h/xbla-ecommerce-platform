@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
  *
  * <h3>★★★ 它和 {@code /api/debug/**} 的区别是【存不存在】</h3>
  *
- * <p>7 个 {@code @Profile("local")} 的探针控制器在生产 profile 下
+ * <p><b>8</b> 个 {@code @Profile("local")} 的探针控制器在生产 profile 下
  * <b>不会被注册</b>。它们能无条件消耗 API 额度（{@code /api/debug/llm/chat}），
  * 或者改状态（{@code POST /api/debug/ratelimit/leak}、{@code /reset}），
  * 所以它们绝不能跟着公网隧道一起出去。

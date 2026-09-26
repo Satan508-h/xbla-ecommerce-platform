@@ -112,8 +112,8 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
      * 报告里那一格显示 <b>0 次「不该检索却检索了」</b> ——
      * 而 0 是个看起来像好消息的数，没有任何东西会红。
      *
-     * <p>⚠️ 另外注意：{@code tool_calls} <b>不在这份清单里</b>，这是刻意的 ——
-     * 报告目前不用它。哪天真要按「有没有调工具」切片，记得连它一起加。
+     * <p>⚠️ 上面那句「{@code tool_calls} 不在这份清单里，报告目前不用它」<b>已经在
+     * 9.6 作废了</b> —— 见下面那一节。它当时是对的，而它自己写明了失效条件。
      *
      * <h3>★★ 阶段 9.5 加了 {@code affinity}（第四次）</h3>
      *
@@ -125,15 +125,52 @@ public interface QaLogMapper extends BaseMapper<QaLog> {
      * 偏好块不进 {@code contexts}，faithfulness 偏低，而报告里
      * 那个数字和「这次本来就没有偏好」长得一模一样。
      *
+     * <h3>★★ 阶段 9.6 加了 {@code tool_calls} 和 {@code session_id}（第五次）</h3>
+     *
+     * <p>这一节的两种列各有各的判据，而且<b>都是被「两个东西长得一样」逼出来的</b>：
+     *
+     * <p><b>① {@code tool_calls}</b> —— 9.6 的「工具选择准确率」要问的是
+     * 「该调工具的题，模型调了没有」。★ 而 {@code intent} 只知道<b>该不该</b>，
+     * 不知道<b>调没调</b>：一次静默降级（工具意图走进了纯 KB 问答）在
+     * {@code intent} / {@code status} / {@code provider} / {@code final_answer}
+     * 上<b>逐字与正常轮相同</b>。这正是 9.1 修掉的那个 bug，
+     * 而修完之后「它没有复发」在数据上一直是个<b>无法回答</b>的问题。
+     *
+     * <p>⚠️ 上面 {@code NOT_SELECTED} 那条理由写的「报告侧只要知道这题是不是工具题 ——
+     * 那由 intent 判」在当时是对的：那时报告确实只问「该不该」。
+     * 9.6 开始问第二个问题，那条理由就到期了。
+     *
+     * <p><b>② {@code session_id}</b> —— 多轮题的<b>轮次边界只能靠它还原</b>。
+     * 一轮多轮题把 N 轮都提交在<b>同一个题号</b>下（{@code eval_question_no} 相同），
+     * 而 {@code qa_log} <b>没有轮次列</b>。可用的还原路径只有两条：
+     * <ul>
+     *   <li>★ 按<b>位置</b>推算（第 r 次重复的第 t 轮 = 第 r×T+t 行）——
+     *       错在它是<b>客户端约定</b>（{@code eval_run.py} 的两层循环顺序），
+     *       服务端的报告去依赖它，客户端一改循环就<b>静默错位</b>；
+     *       而且任一轮失败时客户端会 {@code break}，后面的行数对不上</li>
+     *   <li>★★ 按 {@code session_id} 分组 —— 每一次重复<b>新建一个会话</b>
+     *       （{@code eval_run.py} 每个 repeat 都从 {@code session_no = None} 起），
+     *       所以「同一题号下同一个 session 的这几行」<b>就是</b>一次完整尝试，
+     *       组内按 {@code id} 排就是轮次顺序。这是<b>服务端看得见的事实</b></li>
+     * </ul>
+     *
+     * <p>★ 单轮题的这一列也<b>不是</b>废的：每次重复同样新建会话，所以
+     * 「这一题跑了几次完整的尝试」也可以用它数 —— 只是单轮那几段用的是
+     * {@code id} 序（{@code firstSuccess()} 那套），两条路各自自洽。
+     *
+     * <p>⚠️ 两条都属于「漏了它症状不指向病因」：{@code tool_calls} 漏了显示
+     * 「0 次工具调用」（一个看起来像好消息的 0），{@code session_id} 漏了显示
+     * 「所有多轮题都只有一轮」（一个看起来像题库写错了的 0）。
+     *
      * @param runId 评测运行 ID（{@code qa_log.eval_run_id}）
      */
     @Select("""
-            SELECT id, trace_id, eval_question_no, eval_run_id,
+            SELECT id, trace_id, eval_question_no, eval_run_id, session_id,
                    question,
                    intent, intent_confidence, status, error_msg,
                    queue_ms, queue_position,
                    retrieval_latency_ms, rerank_latency_ms, llm_latency_ms, total_latency_ms,
-                   retrieval_detail, intent_plan, affinity, final_answer, "references",
+                   retrieval_detail, intent_plan, tool_calls, affinity, final_answer, "references",
                    provider, model, prompt_tokens, completion_tokens, total_tokens, cost,
                    created_at
             FROM qa_log

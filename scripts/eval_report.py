@@ -89,6 +89,28 @@ BOOTSTRAP_SEED = 20260923
 #      所以 selftest 里有一条断言它 == report.json 里的 ★切片可信度纪律.MIN_SLICE_N。
 MIN_SLICE_N = eval_ab.MIN_SLICE_N
 
+JAVA_REPORT_SERVICE = os.path.join(
+    ROOT, "src", "main", "java", "com", "xbla", "rag", "rag", "eval", "EvalReportService.java")
+
+
+def _java_min_slice_n(path=None):
+    """Java 侧 `MIN_SLICE_N` 的值 —— **直接从源码里读**，不靠记忆。
+
+    返回 `(值, 错误说明)`。★ 读不到时第一位是 `None` 且第二位非 `None`：
+    **调用方必须把「读不到」当成失败**，不能回落成一个默认值 ——
+    那样这个守卫就成了一个恒真的装饰品（同 docs/10 坑 19 那条纪律）。
+    """
+    target = path or JAVA_REPORT_SERVICE
+    try:
+        with io.open(target, encoding="utf-8") as f:
+            text = f.read()
+    except Exception as e:
+        return None, "读不到 %s：%s" % (target, e)
+    m = re.search(r"MIN_SLICE_N\s*=\s*(\d+)", text)
+    if not m:
+        return None, "在 %s 里找不到 `MIN_SLICE_N = <数字>` —— 常量被改名了？" % target
+    return int(m.group(1)), None
+
 DASH = "—"
 
 
@@ -606,6 +628,44 @@ def ratio_rows(spec, ra, rb):
     return out
 
 
+# ----------------------------------------------------------------
+# §2.10 / §2.11 的四格（阶段 9.6）
+#
+# ★ 键名是【字面量】，和 Java 侧 EvalReportService 里那两个 put 一一对应。
+#   Java 侧改一个 ★ 或一个全角括号，这里就静默印成 `—`（见 docs/10 坑 46），
+#   所以这些字符串集中放在一处，而不是散在渲染代码里。
+# ----------------------------------------------------------------
+
+RD_CELLS = [
+    ("★声明不检索_实际也没检索", "对"),
+    ("★声明不检索_实际检索了（过度检索）", "★ 修法：**收窄**"),
+    ("★声明要检索_实际检索了", "对"),
+    ("★声明要检索_实际没检索（过度关闭）", "★ 修法：**放宽**"),
+]
+RD_DENOM_QUESTIONS = ["分母_声明不检索的题", "分母_声明要检索的题", "平票的题数"]
+RD_DENOM_ROWS = ["分母_声明不检索的行", "分母_声明要检索的行"]
+
+TC_CELLS = [
+    ("★该有工具_确实调了", "对"),
+    ("★该有工具_一次没调", "★★ 9.1 修掉的那个形状"),
+    ("★不该有工具_没调", "对"),
+    ("★不该有工具_却调了", "★ 串味 —— 工具给错了轮"),
+]
+TC_DENOM_QUESTIONS = ["分母_该有工具的题", "分母_不该有工具的题"]
+TC_DENOM_ROWS = ["分母_该有工具的行", "分母_不该有工具的行"]
+
+# ★ 阶段 9.6a：槽位声明（`missing`）的去向。见 `_render_slot_declaration`。
+SD_KEYS = [
+    ("分母_行", "本轮的全部行"),
+    ("★其中·没有计划的行", "★ 非 0 = `intent_plan` 没落库或解析不了 —— 先修它"),
+    ("分母_声明缺槽位的行", "★ 模型自己说「还缺什么」的行（`missing` 是数组且非空）"),
+    ("声明缺槽位_落在澄清分支（反问了）", "⚠️ **定义性**的一格，当对照用，不是发现"),
+    ("★★声明缺槽位_落在业务码（直接作答）", "★★ **模型的这个输出没被消费**"),
+    ("分母_反问的行", "★ 不筛 `missing`；分母是**有计划的行**（没计划的在上面单独数了）"),
+    ("★其中·没声明缺槽位却反问了", "★ 非 0 = 走了回落文案（缺 `missing`/缺模板）"),
+]
+
+
 def render_metrics(runs):
     a, b = runs["noise"], runs["main"]     # A = 噪声底轮，B = 主体轮
     ra, rb = a["report"], b["report"]
@@ -1020,6 +1080,205 @@ def render_metrics(runs):
     out.append("")
     out.append("⚠️ **服务端账本不含意图分类与摘要压缩** —— 它们各自是一次模型调用，但**不进 `qa_log`**。"
                "RAGAS 判官那一轮的花费也不在里面。所以这不是「这一期花了多少」。")
+
+    # ---------- 2.10 检索决策（阶段 9.6）----------
+    #
+    # ★ 为什么编号接在 2.9 后面而不是插到 2.2 / 2.3 旁边：
+    #   2.x 是**硬编码字符串**，插在中间要把 2.5~2.9 全部重编号 ——
+    #   而 ADR-083 等文档里点名引用的是「2.8 延迟」。重编号会让那些引用
+    #   静默指到别的节，且**没有任何东西会报错**。所以新的接在后面。
+    out.append("")
+    out.append("### 2.10 检索决策（该不该检索）")
+    out.append("")
+    out.append("★★ **四格是四件事，不是一个「准确率」。** 两个错方向的修法**完全相反**：")
+    out.append("")
+    out.append("- 「声明要检索 → 实际没检索」= **过度关闭** ⇒ 要**放宽**")
+    out.append("- 「声明不检索 → 实际检索了」= **过度检索** ⇒ 要**收窄**")
+    out.append("")
+    out.append("并成一个数之后，它掉下来你**不知道该往哪边调**。")
+    out.append("")
+    out.extend(table(["格（逐题 · 多数票）", "值（噪声底轮 / 主体轮）", "口径"], [
+        [k, pair_int((get_path(ra, "检索决策.四格（逐题·多数票）") or {}).get(k),
+                     (get_path(rb, "检索决策.四格（逐题·多数票）") or {}).get(k))[0], note]
+        for k, note in RD_CELLS] + [
+        [k, pair_int((get_path(ra, "检索决策.四格（逐题·多数票）") or {}).get(k),
+                     (get_path(rb, "检索决策.四格（逐题·多数票）") or {}).get(k))[0],
+         "★ **分母**，不是分子 —— 两个格共用它"]
+        for k in RD_DENOM_QUESTIONS]))
+    out.append("")
+    out.append("**逐行**（每次重复都算一次决策；分母 = 题数 × 重复次数）：")
+    out.append("")
+    out.extend(table(["格（逐行）", "值（噪声底轮 / 主体轮）", "口径"], [
+        [k, pair_int((get_path(ra, "检索决策.四格（逐行）") or {}).get(k),
+                     (get_path(rb, "检索决策.四格（逐行）") or {}).get(k))[0], ""]
+        for k in RD_DENOM_ROWS + [k for k, _ in RD_CELLS]]))
+    out.append("")
+    out.append("★ 口径三件事：")
+    out.append("")
+    out.append("1. 判据是**实际发生的检索**（`retrieval_detail` 非空），**不是** `intent_plan.retrieve`。"
+               "后者是门控自己的输出，拿它当判据会漏掉「**算对了但调用点忘了用**」那类只改一半的实现。"
+               "两者不一致的行单列在 `★算对了但没用的行` 里，**应恒 0**。")
+    out.append("2. **被限流拒掉的行（`status=4`）不算一次决策** —— 那条路上检索压根没跑。"
+               "把它们算成「决定不检索」会让过度检索率**归零**，一个看起来像好消息的 0，"
+               "而它百分之百是容量造成的。它们被单独数出来。")
+    out.append("3. 「声明不检索」那 %s 道题（工具 15 / 兜底 7 / 澄清 6）走的是 `TOOL` / `NONE` 两条路，"
+               "**代码根本不读模型那一格** —— 它们的「没检索」是设计保证的，"
+               "只有**分类判错**时才会翻成「检索了」。"
+               "**换句话说：这一格测的是分类质量，不是门控质量。**"
+               % num(get_path(rb, "数据完整性.  其中 声明不检索的")))
+    out.append("")
+    bad = (get_path(rb, "检索决策.★算对了但没用的行") or [])
+    out.append("- ★ **算对了但没用的行**：%s"
+               % (_codes(bad) if bad else "**0 行** ✅（门控的结论与实际行为处处一致）"))
+    n_skipped = get_path(rb, "检索决策.★没算成决策的行")
+    out.append("- ★ 没算成决策的行（被限流拒掉，四个格子都不含它们）：%s" % num(n_skipped))
+    out.append("")
+    out.append("★ **`shape` 分布是「门控到底有没有生效」的唯一判据** —— "
+               "JSON 占比接近 100% 才算生效。掉下来说明模型没跟上契约、走了裸码回退，"
+               "而回退路径的 `retrieve` 是**默认值**，不是模型说的。")
+    out.append("")
+    out.extend(table(["shape", "噪声底轮", "主体轮"], [
+        [k, pair_int((get_path(ra, "检索决策.shape分布") or {}).get(k),
+                     (get_path(rb, "检索决策.shape分布") or {}).get(k))[0], ""]
+        for k in sorted(set((get_path(ra, "检索决策.shape分布") or {}))
+                        | set((get_path(rb, "检索决策.shape分布") or {})))]))
+    out.append("")
+    out.append("★ `gate` 分布（谁下的决定）—— **没有它就无法把 `TOOL`（该走工具）和 "
+               "`PLAN_OFF`（模型主动关掉）分开**，而两者都是「没检索」：")
+    out.append("")
+    out.extend(table(["gate", "噪声底轮", "主体轮"], [
+        [k, pair_int((get_path(ra, "检索决策.gate分布") or {}).get(k),
+                     (get_path(rb, "检索决策.gate分布") or {}).get(k))[0], ""]
+        for k in sorted(set((get_path(ra, "检索决策.gate分布") or {}))
+                        | set((get_path(rb, "检索决策.gate分布") or {})))]))
+    n_plan_off = (get_path(rb, "检索决策.gate分布") or {}).get("PLAN_OFF")
+    if not n_plan_off:
+        out.append("")
+        out.append("⚠️ **`PLAN_OFF` = %s —— 这条分支一次都没被走到过。**"
+                   "它是「业务相关但不用检索」那条路（`KB` 意图 ∧ 模型主动关掉检索），"
+                   "已知在阶段 9.2 的 11 条样本里也是 0。**它不是「这条分支没问题」，"
+                   "是「它没被测过」。**" % num(n_plan_off))
+    flip = get_path(rb, "检索决策.★跨次决策翻转的题") or []
+    out.append("")
+    out.append("- ★ **跨次决策翻转的题**（同一题重复跑，决策不一致）：%s"
+               % (_codes(flip) if flip else "无"))
+
+    # ---------- 2.11 工具调用（阶段 9.6）----------
+    out.append("")
+    out.append("### 2.11 工具调用（该不该有工具）")
+    out.append("")
+    out.append("★★ **这一段回答的是 9.1 那个 bug 有没有复发。** "
+               "工具意图静默降级成普通知识库问答时，`intent` / `status` / `provider` / "
+               "`final_answer` **逐字与正常轮相同**，而模型会拿通用规则**编一个订单状态出来**。"
+               "旧数据上这件事**完全看不出来**。")
+    out.append("")
+    out.extend(table(["格（逐题 · 多数票）", "值（噪声底轮 / 主体轮）", "口径"], [
+        [k, pair_int((get_path(ra, "工具调用.四格（逐题·多数票）") or {}).get(k),
+                     (get_path(rb, "工具调用.四格（逐题·多数票）") or {}).get(k))[0], note]
+        for k, note in TC_CELLS] + [
+        [k, pair_int((get_path(ra, "工具调用.四格（逐题·多数票）") or {}).get(k),
+                     (get_path(rb, "工具调用.四格（逐题·多数票）") or {}).get(k))[0],
+         "★ **分母**，不是分子"]
+        for k in TC_DENOM_QUESTIONS]))
+    out.append("")
+    out.append("**逐行**：")
+    out.append("")
+    out.extend(table(["格（逐行）", "值（噪声底轮 / 主体轮）", "口径"], [
+        [k, pair_int((get_path(ra, "工具调用.四格（逐行）") or {}).get(k),
+                     (get_path(rb, "工具调用.四格（逐行）") or {}).get(k))[0], ""]
+        for k in TC_DENOM_ROWS + [k for k, _ in TC_CELLS]]))
+    out.append("")
+    out.append("★ **「该有工具」由 gold 意图经意图树推出**（`retrievalOf(gold) == TOOL`，"
+               "或该叶子自己声明了 `tools`）——**和运行时那一条不是同一个来源**，"
+               "所以它才能发现「该有工具却没有」。")
+    out.append("")
+    out.append("★★ **「越权且成功的调用」应恒 0 —— 而它不是一个恒空式。** "
+               "白名单拒绝**也会留下调用记录**（`isError=true`），所以「越权的调用」非 0 "
+               "**不代表数据泄露**（服务端拒了），它代表「模型叫了一个没给它的名字」。"
+               "而「拒了没有」是**可观测的**：被拒那条必然是 `isError=true`。")
+    out.append("")
+    over = get_path(rb, "工具调用.★★越权且成功的调用") or []
+    out.append("- ★★ **越权且成功的调用**：%s"
+               % (_codes(over) if over else "**0 条** ✅（ADR-093 那条不变式在数据上成立）"))
+    over_try = get_path(rb, "工具调用.★越权的调用") or []
+    out.append("- ★ 越权的调用（尝试）：%s" % (_codes(over_try) if over_try else "无"))
+    drop = get_path(rb, "工具调用.★给了工具却一次没调的行") or []
+    out.append("- ★★ **给了工具却一次没调的行**：%s"
+               % (_codes(drop) if drop
+                  else "**0 行** ✅（门控给了工具，模型就真的用了）"))
+    out.append("")
+    out.append("★ 判据是「**调了没有**」，不是「答对了没有」—— 工具答对内容由 "
+               "`probe_tool.py` 那 30 项负责，这里只管**工具链有没有走通**。"
+               "★ 这个数**不区分**「真降级了」和「工具链压根没跑」，"
+               "所以它非 0 时先看 `数据完整性` 和 `★没有计划的行`。")
+    out.append("")
+    out.append("★★ **`该有工具_一次没调` 那一格不下「静默降级」的结论。** 实测"
+               "（2026-09-26）`MC-002`「我的优惠券什么时候过期」的三次都是"
+               "「用通用规则回答 + **明确说『我这边看不到你账户里具体券的到期时间』**」，"
+               "**那不是编造**。要判「是不是降级」必须读那几行 `final_answer` ——"
+               "判据是「它在谈通用规则，还是在**编一个具体值**」。"
+               "★ 把「如实说查不到」和「编一个数」并成一个名字，会让修法指错方向。")
+    called = get_path(rb, "工具调用.调用的工具分布") or {}
+    if called:
+        out.append("")
+        out.append("- 调用的工具分布（主体轮）：%s"
+                   % "、".join("`%s` ×%s" % (k, num(v)) for k, v in sorted(called.items())))
+    out.append("- `isError` 的调用条数（主体轮）：%s"
+               % num(get_path(rb, "工具调用.isError 的调用条数")))
+    out.extend(_render_slot_declaration(ra, rb))
+    return out
+
+
+def _render_slot_declaration(ra, rb):
+    """§2.12 槽位声明（`missing` 的去向）—— 阶段 9.6a 的第三笔账。
+
+    ★★ 这一节记的是【形状】，不是判据：模型自己说「这句话还缺什么」的那些行，
+    只有落在澄清分支上的才反问了（而那是**定义性**的 —— `status=3` 就是那条分支）。
+    落业务码的一次都没反问。⇒ `missing` 非空 ≠ 会反问。
+    """
+    out = []
+    out.append("")
+    out.append("### 2.12 槽位声明（`missing` 的去向）★ 阶段 9.6a")
+    out.append("")
+    out.append("★★ **模型说「这句话还缺什么」，和「系统会不会反问」，是两条独立的链。** "
+               "当前实现里 `intent_plan.missing` 非空**不会**触发反问 —— "
+               "反问完全由**落点**决定（落点 == 树里 `role: CLARIFY` 的分支 ⟺ `status=3`）。"
+               "`missing` 唯一的消费方是**澄清文案**（缺哪个槽位、问哪一句）。")
+    out.append("")
+    out.extend(table(["格", "值（噪声底轮 / 主体轮）", "口径"], [
+        [k, pair_int((get_path(ra, "槽位声明") or {}).get(k),
+                     (get_path(rb, "槽位声明") or {}).get(k))[0], note]
+        for k, note in SD_KEYS]))
+    out.append("")
+    out.append("★★ **中间那两格是这条账的全部内容** —— 同一批「模型自己说缺槽位」的行，"
+               "落在澄清分支的**全部反问了**、落在业务码的**一次都没反问**。"
+               "★ 分裂的依据是**落点**，而落点是模型自己给的**另一个**输出。")
+    out.append("")
+    out.append("⚠️ **第一格是定义性的，不是发现** —— `status=3` 与「落点是澄清分支」"
+               "是同一个判据。它在这里的用途只有一个：给第二格当**对照**。"
+               "★ 也正因为如此，**这里不做「落点 × 反问」的 2×2** —— "
+               "那张表有一整轴恒真。")
+    out.append("")
+    nos = get_path(rb, "槽位声明.★声明了却没反问的题") or []
+    if not nos:
+        out.append("- ★ **声明了却没反问的题**：无")
+    elif len(nos) <= 20:
+        out.append("- ★ **声明了却没反问的题**（%d 道）：%s" % (len(nos), _codes(nos)))
+    else:
+        # ★ 截断必须留下痕迹（坑 45）—— 读的人得知道这份清单不是全部。
+        #   report.json 里是完整的 25 道，这里只印前 20。
+        out.append("- ★ **声明了却没反问的题**（%d 道，下面列前 20）：%s，"
+                   "**（其余 %d 道略）**"
+                   % (len(nos), _codes(nos[:20]), len(nos) - 20))
+    out.append("")
+    out.append("★★ **这一格不是缺陷清单。** 落业务码的行**本就不该反问**"
+               "（系统答得对）；真正的「漏反问」只是其中的**样本**。"
+               "多轮集上①那一格的漏，成因在这里能看见 —— 见 §6。")
+    out.append("")
+    out.append("★ **要不要让 `missing` 参与闸门是一个产品决策**"
+               "（代价是「让模型自己决定要不要反问」，而它和 5.2 的分类基线同源）。"
+               "2026-09-26 拍板：**先记账、不改行为** —— 与 9.5「停手不改」同源，"
+               "先把它变成可复算的数，再决定改不改。")
     return out
 
 
@@ -1663,6 +1922,123 @@ def render_multi(runs):
                    "不是「多轮更难」，是「追问轮的意图本来就不是一个可测量的量」。")
         out.append("")
     out.append("⚠️ **多轮集的数字不进本报告的任何汇总** —— 它们的唯一去处是这一节。")
+
+    # ---------- 澄清恢复：三层（阶段 9.6）----------
+    mcl = get_path(rm, "多轮澄清") or {}
+    if mcl:
+        out.append("")
+        out.append("#### 澄清恢复（阶段 9.4 的机制在不在）")
+        out.append("")
+        out.append("★★ **分三层，是因为坏掉时得知道坏在哪一层** —— 三层的修法完全不同：")
+        out.append("")
+        out.append("1. **首轮反问发生了**（`status=3`）⇒ 澄清闸门把住了吗")
+        out.append("2. **末轮带上了状态**（`intent_plan.resumed`）⇒ 9.4 的「读后即清」生效了吗")
+        out.append("3. **末轮落点对了**（`intent` == gold）⇒ 补全之后判对了吗")
+        out.append("")
+        out.append("★ **前提是「三层全过」** —— 前两层是机制，第三层才是结果；"
+                   "它们不是三个独立的率，而是同一个任务的三道关。")
+        out.append("")
+        n_judged = num(mcl.get("分母_①可判的尝试"))
+        out.append("**① 首轮该不该反问 —— 2×2**（★ 不是「反问率」）")
+        out.append("")
+        out.extend(table(["格", "值", "口径"], [
+            ["① 该反问_反问了", num(mcl.get("①该反问_反问了")), "对"],
+            ["① 该反问_没反问（漏）", num(mcl.get("①该反问_没反问（漏）")),
+             "★ **漏** ⇒ 修法是**调宽**"],
+            ["① 不该反问_没反问", num(mcl.get("①不该反问_没反问")), "对"],
+            ["① 不该反问_反问了（假阳）", num(mcl.get("①不该反问_反问了（假阳）")),
+             "★ **假阳** ⇒ 修法是**调窄**（用户被无谓地打断）"],
+            ["分母_①可判的尝试", n_judged, "★ 完整 × 标了 `expect_clarify`"],
+            ["★★ ① 没有 gold 的尝试", num(mcl.get("★★①没有 gold 的尝试")),
+             "★★ 多轮题必须显式标 `expect_clarify`（V17）—— 没标的判**不可判**，不猜"],
+        ]))
+        out.append("")
+        out.append("★★ **反问得越多，「反问率」越高** —— 而「不该反问却反问了」是另一种错，"
+                   "修法**相反**。所以这一层也是 2×2，不是一个比率。")
+        out.append("")
+        out.append("**②③ 与三层全过**")
+        out.append("")
+        out.extend(table(["层", "值", "口径"], [
+            ["② 末轮带上了状态", _one(mcl, "②末轮带上了状态"),
+             "分母 = 完整的多轮尝试（%s 次）；★ 只在 `intent_plan` ≥v3 上有这一格" % num(mcl.get("分母_完整的尝试"))],
+            ["③ 末轮落点对了", _one(mcl, "③末轮落点对了"),
+             "同样分母；`intent` == `standalone_question` 标的那一个"],
+            ["**★★ 三层全过**", _one(mcl, "★★三层全过"),
+             "★ 分母 = **①可判的尝试**（%s）；这才是「这个任务解决了」" % n_judged],
+            ["末轮命中@5", _one(mcl, "末轮命中@5"), "★ 末轮只有 `status=1` 且有正解切片时才进分母"],
+            ["★ 不完整的尝试", num(mcl.get("★不完整的尝试")),
+             "★★ 会话断在中途 —— **不进任何分子分母**"],
+            ["★ 计划里没有 resumed 这一格的尝试",
+             num(mcl.get("★计划里没有 resumed 这一格的尝试")),
+             "★ 「0% 带上了状态」有两种成因：功能没生效 / 数据是旧版本"],
+            ["★ 没有 session_id 的行", num(mcl.get("★没有 session_id 的行")),
+             "★★ 非 0 = 投影漏了这一列，多轮分组会全部塌成一组"],
+        ]))
+        out.append("")
+        out.append("★★ **三层全过的 ① 那一半是「判对了」而不是「反问了」** ——"
+                   "「不该反问而没反问」同样算过。写成 `asked && …` 会让这个指标变成"
+                   "「反问得越多越好」，而那不是它的意思。")
+        # ★★ 阶段 9.6a：① 漏掉的那些，成因**不在闸门松紧**，在「落点」—— 见 §2.12。
+        sd = get_path(rm, "槽位声明") or {}
+        if sd:
+            out.append("")
+            out.append("**① 漏掉的那些去了哪 —— `missing` 的去向**（★ 与 §2.12 同一笔账）")
+            out.append("")
+            out.extend(table(["格", "值", "口径"], [
+                ["分母_声明缺槽位的行", num(sd.get("分母_声明缺槽位的行")),
+                 "★ 模型自己说「还缺什么」的行"],
+                ["声明缺槽位_落在澄清分支（反问了）",
+                 num(sd.get("声明缺槽位_落在澄清分支（反问了）")),
+                 "⚠️ **定义性**的一格（`status=3` 就是那条分支），当对照用"],
+                ["★★ 声明缺槽位_落在业务码（直接作答）",
+                 num(sd.get("★★声明缺槽位_落在业务码（直接作答）")),
+                 "★★ **模型的这个输出没被消费**"],
+            ]))
+            out.append("")
+            out.append("★★ **`missing` 非空 ≠ 会反问。** 落点是澄清分支才反问，"
+                       "而落点是模型**另一个**输出 —— `missing` 唯一的消费方是澄清文案"
+                       "（缺哪个槽位、问哪一句）。⇒ 想让 ① 的**漏**变少，"
+                       "要改的不是 `missing` 的解析，是**落点怎么定的**"
+                       "（分类 prompt 或闸门输入）。")
+            out.append("")
+            out.append("⚠️ **别把这一格读成「闸门太窄」。** 落业务码的那些行"
+                       "**多数答得对**（终点是对的，只是没走反问那条路）；"
+                       "把「声明了却没反问」整批算成缺陷，会让修法指向"
+                       "「反问得越多越好」，而那是错的。")
+        n_incomplete = mcl.get("★不完整的尝试") or 0
+        if n_incomplete:
+            out.append("")
+            out.append("⚠️ **不完整的尝试 %s 次** —— 它们被**排除在每一个分母之外**。"
+                       "混进去的话，一次半途断掉的会话会被读成「模型答不对」，"
+                       "而真相是那一轮压根没跑完。明细：" % num(n_incomplete))
+            out.append("")
+            for item in (mcl.get("不完整的尝试明细") or []):
+                out.append("- %s" % md_text(item))
+        n_nogold = mcl.get("★★①没有 gold 的尝试") or 0
+        if n_nogold:
+            out.append("")
+            out.append("⚠️⚠️ **%s 次尝试的 ① 没有 gold** —— 这些题是多轮题，"
+                       "而**没有标 `expect_clarify`**。它们**不进 ① 和「三层全过」的"
+                       "分子分母**（分母是 %s）。"
+                       "★ 为什么不猜：唯一能猜的来源是 `intent`，而多轮题的 `intent` "
+                       "指**末轮** ⇒ 猜出来必然是「每一道都不该反问」——"
+                       "一个恒为 0 的「反问率」，而它与真值长得一模一样地印在报告里。"
+                       % (num(n_nogold), num(n_judged)))
+            out.append("")
+            for item in (mcl.get("①没有 gold 的尝试明细") or []):
+                out.append("- %s" % md_text(item))
+        n_v3 = mcl.get("★计划里没有 resumed 这一格的尝试") or 0
+        if n_v3:
+            out.append("")
+            out.append("⚠️ **%s 次尝试的 `intent_plan` 里没有 `resumed` 这一格** —— "
+                       "那份数据跑在 9.4 之前。**这时的「② = 0」是数据版本造成的，"
+                       "不是功能坏了**；判据就是这一栏。" % num(n_v3))
+        out.append("")
+        out.append("★★ **轮次边界靠 `session_id` 还原，不靠位置推算。** "
+                   "一轮多轮题把 N 轮提交在**同一个题号**下，而 `qa_log` 没有轮次列。"
+                   "「第 r 次重复的第 t 轮 = 第 r×T+t 行」依赖的是**客户端的两层循环顺序**，"
+                   "客户端一改循环就静默错位；而每次重复**新建一个会话**，"
+                   "所以「同题号 + 同 session」是**服务端看得见的事实**。")
     return out
 
 
@@ -2816,6 +3192,52 @@ def render_onepager(runs, rag):
 # selftest
 # ================================================================
 
+def undefined_global_names(src, filename="<报告生成器>"):
+    """★★ 本文件里**被引用、却从未定义**的全局名 —— 一类静态可查、却没人查的错。
+
+    ★★★ 为什么需要它（9.6a 真撞到的）：`render_metrics` 里写了 `_RD_CELLS`，
+    而常量叫 `RD_CELLS` ⇒ 一渲染到 §2.10 就 `NameError`。
+    **而 `--selftest` 35 项全绿** —— 因为它按设计「不读数据」，
+    「这份脚本到底能不能渲染」从来不在它里面。
+    名字打错在**导入期查不出来**（Python 只在执行到那一行时才解析全局名），
+    所以它一路躲过了 `py_compile`、`--selftest`，直到真跑一次渲染。
+
+    ★ 用 `symtable` 而不是正则：正则要自己复现 Python 的作用域规则
+    （内建、局部、推导式变量、`except as` 名字、`global`/`nonlocal`……），
+    而**拼错的方向恰好是漏报** —— 一个只报喜的检查比没有检查更糟。
+    `symtable` 是编译器自己用的那张表。
+
+    ⚠️ 跳过 `__x__`：`__file__` / `__name__` 由解释器提供，**不在**模块符号表里，
+    不排掉它们会得到一条恒红的断言（而那会让人把整个检查关掉）。
+    """
+    import builtins
+    import symtable
+
+    table = symtable.symtable(src, filename, "exec")
+    # ⚠️⚠️ 【不能】用 `table.get_identifiers()` 当「定义过的名字」——
+    #   它返回的是「这张表里出现过的**所有**名字」，**包括那个打错的**。
+    #   ⇒ 拿它当白名单，判据会被自己盖住，检查恒真。
+    #   ★ 实测过：第一版就是这个写法，`X = _FOO` 返回 []（而 `def g(): return _BAR` 能报）。
+    #   判据只能是符号自己的 flag：「在这张表里被绑定过」（赋值过 / import 过）。
+    defined = {s.get_name() for s in table.get_symbols()
+               if s.is_assigned() or s.is_imported()}
+    bad = set()
+
+    def walk(t):
+        for sym in t.get_symbols():
+            name = sym.get_name()
+            if name.startswith("__") and name.endswith("__"):
+                continue
+            if sym.is_referenced() and sym.is_global() and not sym.is_assigned():
+                if name not in defined and not hasattr(builtins, name):
+                    bad.add(name)
+        for child in t.get_children():
+            walk(child)
+
+    walk(table)
+    return sorted(bad)
+
+
 def selftest():
     ok = 0
     bad = []
@@ -2856,7 +3278,20 @@ def selftest():
     check("③ n=0 → (None, None)", bootstrap_ci([]) == (None, None))
 
     # ④ 切片纪律
-    check("④ MIN_SLICE_N 与 Java 侧同值（5）", MIN_SLICE_N == 5)
+    #
+    # ★★ 这一条原来写的是 `MIN_SLICE_N == 5` —— 一个【假守卫】：
+    #    它断言的是一个字面量，而上面第 90 行的注释声称它断言的是
+    #    「== report.json 里的 ★切片可信度纪律.MIN_SLICE_N」。
+    #    ⇒ 把 Java 侧的 5 改成 6，这条照样绿，而报告会给 n=5 的切片打上「可信」。
+    #    ★ 现在真的去读 Java 源码里那个常量 —— 读不到就【报错】，
+    #      不是静默通过（读不到时放行等于把守卫换成了装饰品）。
+    java_min, java_err = _java_min_slice_n()
+    check("④ MIN_SLICE_N 与 Java 侧同值（真读源码，Java=%s）" % java_min,
+          java_err is None and java_min == MIN_SLICE_N)
+    # ★ 反对照：证明这个读法【真的在读】—— 给它一个不存在的路径必须失败，
+    #   否则「读到了」可能只是函数恒返回一个默认值。
+    check("④ 反对照：源码路径不存在时必须报错，而不是回落成 5",
+          _java_min_slice_n(path="/nonexistent/EvalReportService.java")[1] is not None)
 
     # ⑤ 路径取值
     probe = {"a": {"b": {"n": 1, "值": 0.5}}}
@@ -2949,6 +3384,26 @@ def selftest():
     check("⑪ 解出的命中数越界 → 拒绝出数", oh is None and oerr)
     check("⑪ ★ 越界时只陈述观察（正向判据：说了「不下结论」）",
           "不下结论" in oerr)
+
+    # ⑫ ★★ 名字打错 —— 静态可查，而**这一项之前不存在**
+    #
+    # ★★★ 9.6a 实测：`render_metrics` 里写了 `_RD_CELLS`（常量叫 `RD_CELLS`）⇒
+    #   一渲染到 §2.10 就 NameError，而**35 项全绿**。
+    #   ⇒ 判据必须是「**这份脚本能不能渲染**」，而不是「它的口径对不对」。
+    #   ⚠️ 这一项只覆盖「名字」，覆盖不了「这一行有没有被执行到」——
+    #     所以**改完 eval_report.py 必须真跑一次渲染**（写到临时路径即可）。
+    with io.open(__file__, encoding="utf-8") as _f:
+        _own = _f.read()
+    _undef = undefined_global_names(_own)
+    check("⑫ 本文件里没有「被引用但从未定义」的全局名（%s）"
+          % (", ".join(_undef) if _undef else "无"), not _undef)
+    # ★ 反对照：守卫必须真的会咬 —— 不喂一个打错的名字，上面那条可能恒真
+    check("⑫ 反对照：故意打错的名字必须被数出来",
+          undefined_global_names(_own + "\nX = _NOT_A_REAL_NAME\n")
+          == ["_NOT_A_REAL_NAME"])
+    # ★ 反对照：解释器提供的名字不能被误报
+    check("⑫ 反对照：`__file__` 这类不算未定义",
+          "_file__" not in "".join(undefined_global_names(_own)))
 
     print("selftest: %d 项通过, %d 项失败" % (ok, len(bad)))
     for b in bad:

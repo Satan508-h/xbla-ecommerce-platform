@@ -97,11 +97,62 @@ public class EvalQuestionLoader {
      * 语料那边要登记是因为 {@code doc_type} 只能由人来判（猜不出来），
      * 而题库这边每个文件都<b>自带</b> {@code question_set} 和来源声明 ——
      * 声明就在文件里，所以「有没有声明」这件事本身是可见的。
+     *
+     * <p>⚠️ <b>「这里的每一个 {@code *.yml} 都是题库」这句话在 2026-09-26 被放宽了一格</b>：
+     * 现在每个文件要先声明 {@link #KIND_KEY}（{@code bank} / {@code gold}），
+     * 声明成 {@code gold} 的<b>不会</b>被当成题库。理由见 {@link #KIND_BANK} 那一段 ——
+     * 一句话：9.5 往这个目录放了一个判据文件，而旧的判据只能把它读成
+     * 「一个写漏了 {@code question_set} 的题库」，于是报错报得对、指向的修法却错了，
+     * 并且<b>把整条评测链一起打断了</b>。
      */
     public static final String EVAL_DIR = "data/eval";
 
-    /** 题库文件的后缀 —— 只认这两个，别的东西放在这个目录里会被忽略（并打日志） */
+    /** 题库文件的后缀 —— 只认这两个，别的东西放在这个目录里会被忽略 */
     private static final List<String> EVAL_FILE_SUFFIXES = List.of(".yml", ".yaml");
+
+    /**
+     * 每个题库文件的顶层必须自报家门：这是一个<b>题库</b>，还是一个<b>判据文件</b>。
+     *
+     * <h3>★★★ 为什么必须有这一格（它是踩出来的，不是设计出来的）</h3>
+     *
+     * <p>2026-09-26：阶段 9.5 把 {@code data/eval/recommend-gold.yml}
+     * （推荐排序的<b>人工标注判据</b>，不是题库）放进了这个目录。
+     * 于是<b>每一次 reload 都失败</b>，而
+     * {@code scripts/eval_run.py} 的第 ① 步就是 reload ——
+     * <b>整条评测链断了，而 {@code ./mvnw clean test} 全绿</b>
+     * （没有测试走这个 HTTP 端点）。
+     *
+     * <p>旧逻辑只能表达一件事：「这是一个题库，只是写漏了 {@code question_set}」。
+     * 而对一个<b>本来就不该是题库</b>的文件，它报的正是那句话 ——
+     * <b>报错是对的，报错的内容指向了错误的修法</b>。
+     *
+     * <h3>★ 为什么不是「缺 question_set 就跳过」</h3>
+     *
+     * <p>那会让<b>真的写漏了</b> {@code question_set} 的题库被静默跳过 ——
+     * 正是上面 {@link #EVAL_DIR} 那段论证要防的东西
+     * （题数从 150 变成 120，而没人知道少了什么）。
+     * <b>判据必须是「显式声明」，不是「缺什么就猜什么」。</b>
+     *
+     * <pre>
+     *   缺 kind              → 当场报错，并且【告诉你要写哪个值】
+     *   kind: gold           → 不是题库，跳过（打一条 INFO 说明它不参与任何指标）
+     *   kind: bank           → 题库，照旧走原来的全套校验
+     *   kind: 别的东西        → 当场报错（拼错了不该被当成 gold）
+     * </pre>
+     */
+    private static final String KIND_KEY = "kind";
+
+    /** 这是一个题库 —— 必须同时有 {@code question_set} / {@code source} / {@code annotated_by} */
+    private static final String KIND_BANK = "bank";
+
+    /**
+     * 这是一个<b>判据 / 标注</b>文件，不是题库 —— 跳过，不进任何指标。
+     *
+     * <p>例：{@code recommend-gold.yml}（阶段 9.5 的推荐排序人工标注）。
+     * ★ 它放在这个目录里是合理的（它和题库一样是「评测用的手写材料」），
+     * 只是<b>不能被当成题库</b>。
+     */
+    private static final String KIND_GOLD = "gold";
 
     /**
      * {@code eval_question.intent} 的<b>历史</b>占位值。
@@ -156,7 +207,8 @@ public class EvalQuestionLoader {
     private static final Set<String> QUESTION_KEYS = Set.of(
             "question_no", "question", "turns", "standalone_question",
             "category", "difficulty", "intent", "expected_answer",
-            "anchors", "allow_multiple", "expect_no_retrieval", "user_id", "notes");
+            "anchors", "allow_multiple", "expect_no_retrieval", "expect_clarify",
+            "user_id", "notes");
 
     /**
      * 锚点项允许出现的字段。
@@ -217,7 +269,8 @@ public class EvalQuestionLoader {
             String source,
             String annotatedBy,
             Long userId,
-            boolean expectNoRetrieval) {
+            boolean expectNoRetrieval,
+            Boolean expectClarify) {
 
         /**
          * ★ 这道题有没有检索目标。
@@ -377,6 +430,33 @@ public class EvalQuestionLoader {
         }
         if (root == null) {
             problems.add("[" + path.getFileName() + "] 文件是空的");
+            return;
+        }
+
+        // ── 自报家门：这个文件是不是题库 ──
+        //
+        // ★★ 它必须排在 question_set 之前：一个 kind=gold 的文件【本来就没有】
+        //    question_set，先查 question_set 会把它读成一个「写漏了的题库」——
+        //    报错的内容是对的、指向的修法是错的（见 KIND_BANK 那段）。
+        String kind = optionalString(root, KIND_KEY);
+        if (kind == null) {
+            problems.add("[" + path.getFileName() + "] 顶层缺少 " + KIND_KEY + "。"
+                    + "★ 这个目录里每个 " + EVAL_FILE_SUFFIXES + " 都必须自己声明是什么："
+                    + KIND_KEY + ": " + KIND_BANK + "（题库）或 "
+                    + KIND_KEY + ": " + KIND_GOLD + "（判据/标注，不进题库）。"
+                    + "⚠️ 【不写】不等于「默认是题库」—— 那正是这里不设默认值的理由");
+            return;
+        }
+        if (KIND_GOLD.equals(kind)) {
+            log.info("★ [{}] kind={} —— 不是题库，跳过（它不进任何指标，也不要求 question_set）",
+                    path.getFileName(), KIND_GOLD);
+            return;
+        }
+        if (!KIND_BANK.equals(kind)) {
+            problems.add("[" + path.getFileName() + "] " + KIND_KEY + "=\"" + kind
+                    + "\" 不认识。只认 " + KIND_BANK + " / " + KIND_GOLD
+                    + "。★ 拼错的值不该被当成任何一种 —— "
+                    + "当成 gold 会静默不加载，当成 bank 会报一堆看不出因果的错");
             return;
         }
 
@@ -654,6 +734,30 @@ public class EvalQuestionLoader {
         //      而「没写」必须能与「写了 0」区分开。
         Long userId = node.get("user_id") instanceof Number un ? un.longValue() : null;
 
+        // ★ 阶段 9.6a：三态 —— **不写就是「没显式声明」**，报告会回落到
+        //   「gold intent 是不是澄清分支码」（那对单轮题恰好就是答案）。
+        //
+        //   ⚠️ 这一格【刻意比别的字段严】：写了但不是布尔值 → 报错，
+        //      而不是当成「没写」。理由是这个字段的三种取值各有各的后果，
+        //      把 `expect_clarify: "true"`（字符串）静默读成 null，
+        //      等于让一条标注【看起来生效了】而报告用的是另一条规则 ——
+        //      而那正是这一列存在的目的（把「我以为它该反问」变成可判的）。
+        //      ★ 裸写 `expect_clarify:`（YAML 里就是 null）仍按「没声明」处理，
+        //        那是 YAML 里最自然的读法。
+        Boolean expectClarify = null;
+        Object clarifyNode = node.get("expect_clarify");
+        if (clarifyNode != null) {
+            if (clarifyNode instanceof Boolean b) {
+                expectClarify = b;
+            } else {
+                throw new IllegalStateException("[" + no + "] expect_clarify 只能是 true / false，"
+                        + "拿到的是 " + clarifyNode.getClass().getSimpleName()
+                        + "（" + clarifyNode + "）。★ 这一格是三态的（不写 = 回落），"
+                        + "所以「写了个别的东西」必须报错 —— 静默当成「没写」"
+                        + "会让那条标注看起来生效了，而报告用的是另一条规则");
+            }
+        }
+
         return new LoadedQuestion(
                 set,
                 no,
@@ -668,7 +772,8 @@ public class EvalQuestionLoader {
                 source,
                 annotatedBy,
                 userId,
-                expectNoRetrieval);
+                expectNoRetrieval,
+                expectClarify);
     }
 
     /**
@@ -707,6 +812,10 @@ public class EvalQuestionLoader {
         //   「有人手写 SQL 插入」时才起作用，而那时它应该拦住人（见 V12）。
         entity.setUserId(q.userId());
         entity.setExpectNoRetrieval(q.expectNoRetrieval());
+        // ★ 阶段 9.6a：三态。★ 它能被【清空】靠的是实体上那个
+        //   @TableField(updateStrategy = ALWAYS) —— updateById 默认跳过 null，
+        //   不挂它的话「从 yml 里删掉这一格」不会把库里的旧值清掉（见 V17 第三节）。
+        entity.setExpectClarify(q.expectClarify());
         // ★ 多轮那两列（V13）：单轮题写 null —— 数据库有一条 CHECK 要求这两列
         //   「同生同死」，所以这里必须【一起】写，不能只写其中一个。
         //   ⚠️ 空列表要变成 null 而不是 "[]"：`[]` 是合法的 JSON 数组，

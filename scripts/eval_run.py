@@ -442,6 +442,30 @@ def main() -> int:
         print("  对账靠 run_id 唯一 —— 复用会让两轮的行走进同一个筛子。换一个。")
         return 2
 
+    # ★★★ 上面那一问判的是【本地目录】，而 run_id 的语义在【库里】——
+    #   两个存储，都要问（docs/10 坑 52）。
+    #
+    #   洞的形状：删掉 `eval_results/<id>/` 再跑同一个 id，目录检查就不响了，
+    #   于是两轮的行落进同一个筛子 —— 而**对账照样通过**：
+    #   它的判据是「提交的 traceId 在不在库里」，防的是**行少了**，不防**行多了**。
+    #   实测（2026-09-26）：两轮 96 行（应 48）落在一起，报告把**两个版本的题库**
+    #   混着算，每一层检查都是绿的。
+    #
+    #   ⚠️ 库连不上时【必须让它失败】—— 那正是最需要这一问的时刻。
+    #     所以这里不写 try/except：`psql_json` 抛 RuntimeError 就让它把脚本终止。
+    seen = psql_json(
+        "SELECT json_agg(x) FROM ("
+        "  SELECT count(*) AS n FROM qa_log WHERE eval_run_id = %s"
+        ") x" % sql_literal(run_id), "run id 唯一性检查（库）") or []
+    n_seen = int(seen[0]["n"]) if seen else 0
+    if n_seen:
+        print("★ 这个 run id 在【库里】已经有 %d 行了：%s" % (n_seen, run_id))
+        print("  对账靠 run_id 唯一 —— 复用会把两轮的行放进同一个筛子，"
+              "而【对账查不出来】（它防行少了，不防行多了）。换一个。")
+        print("  ★ 光换 id 不够：库里那批旧行也要删，否则任何按 eval_run_id "
+              "聚合的查询都会继续捞到它们。")
+        return 2
+
     print("=" * 78)
     print("阶段 7 跑题器   run_id = %s   题集 = %s   每个题重复 %d 次"
           % (run_id, args.set, args.repeat))

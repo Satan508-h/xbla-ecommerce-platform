@@ -30,8 +30,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <h2>★★★ 为什么这个测试必须存在（它守的东西已经坏了两次）</h2>
  *
- * <p>这条查询手写了 25 个列名，而不是 {@code SELECT *}。手写是对的
+ * <p>这条查询手写了 <b>29</b> 个列名，而不是 {@code SELECT *}。手写是对的
  * （体积可控、读的人一眼看得到取什么），但<b>它和实体字段之间没有任何强制同步</b>。
+ * ⚠️ 这个数字本身漂过：7.5 之后是 25，9.2 / 9.5 / 9.6 各加过列。
+ * <b>别信这句注释里的数，信下面那段反射出来的清单</b> —— 它就是为此存在的。
  * 于是「给服务加一个新读取，忘了给查询加一列」是一个<b>必然会发生</b>的操作，
  * 而它的症状是这三种里最坏的一种：
  *
@@ -82,9 +84,12 @@ class QaLogMapperProjectionTest {
      * <p>每一行都要能说出「为什么不取」。说不出来就说明它该被取。
      */
     private static final Set<String> NOT_SELECTED = new LinkedHashSet<>(List.of(
-            // 身份与会话：评测报告按 eval_run_id 圈范围，不需要回溯到谁问的。
+            // 身份：评测报告按 eval_run_id 圈范围，不需要回溯到【谁】问的。
             // （真实用户的行这条路根本不查 —— WHERE eval_run_id = ? 已经限定了）
-            "sessionId",
+            //
+            // ★★ 9.6 更正了一处混淆：{@code sessionId} 原先被归在这一条下面，
+            //    而它和身份无关 —— 它回答的是「这几行属不属于同一次会话」。
+            //    多轮的轮次边界只能靠它还原，所以 9.6 把它取出来了。
             "userId",
             // ★ 检索【内部】的重写问题。它只服务 RetrievalPipeline 的召回，
             //   从不进生成用的消息（模型看到的一直是 question）。报告侧不需要。
@@ -92,10 +97,15 @@ class QaLogMapperProjectionTest {
             // 熔断降级事件。它服务的是「降级可归因」，报告的问题是
             // 「这一轮有没有降级」—— 那由 provider / model 两列直接回答，
             // 而它们【在】投影里（见下「按 provider 切片」那节）。
-            "degradationEvents",
-            // MCP 工具调用明细。工具体验的验收在 probe_tool.py，
-            // 报告侧只要知道「这题是不是工具题」—— 那由 intent 判。
-            "toolCalls"
+            "degradationEvents"
+            // ★★ 9.6 之后这里【只剩 3 项】。原来的 5 项里有两项到期了：
+            //    sessionId  —— 见上面那条更正，多轮分组要用；
+            //    toolCalls  —— 原理由写的是「报告侧只要知道这题是不是工具题，
+            //                  那由 intent 判」。那句在当时是对的：
+            //                  报告确实只问「该不该」。9.6 开始问
+            //                  「该调工具的题，模型调了没有」，它就必须进来。
+            //    ⚠️ 这两个都是【移除豁免】，方向和「加一项」相反 ——
+            //       加一项是让测试闭嘴，移除一项是让测试重新开始要求它。
     ));
 
     private static final String RUN = "PROJ-" + System.nanoTime() + "-";
@@ -364,6 +374,105 @@ class QaLogMapperProjectionTest {
             assertNull(back.getIntentPlan(),
                     "★ 「没发生」和「发生了但是空的」必须能区分开 —— "
                             + "查询侧 `WHERE intent_plan IS NOT NULL` 靠的就是这一点");
+        }
+    }
+
+    // ============================================================
+    // 五、★ 阶段 9.6：tool_calls + session_id（两个「到期」的豁免）
+    // ============================================================
+
+    /**
+     * ★★ 这两列和上面几列的<b>来路不同</b>：它们不是「新加的字段忘了取」，
+     * 而是<b>原来被刻意排除、9.6 到期收回</b>的。
+     *
+     * <p>所以这里除了往返，还要证明一件事：<b>收回豁免是有后果的</b> ——
+     * 如果只把 {@code NOT_SELECTED} 里那两行删掉而没往投影里加列，
+     * 一、二的测试会红；反过来，够了列却没删豁免，二、的反对照会红。
+     * 两个方向都有东西守着，这就是「一份受审的清单」该有的样子。
+     */
+    @Nested
+    @DisplayName("五、★ 阶段 9.6 的 tool_calls 与 session_id")
+    class ToolCallsAndSession {
+
+        /**
+         * ★★ 漏了这一列的症状是<b>一个看起来像好消息的 0</b>。
+         *
+         * <p>「工具选择准确率」问的是「该调工具的题，模型调了没有」。
+         * 它读不到 {@code tool_calls} 时，每一行都被判成「一次都没调」——
+         * 而报告上那一格显示的是<b>「工具调用率 0%」</b>。
+         * 读者会去查模型为什么不会用工具，而真正坏的是取数。
+         */
+        @Test
+        @DisplayName("★★ tool_calls 取得回来 —— 它是「工具选择准确率」的唯一数据源")
+        void toolCallsRoundTrip() {
+            QaLog row = new QaLog();
+            row.setTraceId("T-PROJ-" + System.nanoTime());
+            row.setQuestion("PROJ-" + SEQ.incrementAndGet());
+            row.setEvalRunId(RUN);
+            row.setEvalQuestionNo("P-" + SEQ.get());
+            row.setIntent("ORDER_LOGISTICS");
+            row.setToolCalls("""
+                    [{"round":1,"tool":"query_order_status","isError":false,\
+                    "detail":"chars=87"}]""");
+            qaLogMapper.insert(row);
+
+            QaLog back = qaLogMapper.selectByEvalRun(RUN).get(0);
+
+            assertNotNull(back.getToolCalls(),
+                    "★★★ 读成 null 的话，报告里每一行都算「一次都没调工具」——"
+                            + " 那一格会显示「工具调用率 0%」，"
+                            + "看起来像【模型不会用工具】，而坏的是取数");
+            assertTrue(back.getToolCalls().contains("query_order_status"),
+                    "★ JSONB 往返会重排键、改空白，所以只能断言内容，不能断言文本");
+            assertTrue(back.getToolCalls().contains("isError"),
+                    "★ isError 那一格决定「工具是答了还是失败了」，报告要数它");
+        }
+
+        /**
+         * ★★ 漏了这一列的症状是<b>一个看起来像题库写错了的 0</b>。
+         *
+         * <p>一轮多轮题把 N 轮提交在<b>同一个题号</b>下，而 {@code qa_log} 没有轮次列。
+         * 分组要靠会话：每一次重复新建一个会话，所以「同题号下同一 session 的这几行」
+         * 就是一次完整的多轮尝试。这一列读成 null 时，所有行归成一组 ——
+         * 报告会显示「多轮题每一道都只跑了一轮」，而真正的病因在投影。
+         */
+        @Test
+        @DisplayName("★★ session_id 取得回来 —— 多轮的轮次边界只能靠它还原")
+        void sessionIdRoundTrip() {
+            long sessionId = 9_600_000L + SEQ.incrementAndGet();
+            QaLog row = new QaLog();
+            row.setTraceId("T-PROJ-" + System.nanoTime());
+            row.setQuestion("PROJ-" + SEQ.incrementAndGet());
+            row.setEvalRunId(RUN);
+            row.setEvalQuestionNo("P-" + SEQ.get());
+            row.setSessionId(sessionId);
+            qaLogMapper.insert(row);
+
+            QaLog back = qaLogMapper.selectByEvalRun(RUN).get(0);
+
+            // ★ 这一列【没有外键】—— 和 chat_session.user_id 不同（那一列有 FK，
+            //   因为它是身份，会因为伪造的头把会话写崩）。所以这里不需要先造一个会话。
+            assertNotNull(back.getSessionId(),
+                    "★★★ 读成 null 的话，多轮题的全部行会归成同一组 ——"
+                            + " 报告显示「每道多轮题都只跑了一轮」，那个 0 看起来像题库写错了");
+            assertEquals(sessionId, back.getSessionId().longValue(),
+                    "★ 原样读回来。分组靠的是「相等的两个值」，不是「某个范围」");
+        }
+
+        @Test
+        @DisplayName("★★ 反对照：没调工具的行读回来是 null，不是 []")
+        void absentToolCallsStaysNull() {
+            // ★ 先插、再查：反过来的话那一行还没落库，findFirst 会抛在空流上，
+            //   而失败信息会指向「没有行」而不是「这一列读到了什么」。
+            QaLog inserted = insertRow();
+            QaLog back = qaLogMapper.selectByEvalRun(RUN).stream()
+                    .filter(r -> r.getId().equals(inserted.getId()))
+                    .findFirst().orElseThrow();
+
+            assertNull(back.getToolCalls(),
+                    "★ 「一次都没调」和「调了但是空的」必须能区分开 ——"
+                            + " 前者是【模型没用工具】，后者是【工具循环跑了但一次都没发出】，"
+                            + "两者的修法相反。同 tool_calls / references / intent_plan 那条全库约定");
         }
     }
 }

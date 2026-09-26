@@ -269,6 +269,48 @@ class EntityMappingTest {
         System.out.println("✅ 数据库拒绝「有 turns 没有 standalone_question」的半成品");
     }
 
+    /**
+     * ★★★ 阶段 9.6a：{@code expect_clarify} 必须能被【清回 NULL】。
+     *
+     * <p>MyBatis-Plus 的 {@code updateById} 默认策略是 {@code NOT_NULL} ——
+     * <b>null 字段被静默跳过</b>。而「把这一格从 yml 里删掉」正是这个字段的
+     * <b>正常用法之一</b>（想退回「没标注」）。不挂
+     * {@code @TableField(updateStrategy = ALWAYS)} 的话：
+     *
+     * <pre>
+     *   从 yml 删掉 expect_clarify → 库里的旧值【不会被清掉】
+     *   → 报告继续用那个陈旧的显式值 → 文件与库不一致，而没有任何东西会报错
+     * </pre>
+     *
+     * <p>★ 判据必须是**走 {@code updateById} 这条真实路径**（加载器就是它），
+     * 而不是手写 SQL —— 手写 SQL 当然能清掉，那验的不是这条注解。
+     * <p>同 9.4 的坑 41（清空一列必须显式 {@code set}，不能用 {@code updateById}）。
+     */
+    @Test
+    @DisplayName("★★★ expect_clarify 能被清回 NULL（updateStrategy=ALWAYS 的判据）")
+    void expectClarifyCanBeClearedBackToNull() {
+        EvalQuestion q = new EvalQuestion();
+        q.setQuestionNo("Q-TEST-CLARIFY");
+        q.setQuestion("它值得买吗");
+        q.setIntent("SCENARIO_PICK");
+        q.setQuestionSet("stage9-clarify-multi");
+        q.setExpectClarify(true);
+        evalQuestionMapper.insert(q);
+
+        assertThat(evalQuestionMapper.selectById(q.getId()).getExpectClarify())
+                .as("先确认它真的写进去了（否则下面那条是恒真的）")
+                .isTrue();
+
+        EvalQuestion again = evalQuestionMapper.selectById(q.getId());
+        again.setExpectClarify(null);
+        evalQuestionMapper.updateById(again);
+
+        assertThat(evalQuestionMapper.selectById(q.getId()).getExpectClarify())
+                .as("★★★ 读回来还是 true 的话 = updateById 把 null 跳过了 ⇒ "
+                        + "「从 yml 里删掉这一格」静默失效，而报告会继续用陈旧的显式值")
+                .isNull();
+    }
+
     @Test
     @DisplayName("★ vector(1024) 向量列读写：写入 float[]，读回来还是同一个 float[]")
     void insertKbChunk_shouldRoundTripVectorColumn() {

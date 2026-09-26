@@ -75,10 +75,24 @@ class EvalQuestionLoaderTest {
         Files.writeString(dir.resolve(name), content, StandardCharsets.UTF_8);
     }
 
+    /** 最小题目 + 一格 {@code expect_clarify}（{@code literal} 原样写进去，便于造坏值） */
+    private static String withClarify(String questionNo, String literal) {
+        return questionFile("stage7", "x", "y", questionNo, "退货要几天")
+                .replace("    difficulty: 1\n",
+                        "    difficulty: 1\n    expect_clarify: " + literal + "\n");
+    }
+
+    private static EvalQuestionLoader.LoadedQuestion one(
+            List<EvalQuestionLoader.LoadedQuestion> qs, String questionNo) {
+        return qs.stream().filter(q -> q.questionNo().equals(questionNo))
+                .findFirst().orElseThrow(() -> new AssertionError("没加载到 " + questionNo));
+    }
+
     /** 一份最小的合法文件，只有 header 里的字段可以换 */
     private static String questionFile(String questionSet, String source, String annotatedBy,
                                        String questionNo, String question) {
         return """
+                kind: bank
                 question_set: %s
                 source: %s
                 annotated_by: %s
@@ -94,6 +108,24 @@ class EvalQuestionLoaderTest {
                     anchors:
                       - text: 退款在三个工作日内发起
                 """.formatted(questionSet, source, annotatedBy, questionNo, question);
+    }
+
+    /**
+     * 一个 {@code kind: gold} 的文件 —— <b>不是题库</b>。
+     *
+     * <p>它刻意写成一个**看起来完全像题库但没有 {@code question_set}** 的样子：
+     * 这正是 {@code recommend-gold.yml} 在 2026-09-26 那次的真实形状。
+     */
+    private static String goldFile() {
+        return """
+                kind: gold
+                version: 1
+                annotated_at: 2026-09-26
+
+                needs:
+                  - id: G-001
+                    note: 这一份是判据，不是题库
+                """;
     }
 
     // ============================================================
@@ -144,6 +176,155 @@ class EvalQuestionLoaderTest {
                     .hasMessageContaining("缺少 source")
                     .hasMessageContaining("no-annotator.yml")
                     .hasMessageContaining("缺少 annotated_by");
+        }
+    }
+
+    // ============================================================
+    // 一·五、★★★ kind：这个文件是不是题库（阶段 9.6）
+    // ============================================================
+
+    /**
+     * <h2>★★★ 这一节的成因是一次【真实的断链】，不是假想</h2>
+     *
+     * <p>2026-09-26：阶段 9.5 把 {@code recommend-gold.yml}（推荐排序的人工判据，
+     * 不是题库）放进了 {@code data/eval/}。旧逻辑只能把它读成
+     * 「<b>一个写漏了 question_set 的题库</b>」，于是<b>每一次 reload 都失败</b> ——
+     * 而 {@code scripts/eval_run.py} 的第 ① 步就是 reload，
+     * <b>整条评测链断了，而 {@code ./mvnw clean test} 全绿</b>
+     * （没有测试走这个 HTTP 端点）。
+     *
+     * <p>★ 所以这一节守的<b>不是</b>「加载器会不会报错」（旧逻辑报了，报得很响），
+     * 而是「<b>报错的内容指不指向正确的修法</b>」。旧报错说「缺少 question_set」——
+     * 于是最自然的修法是给一个<b>根本不是题库</b>的文件补一个 {@code question_set}，
+     * 那会把它静默地变成一套只有 0 道题的题集。
+     *
+     * <p>★★ 而「缺 kind 就默认按 bank 处理」会把这个错误换个方向重演：
+     * 真的写漏了 {@code question_set} 的题库会被当成「没声明」——
+     * 所以这里<b>不设默认值</b>，缺了就报错。
+     */
+    @Nested
+    @DisplayName("一·五、★★★ kind：这个文件是不是题库")
+    class KindDeclaration {
+
+        @Test
+        @DisplayName("★★ kind: gold 的文件不进题库，同一目录里的 bank 照常加载")
+        void goldIsSkippedAndBankStillLoads() throws IOException {
+            writeFile("bank.yml", questionFile("stage7", "x", "y", "X-001", "退货要几天"));
+            writeFile("recommend-gold.yml", goldFile());
+
+            EvalQuestionLoader.Result result = loader().reload(dir, null);
+
+            assertThat(result.questions()).hasSize(1);
+            assertThat(result.questions().get(0).questionNo()).isEqualTo("X-001");
+
+            // ★★ 反对照：把同一个文件的 kind 改成 bank，它就必须【失败】。
+            //    没有这一半的话，上面那条可能只是因为加载器压根没扫到那个文件
+            //    （比如它把不认识的文件默默滤掉了）—— 那样「gold 被跳过」就是一句空话。
+            writeFile("recommend-gold.yml", goldFile().replace("kind: gold", "kind: bank"));
+            assertThatThrownBy(() -> loader().reload(dir, null))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("recommend-gold.yml")
+                    .hasMessageContaining("缺少 question_set");
+        }
+
+        @Test
+        @DisplayName("★★★ 缺 kind 必须报错，而且报错要说清该写哪个值")
+        void missingKindIsRejected() throws IOException {
+            writeFile("q.yml", questionFile("stage7", "x", "y", "X-001", "退货要几天")
+                    .replace("kind: bank\n", ""));
+
+            assertThatThrownBy(() -> loader().reload(dir, null))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("q.yml")
+                    .hasMessageContaining("缺少 kind")
+                    // ★ 判据不止是「报错了」，还要「说得清该写什么」——
+                    //   一句话的报错会让人去猜，而猜错的那个修法
+                    //   正是 9.5 那次事故里最自然的那一个
+                    .hasMessageContaining("bank")
+                    .hasMessageContaining("gold");
+        }
+
+        @Test
+        @DisplayName("★ kind 拼错 → 报错，不当成 gold 静默跳过")
+        void unknownKindIsRejected() throws IOException {
+            writeFile("q.yml", questionFile("stage7", "x", "y", "X-001", "退货要几天")
+                    .replace("kind: bank\n", "kind: golds\n"));
+
+            assertThatThrownBy(() -> loader().reload(dir, null))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("不认识");
+        }
+
+        @Test
+        @DisplayName("★★ 只有 gold 的目录 → 报「没有加载到任何题目」，而不是静默成功")
+        void goldOnlyDirectoryFailsLoudly() throws IOException {
+            writeFile("recommend-gold.yml", goldFile());
+
+            assertThatThrownBy(() -> loader().reload(dir, null))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("没有加载到任何题目");
+        }
+    }
+
+    // ============================================================
+    // 一·六、★ expect_clarify：三态（阶段 9.6a）
+    // ============================================================
+
+    /**
+     * <h2>★★ 这个字段的要害全在【第三态】上</h2>
+     *
+     * <p>它回答的是「多轮题的第 1 轮该不该被澄清闸门反问」，而报告在
+     * 没标注时判<b>不可判</b>（排除出分子分母），**不猜**。
+     *
+     * <p>★ 「猜」为什么更糟：唯一能猜的来源是 gold intent，而多轮题的
+     * intent 描述的是<b>末轮</b> ⇒ 猜出来必然是「每一道都不该反问」——
+     * 一个恒为 0 的「反问率」，读起来像「澄清机制从来没生效」。
+     * 而那个值与真值长得一模一样地印在报告里。
+     *
+     * <p>⚠️ 它和 {@code expect_no_retrieval} 的差别也在这里：那一列是
+     * {@code NOT NULL DEFAULT false}（默认值对每一道题都恰好成立），
+     * 这一列不行 —— 同一个常量在多轮题上必然错。
+     */
+    @Nested
+    @DisplayName("一·六、★ expect_clarify（三态）")
+    class ExpectClarify {
+
+        @Test
+        @DisplayName("★★ 三态：true / false / 不写(null)")
+        void triState() throws IOException {
+            writeFile("t.yml", withClarify("X-001", "true"));
+            writeFile("f.yml", withClarify("X-002", "false"));
+            writeFile("n.yml", questionFile("stage7", "x", "y", "X-003", "保修期是多久"));
+
+            List<EvalQuestionLoader.LoadedQuestion> qs = loader().reload(dir, null).questions();
+
+            assertThat(one(qs, "X-001").expectClarify()).isTrue();
+            assertThat(one(qs, "X-002").expectClarify()).isFalse();
+            assertThat(one(qs, "X-003").expectClarify())
+                    .as("★ 不写 = null，【不是】false —— "
+                            + "「没标注」和「标注为不该反问」是两件事，"
+                            + "合并之后一道该反问而没标的题会静默变成一次假阳")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("★★ 反对照：写了非布尔值 → 报错，不当成「没写」")
+        void nonBooleanIsRejected() throws IOException {
+            writeFile("bad.yml", withClarify("X-001", "\"true\""));
+
+            assertThatThrownBy(() -> loader().reload(dir, null))
+                    .as("★ 静默当成「没写」会让那条标注看起来生效了，"
+                            + "而报告用的是另一条规则 —— 那正是这一列存在的目的")
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("expect_clarify");
+        }
+
+        @Test
+        @DisplayName("★ 反对照：没写这一格的文件照常加载（它不是必填）")
+        void absentIsFine() throws IOException {
+            writeFile("n.yml", questionFile("stage7", "x", "y", "X-001", "退货要几天"));
+
+            assertThat(loader().reload(dir, null).questions()).hasSize(1);
         }
     }
 
@@ -291,6 +472,7 @@ class EvalQuestionLoaderTest {
             when(chunkMapper.findIdsByContentAnchor(anyString())).thenReturn(List.of(1001L));
 
             writeFile("a.yml", """
+                    kind: bank
                     question_set: stage7
                     source: x
                     annotated_by: y
@@ -323,6 +505,7 @@ class EvalQuestionLoaderTest {
                     .thenReturn(List.of(2002L));
 
             writeFile("a.yml", """
+                    kind: bank
                     question_set: stage7
                     source: x
                     annotated_by: y
@@ -430,6 +613,7 @@ class EvalQuestionLoaderTest {
         /** 一道最小的「不检索」题 —— 没有 anchors 段，只有那一行声明 */
         private static String noRetrievalFile(String extra) {
             return """
+                    kind: bank
                     question_set: stage7
                     source: corpus_driven_manual
                     annotated_by: Claude
@@ -504,6 +688,7 @@ class EvalQuestionLoaderTest {
             //   结尾走，报出「mapping values are not allowed here」这种
             //   和真实原因无关的错（写这个测试时就踩了一次）
             writeFile("a.yml", """
+                    kind: bank
                     question_set: stage7
                     source: corpus_driven_manual
                     annotated_by: Claude
@@ -574,6 +759,7 @@ class EvalQuestionLoaderTest {
         /** 一道最小的合法多轮题 —— turns 两轮，末尾要补 standalone_question 等字段 */
         private static String multiTurnFile(String set, String extra) {
             return """
+                    kind: bank
                     question_set: %s
                     source: corpus_driven_manual
                     annotated_by: Claude
@@ -671,6 +857,7 @@ class EvalQuestionLoaderTest {
         @DisplayName("★★ turns 只有一轮 → 失败（本轮该写进单轮题库）")
         void oneTurnIsNotMultiTurn() throws IOException {
             writeFile("m.yml", """
+                    kind: bank
                     question_set: stage7-multi
                     source: corpus_driven_manual
                     annotated_by: Claude
@@ -725,6 +912,7 @@ class EvalQuestionLoaderTest {
         @DisplayName("★ 空的轮次 → 失败（跑题器会发一句空问题，那个失败会被记成「模型不行」）")
         void blankTurnFails() throws IOException {
             writeFile("m.yml", """
+                    kind: bank
                     question_set: stage7-multi
                     source: corpus_driven_manual
                     annotated_by: Claude
@@ -821,6 +1009,7 @@ class EvalQuestionLoaderTest {
         @DisplayName("★★ session_no 有自己的解释（它会让 repeat 串味，症状像好消息）")
         void sessionNoGetsItsOwnExplanation() throws IOException {
             writeFile("m.yml", """
+                    kind: bank
                     question_set: stage7-multi
                     source: corpus_driven_manual
                     annotated_by: Claude

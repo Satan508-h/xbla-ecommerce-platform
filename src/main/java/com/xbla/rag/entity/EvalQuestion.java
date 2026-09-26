@@ -1,6 +1,7 @@
 package com.xbla.rag.entity;
 
 import com.baomidou.mybatisplus.annotation.FieldFill;
+import com.baomidou.mybatisplus.annotation.FieldStrategy;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
@@ -131,6 +132,63 @@ public class EvalQuestion {
      * 而不必去猜「空数组是声明的还是写错了」—— <b>让数据自己说清楚</b>。
      */
     private Boolean expectNoRetrieval;
+
+    /**
+     * <b>多轮题第 1 轮</b>该不该被澄清闸门反问（阶段 9.6a）。
+     *
+     * <p>★★ <b>三态</b>：
+     *
+     * <pre>
+     *   null   = 没显式声明 ⇒ 报告判它「不可判」，排除出 ① 的分子分母
+     *   true   = 这一轮该被反问
+     *   false  = 这一轮不该被反问
+     * </pre>
+     *
+     * <h3>★ 为什么需要它：多轮题的「首轮该不该反问」原本没有 gold</h3>
+     *
+     * <p>9.6 的多轮澄清判据第 ① 层是「首轮反问发生了没」，而题库里没有一个字段
+     * 回答得了它 —— 因为 {@link #intent} 的语义<b>随题库类型而变</b>：
+     *
+     * <pre>
+     *   单轮题：intent 就是这一轮的意图 ⇒ 是不是澄清码就是答案   （推得出来，不必标）
+     *   多轮题：intent 描述的是【末轮】（见 standaloneQuestion） （推不出来，必须标）
+     * </pre>
+     *
+     * <p>实测（2026-09-26）：8 道多轮澄清题的首轮反问率 12/24 = 50%，
+     * 而其中 <b>3 道题的首轮不反问是对的</b>（问的是退货政策，本来就不依赖商品）。
+     * <b>没有这一列就分不出「系统少反问了一次」和「我的场景前提不成立」</b> ——
+     * 而这两件事一个要改闸门、一个要改题。
+     *
+     * <h3>★★ 为什么不是 {@code NOT NULL DEFAULT false}（同 {@link #expectNoRetrieval}）</h3>
+     *
+     * <p>那一列的默认值对<b>每一道题</b>都恰好成立，所以能当默认值。
+     * 这一列不行 —— 它会把「<b>没标注</b>」和「<b>标注为不该反问</b>」合并成一个值，
+     * 而那正是全库那条约定禁掉的事（「没有发生」和「发生了但是空的」必须能区分开）。
+     * ⚠️ 而且合并出来的那个值<b>还是错的</b>：一道该反问而没标的题会静默地
+     * 变成一次「不该反问却反问了」的假阳 —— 一个指向反方向的结论。
+     *
+     * <p>★★ <b>报告不做任何回落。</b> 唯一能回落的来源是 gold intent
+     * （单轮题上恰好正确），而多轮澄清那一段只处理多轮题 —— 所以这一格
+     * 必须由人<b>显式写出来</b>。
+     *
+     * <h3>⚠️ 为什么挂 {@code updateStrategy = ALWAYS}（全实体唯一的例外）</h3>
+     *
+     * <p>MyBatis-Plus 的 {@code updateById} 默认策略是 {@code NOT_NULL} ——
+     * <b>null 字段被静默跳过</b>。而「把这一格从 yml 里删掉」正是这个字段的
+     * <b>正常用法之一</b>（想退回回落值）。不挂 ALWAYS 的话：
+     *
+     * <pre>
+     *   从 yml 删掉 expect_clarify → 库里的旧值【不会被清掉】
+     *   → 报告继续用那个陈旧的显式值 → 文件与库不一致，而没有任何东西会报错
+     * </pre>
+     *
+     * <p>同 9.4 的坑 41（清空一列必须显式 {@code set}，不能用 {@code updateById}）。
+     * ★ 这里用注解而不是在那个 upsert 里手写 {@code lambdaUpdate}，是因为
+     * <b>{@code EvalQuestionMapper.updateById} 全仓只有加载器一个调用点</b> ——
+     * 注解的作用域因此是可枚举的。
+     */
+    @TableField(updateStrategy = FieldStrategy.ALWAYS)
+    private Boolean expectClarify;
 
     /**
      * 多轮题的完整轮次（JSON 字符串数组，按时间顺序）。单轮题为 {@code null}。
