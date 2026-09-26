@@ -33,10 +33,11 @@
  * `ChatAskResponse` 里 —— 所以它们是「回答结束时一次性到位」，
  * 而不是边流边出现。这不是缺陷：那些值在生成结束前本来就不确定。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 
 import { getTrace, listMessages, listSessions, streamChat } from '../api.js'
+import { setTrackContext } from '../track.js'
 import MessageBubble from '../components/MessageBubble.vue'
 import QueueBanner from '../components/QueueBanner.vue'
 import SessionList from '../components/SessionList.vue'
@@ -152,6 +153,32 @@ const streaming = ref(false)
  * 界面上也不必假装它是个登录 —— 所以这里就是一个直白的输入框。
  */
 const userId = ref('8')
+
+/**
+ * ★★ 把身份和会话号推给埋点模块。
+ *
+ * ## 为什么是「推进去」而不是「当参数传下去」
+ *
+ * 埋点要的是**当前会话的上下文**（谁、在哪个会话里），那是全局状态，
+ * 不是某个组件自己的数据。靠 props 逐层传的话：
+ *
+ * ```
+ *   ChatView → MessageBubble → (将来) 新组件 …
+ * ```
+ *
+ * 每加一个会埋点的组件都要再接一遍，而**漏传的症状是
+ * 「user_event.user_id 全是空」** —— 静默，且看起来像「都是匿名用户」。
+ *
+ * ★ 收口在这里之后，「埋点需要什么上下文」只有这一处答案。
+ *
+ * ⚠️ `immediate: true` 不能漏：没有它，**页面加载后到第一次改身份之间**
+ * 那段时间里埋点是匿名的。而「点第一条回答的引用」正好落在那段时间里。
+ */
+watch(
+  [userId, activeSessionNo],
+  ([u, s]) => setTrackContext({ userId: u, sessionNo: s }),
+  { immediate: true },
+)
 
 const queue = reactive({
   position: null,

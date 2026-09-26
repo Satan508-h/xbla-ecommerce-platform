@@ -14,16 +14,20 @@
 面向电商场景（商品咨询、规格对比、促销政策、售后服务）的企业级 **RAG 智能问答平台**。
 核心不是"能聊天"，而是**检索质量可量化、可优化、可复现**。
 
-**当前阶段**：阶段 8（前端 + 部署）—— **8.1 ~ 8.6 / 8.8 已实现【并实测】✅ 2026-09-24**，
-**8.7（内网穿透）未做**（选型已定 cpolar，但**没有开** —— 开它 = 把服务暴露到公网，是外向动作）。
-★ 测试数 824 → **860**。前端在 `frontend/`（Vue 3 + Vite + Element Plus），部署在 `deploy/`。
+**当前阶段：阶段 0 ~ 9 全部完成 ✅ 2026-09-26。**
+阶段 8（前端 + 部署）8.1~8.6 / 8.8 已实测（2026-09-24）；
+阶段 9（Agentic RAG）9.1 ~ 9.6b 全部完成并实测
+（9.1~9.5 于 2026-09-25，9.6a / 9.6b 于 2026-09-26）。
+⚠️ **唯一刻意未做的是 8.7 内网穿透** —— 开它 = 把服务暴露到公网，是外向动作。
+前端在 `frontend/`（Vue 3 + Vite + Element Plus），部署在 `deploy/`。
+测试数 824 → 860 → 870 → 915 → 999 → 1049 → 1087 → 1092 → 1106 → 1122 → 1139 → **1197**。
 
-★★ **阶段 9（Agentic RAG）进行中 —— 9.1 ~ 9.5 已完成并实测 ✅ 2026-09-25，
-9.6a（离线指标）已完成 ✅ 2026-09-26，只剩 9.6b（在线）** 见 `docs/10`。
-测试数 860 → 870 → 915 → 999 → 1049 → 1087 → 1092 → 1106 → 1122 → **1139**。
-★ **9.6b 的前置已完成**（2026-09-26）：引用卡片可点看原文 + 反馈 UI + 埋点出口
-  `frontend/src/track.js`（★ 它**真的往 console 打**，所以「有事件可埋」当场可验）。
-  ⚠️ **反馈现在只活在页面会话里**（不落库）—— `user_event` 表还没建。
+★ **9.6b（在线指标，2026-09-26）**：`user_event` 表（**V18**）+
+  `POST /api/events` + `GET /api/status/metrics` + 前端 `sendBeacon` 真埋点。
+  ★★ **这个项目里没有「转化」** —— 前端没有可点的商品（回答正文是纯文本、
+  商品号点不动），硬报 `product_click` 就是编数据。改叫**「引用点击率」**，
+  它量的是「想看原文」（ADR-103）。
+  ★ 率的**分子分母必须同侧时钟**（都用服务端那两列），否则窗口边界上率会 > 1。
 ★ 工具从 3 个扩到 **6 个**，并且**按意图裁剪**（白名单，见下 §九）。
 ★ 唯一一个**混合轮**叶子：`SCENARIO_PICK`（先检索、再给工具）。
 ★ 9.4 让澄清反问变成**多轮**：反问的槽位状态存一列、下一轮读出来拼进分类 prompt
@@ -311,6 +315,16 @@ python scripts/probe_stage8.py --url http://localhost -u 用户:口令   # ★ �
 curl -s localhost:8080/api/chat/sessions | python -m json.tool          # 会话列表（★ 已排评测流量）
 curl -s "localhost:8080/api/chat/trace/<traceId>" | python -m json.tool # 技术面板的数据
 curl -s localhost:8080/api/status/ratelimit | python -m json.tool       # ★ 生产也存在的只读状态
+# ── 阶段 9.6b：在线指标（★ 全都不花钱，除探针第 3 段）──
+python scripts/probe_stage96.py              # ★★ 26 项；第 3 段要真的问一句（≈0.0002 元）
+python scripts/probe_stage96.py --no-model   # 跳过第 3 段，完全不花钱
+curl -s "localhost:8080/api/status/metrics?window=all" | python -m json.tool
+#   ★ window = 24h（缺省）| 7d | all；⚠️ 非法值不报错，换成 24h 并写进 requestedWindow
+#   ★★ 两组数【分开看】：traffic/latency 来自 qa_log（有历史），
+#      behavior 来自 user_event（★ 从零开始）。notes 里带着口径一起发。
+curl -s -X POST localhost:8080/api/events -H 'Content-Type: application/json' \
+  -d '{"eventNo":"demo-1","eventType":"ref_click","traceId":"xxx","occurredAt":"2026-09-26T15:00:00+08:00"}'
+#   ★ 永远回 200，结局在 data.outcome：WRITTEN / DUPLICATE / DISCARDED
 #   ★ 注意 /api/status 和 /api/debug 的区别：后者 @Profile("local")，公网上必须 404
 
 # ── 一次性 / 重建 ──
@@ -544,6 +558,12 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
   本项目**每一个 404 都曾被渲染成 500**（阶段 8 才发现，因为那之前没有「必须 404」的判据）。
   已加显式 handler → 404 + DEBUG 级日志。（坑 30）
   ★ 判据：**任何想要特定状态码的异常都必须显式注册** —— 兜底 handler 的代价。
+  ★★ **这句话当时只兑现了一半**（9.6b 才发现）：`HttpMessageNotReadableException`
+  （畸形 JSON）和 `HttpMediaTypeNotSupportedException`（错的 Content-Type）
+  **也没注册** ⇒ 全项目每个 POST 端点都把它们变成 **500**（应该 400 / 415）。
+  危害不是「功能坏了」是**信号坏了**：一次客户端错误被报成服务故障，**会触发告警**。
+  ★ 已修。★ 发现方式：给新端点写 HTTP 层用例时**顺手撞出来的** ——
+  **那些用例会走「请求根本进不到方法里」那几条路，而它们以前没人走过。**（坑 54）
 - ★★ **新的 not-found 场景必须继承 `ResourceNotFoundException`**（不要自己有样学样写
   `@ResponseStatus`、也别新加 `@ExceptionHandler`）—— 父类那条 handler 是**唯一**的注册点。
   ⚠️ **漏了不会报错，只会静默变 500**，而 **service 层的测试一条都不会红**（它们不经过 HTTP 层）。
@@ -569,6 +589,19 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
 - ★ **SSE 解析器在 `frontend/src/api.js`**，手写的（ADR-011）。
   三件必须做对的事：`\n\n` 分帧、`TextDecoder` 带 `{stream:true}`（**中文会被切在 chunk 边界**）、
   服务端事件名是 `failed` 不是 `error`。
+- ★★ **埋点全部走 `frontend/src/track.js` 一个出口**（9.6b）—— 组件只调
+  `track(type, {...})`，不知道上报方式。**别在组件里直接 `sendBeacon`**：
+  换上报方式时漏掉一处的症状是「那个事件永远收不到」，没有任何报错。
+  ★ 它**真的往 console 打一条** —— 这是这个模块唯一的验收手段（F12 看得见）。
+- ★★ **`sendBeacon` 有两个硬约束，违反了都不报错**（9.6b）：
+  ① **不能设自定义请求头** ⇒ 身份（`userId`）只能在**请求体**里，
+     不能走 `X-Xbla-User-Id`。**别「顺手改成走 header」** —— 那样编译通过、
+     单测通过，而浏览器发出去的身份会变成 `null`（症状：`user_event.user_id` 全是空）；
+  ② **body 必须包成 `type: 'application/json'` 的 `Blob`** ——
+     传字符串会发 `Content-Type: text/plain` ⇒ **415**（修之前是 500，见坑 54）。
+- ★ **`crypto.randomUUID` 只在安全上下文里存在**（https 或 localhost）——
+  内网穿透用 http 打开时它是 `undefined`，症状是**幂等键全丢、埋点被静默丢弃**。
+  `track.js` 里退回到 `crypto.getRandomValues` 手工拼 v4。
 
 ### 身份与 Agentic RAG（阶段 9）
 
