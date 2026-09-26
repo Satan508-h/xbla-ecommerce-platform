@@ -200,6 +200,12 @@ python scripts/probe_stage8.py --url http://localhost -u xbla:<口令>
 
 # 后端启动（密钥从 application-local.yml 读，那个文件已 gitignore）
 ./mvnw spring-boot:run
+#   ★★ 它绑的是 0.0.0.0（Spring Boot 默认）——【共享网络里别人能打到它】，
+#      而它跑 local profile ⇒ 7 个 debug 控制器全开，
+#      其中 /api/debug/llm/chat 能无条件烧你的 API 额度。
+#      auth_basic 是【nginx 的】，不在 8080 身上（2026-09-26 实测：局域网 IP → 200）。
+#      ⇒ 共享网络里请加：--server.address=127.0.0.1
+#      详见 docs/07 §六 E5
 
 # 前端（开发，5173，已配 /api 代理 → 8080）
 cd frontend && npm install && npm run dev
@@ -315,6 +321,13 @@ python scripts/probe_stage8.py --url http://localhost -u 用户:口令   # ★ �
 curl -s localhost:8080/api/chat/sessions | python -m json.tool          # 会话列表（★ 已排评测流量）
 curl -s "localhost:8080/api/chat/trace/<traceId>" | python -m json.tool # 技术面板的数据
 curl -s localhost:8080/api/status/ratelimit | python -m json.tool       # ★ 生产也存在的只读状态
+# ── 暴露面（★ 开隧道【之前】跑，见 docs/07 §六）──
+python scripts/probe_exposure.py --url http://localhost -u 用户:口令   # 打 Nginx 那一侧
+#   ★★ 验：debug 端点 404 / 私有文档 404 / 四种错误状态码 / 数据库端口；
+#      并把「已知边界」再摆一遍（身份头可编、知识库可写、单价）。
+#   ★ 不花钱、不写库、不改状态。判据在代码里，别照着清单手抄。
+#   ⚠️ 打 :8080 开发实例时【1】必然全红（它跑 local profile）—— 脚本会先说这句
+
 # ── 阶段 9.6b：在线指标（★ 全都不花钱，除探针第 3 段）──
 python scripts/probe_stage96.py              # ★★ 26 项；第 3 段要真的问一句（≈0.0002 元）
 python scripts/probe_stage96.py --no-model   # 跳过第 3 段，完全不花钱
@@ -559,12 +572,22 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
   本项目**每一个 404 都曾被渲染成 500**（阶段 8 才发现，因为那之前没有「必须 404」的判据）。
   已加显式 handler → 404 + DEBUG 级日志。（坑 30）
   ★ 判据：**任何想要特定状态码的异常都必须显式注册** —— 兜底 handler 的代价。
-  ★★ **这句话当时只兑现了一半**（9.6b 才发现）：`HttpMessageNotReadableException`
-  （畸形 JSON）和 `HttpMediaTypeNotSupportedException`（错的 Content-Type）
-  **也没注册** ⇒ 全项目每个 POST 端点都把它们变成 **500**（应该 400 / 415）。
-  危害不是「功能坏了」是**信号坏了**：一次客户端错误被报成服务故障，**会触发告警**。
-  ★ 已修。★ 发现方式：给新端点写 HTTP 层用例时**顺手撞出来的** ——
-  **那些用例会走「请求根本进不到方法里」那几条路，而它们以前没人走过。**（坑 54）
+  ★★ **这句话当时只兑现了一半**，而且是**分两批**补齐的（都是 2026-09-26）：
+  ```
+  第一批（坑 54）  HttpMessageNotReadableException     → 400   畸形 JSON
+                   HttpMediaTypeNotSupportedException  → 415   错的 Content-Type
+  第二批（暴露面审计）HttpRequestMethodNotSupportedException → 405  用错动词
+                   MethodArgumentTypeMismatchException → 400   参数类型不对
+  ```
+  ⇒ **四个都曾经是 500。** 危害不是「功能坏了」是**信号坏了**：
+  一次客户端错误被报成服务故障，**监控按 500 计数时会触发告警**。
+  ★★ **两批的发现方式都不是「读代码」，都是「拿没人会发的请求去打端点」**：
+  第一批是给新端点写 HTTP 层用例时的副产品（那条用例的本意只是「空体不该 500」），
+  第二批是用**错的 HTTP 方法**去探端点存不存在（405=在，404=不在）时撞出来的。
+  ⇒ **判据：新端点写完，顺手发几个「没意义的请求」给它 —— 会顺带体检整个 handler 链。**
+  ★ 加新 handler 时别忘了：**405 要带 `Allow` 头**（RFC 9110 §15.5.6）；
+  **400 只回参数名，不回客户端传的那个值**（原样回进 body 是一次反射式注入）。
+  ★★ **改完要重建容器镜像才算数** —— 容器跑的是旧 jar，本地测绿了不代表公网绿了。
 - ★★ **新的 not-found 场景必须继承 `ResourceNotFoundException`**（不要自己有样学样写
   `@ResponseStatus`、也别新加 `@ExceptionHandler`）—— 父类那条 handler 是**唯一**的注册点。
   ⚠️ **漏了不会报错，只会静默变 500**，而 **service 层的测试一条都不会红**（它们不经过 HTTP 层）。

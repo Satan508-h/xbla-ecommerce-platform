@@ -1,6 +1,7 @@
 package com.xbla.rag.controller;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -10,7 +11,9 @@ import org.springframework.test.web.servlet.MockMvc;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -140,5 +143,80 @@ class RequestBindingErrorMappingTest {
         //      那是唯一出处，这里只是把「不该是 5xx」再钉一遍
         mvc.perform(post(ENDPOINT).contentType(MediaType.APPLICATION_JSON).content("{oops"))
                 .andExpect(status().is4xxClientError());
+    }
+
+    // ============================================================
+    // 同一批审计抓出来的另外两条（2026-09-26）
+    // ============================================================
+
+    @Nested
+    @DisplayName("三、用错方法 / 参数类型不对")
+    class AuditFindings {
+
+        /**
+         * ★★ 这条的来历：做暴露面审计时，我用「错的 HTTP 方法」去探端点存不存在
+         * （405 = 存在，404 = 不存在）—— <b>结果全是 500</b>。
+         *
+         * <p>★ 那条探测的<b>本意不是查 bug</b>，只是想确认「这个端点在不在」。
+         * 同一天里同一个手法已经抓出两批了。
+         */
+        @Test
+        @DisplayName("★★ 用错 HTTP 方法 → 405（不是 500）")
+        void wrongMethodIs405() throws Exception {
+            // ★ `/api/chat` 只收 POST（GET 的是 /api/chat/stream）——
+            //   而且它是【早就存在】的端点，与本项目任何新端点无关
+            mvc.perform(get("/api/chat"))
+                    .andExpect(status().isMethodNotAllowed())
+                    .andExpect(jsonPath("$.code").value(405));
+        }
+
+        /**
+         * ★★ 405 <b>必须</b>带 {@code Allow} 头（RFC 9110 §15.5.6）。
+         *
+         * <p>缺了它，调用方只能猜「到底该用什么方法」。
+         * ★ Spring 已经把那个集合准备好了 —— 是<b>我们自己的</b>路由信息，
+         * 回出去安全。
+         */
+        @Test
+        @DisplayName("★★ 405 带 Allow 头（RFC 要求），且里面是 POST")
+        void methodNotAllowedCarriesAllowHeader() throws Exception {
+            mvc.perform(get("/api/chat"))
+                    .andExpect(status().isMethodNotAllowed())
+                    .andExpect(header().string("Allow", containsString("POST")));
+        }
+
+        @Test
+        @DisplayName("★★ 查询参数类型不对 → 400（不是 500）")
+        void badParamTypeIs400() throws Exception {
+            // `limit` 是 int，传 abc ⇒ MethodArgumentTypeMismatchException
+            mvc.perform(get("/api/chat/sessions").param("limit", "abc"))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value(400));
+        }
+
+        /**
+         * ★★ 消息里回<b>参数名</b>（我们自己的），<b>不回客户端传的那个值</b>。
+         *
+         * <p>把客户端发来的字符串原样回进 body 就是一次反射式内容注入 ——
+         * 同这个类里那几条「不回 e.getMessage()」。
+         */
+        @Test
+        @DisplayName("★★ 回参数名，绝不回客户端传的那个值")
+        void messageNamesParameterButEchoesNoInput() throws Exception {
+            mvc.perform(get("/api/chat/sessions").param("limit", "<script>alert(1)</script>"))
+                    .andExpect(status().isBadRequest())
+                    // ★ 参数名要回 —— 调用方立刻知道该改哪个
+                    .andExpect(jsonPath("$.message").value(containsString("limit")))
+                    // ★★ 而客户端发来的那个串一个字符都不能出现
+                    .andExpect(jsonPath("$.message").value(not(containsString("script"))));
+        }
+
+        @Test
+        @DisplayName("★ 反：合法参数 → 200（不是「什么都 400」）")
+        void validParamIsFine() throws Exception {
+            mvc.perform(get("/api/chat/sessions").param("limit", "1"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.code").value(0));
+        }
     }
 }

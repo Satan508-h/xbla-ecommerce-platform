@@ -8,15 +8,20 @@ import com.xbla.rag.ratelimit.QueueRejectedException;
 import com.xbla.rag.service.ResourceNotFoundException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+
+import java.util.Set;
 
 import java.util.stream.Collectors;
 
@@ -380,6 +385,73 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
                 .body(ApiResponse.fail(HttpStatus.UNSUPPORTED_MEDIA_TYPE.value(),
                         "请求体的 Content-Type 不支持，本接口要 application/json"));
+    }
+
+    /**
+     * <b>用错 HTTP 方法</b> —— 比如对一个只收 POST 的端点发 GET。
+     *
+     * <h3>★★ 它和上面那两条是【同一批审计】抓出来的</h3>
+     *
+     * <p>2026-09-26 做暴露面审计时，我用「错的 HTTP 方法」去探端点存不存在
+     * （405 = 存在，404 = 不存在）—— 结果**全是 500**。
+     *
+     * <p>★ 这个发现方式值得记：那条探测的**本意不是查 bug**，
+     * 只是想确认「这个端点在不在」。同一天里同一个手法已经抓出两批了
+     * （另一批是 {@code /api/events} 的 400/415）。
+     * ⇒ <b>拿一个「没人会发的请求」去打端点，会顺带体检整个 handler 链。</b>
+     *
+     * <h3>★★ 405 按 RFC 必须带 {@code Allow} 头</h3>
+     *
+     * <p>见 RFC 9110 §15.5.6：405 响应<b>必须</b>生成一个 {@code Allow} 头，
+     * 列出这个资源支持的方法。缺了它，调用方只能猜「到底该用什么方法」。
+     *
+     * <p>★ 而 Spring 在 {@code HttpRequestMethodNotSupportedException} 上
+     * 已经把那个集合准备好了（{@code getSupportedHttpMethods()}）——
+     * 这些是<b>我们自己的</b>路由信息，不是客户端发来的东西，回出去是安全的。
+     *
+     * <p>⚠️ <b>但 {@code e.getMethod()}（客户端发的方法名）不回进 body</b> ——
+     * 它原样来自请求行。同上面两条：客户端发来的东西不进响应体。
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethodNotSupported(
+            HttpRequestMethodNotSupportedException e) {
+        log.debug("HTTP 方法不支持（正常事件）: {}", e.getMessage());
+
+        ResponseEntity.BodyBuilder builder = ResponseEntity
+                .status(HttpStatus.METHOD_NOT_ALLOWED);
+        // ★ RFC 9110 §15.5.6：405 必须带 Allow
+        Set<HttpMethod> allowed = e.getSupportedHttpMethods();
+        if (allowed != null && !allowed.isEmpty()) {
+            builder.allow(allowed.toArray(new HttpMethod[0]));
+        }
+        return builder.body(ApiResponse.fail(HttpStatus.METHOD_NOT_ALLOWED.value(),
+                "这个接口不支持该 HTTP 方法，请看响应头里的 Allow"));
+    }
+
+    /**
+     * <b>查询参数的类型对不上</b> —— 比如 {@code ?limit=abc} 而 {@code limit} 是 {@code int}。
+     *
+     * <h3>★★ 它是 400，不是 500 —— 而且理由和上面几条一样</h3>
+     *
+     * <p>调用方把参数写错了。回 500 会让<b>监控按服务故障计数</b>，
+     * 而真相是「有人拼错了一个查询串」。
+     *
+     * <h3>★ 消息里回【参数名】，不回【客户端传的那个值】</h3>
+     *
+     * <p>{@code e.getName()} 是<b>我们自己代码里那个参数的名字</b>（{@code limit}），
+     * 回出去既安全又有用 —— 调用方立刻知道该改哪个参数。
+     *
+     * <p>⚠️ 而 {@code e.getValue()} 是<b>客户端发来的字符串</b>，原样回进 body
+     * 就是一次反射式内容注入。同上面三条：<b>客户端发来的东西不进响应体。</b>
+     * 完整信息在 DEBUG 日志里。
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ApiResponse<Void>> handleTypeMismatch(
+            MethodArgumentTypeMismatchException e) {
+        log.debug("查询参数类型不匹配（正常事件）: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.fail(HttpStatus.BAD_REQUEST.value(),
+                        "参数 " + e.getName() + " 的格式不对"));
     }
 
     /**
