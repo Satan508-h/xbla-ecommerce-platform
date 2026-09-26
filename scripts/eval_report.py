@@ -54,15 +54,21 @@ import eval_ab  # noqa: E402  ★ 纪律 ②：比较逻辑只有这一份
 
 DEFAULT_ROLES = {
     # 主体：数据形状最完整的那一轮（有 sizes 段 → 归因可判定）
-    "main": "20260922-stage7-run2",
-    # 噪声底：与 main 同配置、早一轮（T6 的产出）
-    "noise": "20260921-stage7",
+    # ★ 2026-09-26 换期：阶段 9 之后的第一对同配置轮（9.6a 跑的）。
+    #   ⚠️ RAGAS 挂在【主轮】上（下面 DEFAULT_RAGAS 同一个 runId）——
+    #      §4.2 的分层要求「RAGAS 的 runId 在本次报告的四轮里」，挂错就整段跳过。
+    "main": "20260926-stage7-plan",
+    # 噪声底：与 main 同配置、同一天跑的另一轮（9.6a 那一对）
+    "noise": "20260926-stage7-plan-b",
     # 对比基线：阶段 4 的 20 题
     "baseline": "20260921-baseline",
     # 假配置：baseline + final-top-k=1（证明矩阵抓得到已知的差）
     "baseline_bad": "20260922-baseline-bad",
     # 多轮集：单独一套题、单独分母
-    "multi": "20260921-stage7-multi",
+    # ★ 2026-09-26 换期：9.6a 新跑的 stage9 多轮集（带 expect_clarify，V17）
+    #   ⚠️ 老的 20260921-stage7-multi 没有 expect_clarify 那三列，
+    #      换过来之后「多轮澄清」那一段才算得出来
+    "multi": "20260926-stage9-clarify-multi",
 }
 
 # ★ T8 迭代实验：噪声【链】+ 三条轴。
@@ -72,8 +78,10 @@ DEFAULT_ROLES = {
 DEFAULT_T8_NOISE = "20260922-stage7-run2,20260923-t8-noise,20260923-t8-noise2"
 DEFAULT_T8_AXES = ("20260923-t8-rerank-off,20260923-t8-topk8,20260924-t8-mc20")
 
-DEFAULT_RAGAS = os.path.join("20260921-stage7", "ragas-sample43.json")
-DEFAULT_RAGAS_NEG = os.path.join("20260921-stage7", "ragas-negative-control.json")
+# ★ 2026-09-26 换期：RAGAS 重跑在新主轮上（9.6a 那两条命令，见 docs/06 §4.5）。
+#   ⚠️ 路径必须与 DEFAULT_ROLES["main"] 是同一个 runId，否则 §4.2 分层拿不到。
+DEFAULT_RAGAS = os.path.join("20260926-stage7-plan", "ragas-sample43.json")
+DEFAULT_RAGAS_NEG = os.path.join("20260926-stage7-plan", "ragas-negative-control.json")
 
 RAGAS_METRICS = ["faithfulness", "answer_relevancy", "context_recall", "answer_correctness"]
 
@@ -1151,13 +1159,34 @@ def render_metrics(runs):
                      (get_path(rb, "检索决策.gate分布") or {}).get(k))[0], ""]
         for k in sorted(set((get_path(ra, "检索决策.gate分布") or {}))
                         | set((get_path(rb, "检索决策.gate分布") or {})))]))
-    n_plan_off = (get_path(rb, "检索决策.gate分布") or {}).get("PLAN_OFF")
-    if not n_plan_off:
+    # ★★ 三个「0」的眼睛不一样，不能一起读成「没问题」：
+    #   一个是「**没测过**」，两个是「**隐形的好消息**」。
+    #   ⚠️ 不写这一段，三行 `0` 在表里长得一模一样（这一笔账的全部意义就在这）。
+    ZERO_MEANING = [
+        ("PLAN_OFF",
+         "「业务相关但不用检索」那条路（`KB` 意图 ∧ **模型主动关掉检索**）——"
+         "⚠️ **它不是「这条分支没问题」，是「它没被测过」。**"
+         "★ 已知在阶段 9.2 的 11 条样本里也是 0（那批问法全被分成了 `OUT_OF_SCOPE`，"
+         "走的是 `NONE_INTENT`，模型那一格根本没派上用场）。"),
+        ("NONE_DISABLED",
+         "「`NONE` 也检索」= **9.2 之前的行为**（回退开关 `gate.none-intent-skip-retrieval` 打开时）——"
+         "`0` 意味着**那个开关是关着的**。★ 这是**好消息**，"
+         "而它在加这一段之前是**隐形的**：开关万一被打开，兜底题会悄悄退回到「跑一遍全池召回」，"
+         "其余指标一格不动。"),
+        ("NO_CLASSIFY",
+         "分类失败 / 没开意图识别 / 模型编了个 code（走回退路径）——"
+         "`0` 意味着**分类一次都没失败过**，`shape=JSON` 那个判据也是靠它兜底的。"
+         "★ 同样是隐形的：这一支一旦非 0，那些行会**混进 `KB` 里**，从表上分不出来。"),
+    ]
+    gates_main = get_path(rb, "检索决策.gate分布") or {}
+    zeros = [(k, why) for k, why in ZERO_MEANING if not gates_main.get(k)]
+    if zeros:
         out.append("")
-        out.append("⚠️ **`PLAN_OFF` = %s —— 这条分支一次都没被走到过。**"
-                   "它是「业务相关但不用检索」那条路（`KB` 意图 ∧ 模型主动关掉检索），"
-                   "已知在阶段 9.2 的 11 条样本里也是 0。**它不是「这条分支没问题」，"
-                   "是「它没被测过」。**" % num(n_plan_off))
+        out.append("★★ **下面这几个分支这一期都是 0 —— 但三个 `0` 的意思完全不同，"
+                   "不要一起读成「没问题」：**")
+        out.append("")
+        for k, why in zeros:
+            out.append("- `%s` = 0：%s" % (k, why))
     flip = get_path(rb, "检索决策.★跨次决策翻转的题") or []
     out.append("")
     out.append("- ★ **跨次决策翻转的题**（同一题重复跑，决策不一致）：%s"
@@ -1203,9 +1232,27 @@ def render_metrics(runs):
     over_try = get_path(rb, "工具调用.★越权的调用") or []
     out.append("- ★ 越权的调用（尝试）：%s" % (_codes(over_try) if over_try else "无"))
     drop = get_path(rb, "工具调用.★给了工具却一次没调的行") or []
-    out.append("- ★★ **给了工具却一次没调的行**：%s"
-               % (_codes(drop) if drop
-                  else "**0 行** ✅（门控给了工具，模型就真的用了）"))
+    # ★★ 这一列**天然很长**（每行带一段 traceId + 三个工具名），实测一期 42 条
+    #   挤在一行里 ≈ 4 KB —— 读不了。★ 所以：先报**条数**，再截断，**并留下痕迹**
+    #   （坑 45：截断不留痕 = 那句话「读起来就是完整的」）。
+    #   ★ 完整清单在 `report.json` 的那一格（机器可读的那一份不截断）。
+    DROP_SHOW = 8
+    if not drop:
+        out.append("- ★★ **给了工具却一次没调的行**：**0 行** ✅"
+                   "（门控给了工具，模型就真的用了）")
+    else:
+        # 原始形状是 "SP-001（trace=36f7e758…, 给了 [search_products, …]）"，
+        # ★ 压成 `题号@短trace` —— 工具清单是**同一批**，每行重复一遍没有信息量。
+        def _short(s):
+            q = s.split("（", 1)[0]
+            parts = s.split("trace=", 1)
+            return "%s@%s" % (q, parts[1][:8] if len(parts) > 1 else "?")
+        shown = ", ".join("`%s`" % _short(x) for x in drop[:DROP_SHOW])
+        tail = ("，**（其余 %d 条略 —— 完整清单在 `report.json` 的"
+                " `工具调用.★给了工具却一次没调的行` 那一格，那一份不截断）**"
+                % (len(drop) - DROP_SHOW) if len(drop) > DROP_SHOW else "")
+        out.append("- ★★ **给了工具却一次没调的行**（**%d 条**）：%s%s"
+                   % (len(drop), shown, tail))
     out.append("")
     out.append("★ 判据是「**调了没有**」，不是「答对了没有」—— 工具答对内容由 "
                "`probe_tool.py` 那 30 项负责，这里只管**工具链有没有走通**。"
@@ -1731,6 +1778,17 @@ def _ragas_layers(owner, rag, by_metric):
         else:
             out.append("③ `B 分类错误` 的 `faithfulness` 是 %s，低于正确的 %s。"
                        % (rat(mean_of(fb)), rat(mean_of(fa))))
+        # ★★ 这一条**必须带上 n** —— 它是三层里最小的一层，
+        #   而 §4.3 已经立过规矩：「n=3 不作为结论」。
+        #   ⚠️ 同一份报告里不能一处拿 n=3 下结论、另一处说 n=3 不算数。
+        if len(fb) <= 5:
+            out.append("   - ⚠️ **但 `B` 这一层只有 n=%d** —— 按本报告 §4.3 立的规矩"
+                       "（「n=3 不作为结论」），③ 这句话**只能当假设，不能当结论**。"
+                       "★ ② 的 n 与它相同，同样读作方向性提示。"
+                       "★ 而且 `B` **天然就小**：它是「真的判歪了」那一层，"
+                       "分类准确率越高它越小 —— 所以**它永远涨不到能下结论的规模**，"
+                       "除非特地去构造一批「分类必错」的题。"
+                       % len(fb))
         out.append("")
     bad = detail["C gold 不可达"]
     if bad:
