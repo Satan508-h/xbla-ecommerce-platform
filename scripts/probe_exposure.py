@@ -108,6 +108,38 @@ def code_of(resp):
     return resp[0]
 
 
+def call_ctype(method, path, timeout=15):
+    """
+    只取 (状态码, Content-Type)。
+
+    ## ★★ 为什么需要它：有些判据【光看状态码分不开两件事】
+
+    实测（2026-09-26）：打 nginx 时 `/actuator/env` 回 **200** ——
+    但那是前端那个 `index.html`（`Content-Type: text/html`），
+    不是 actuator 的 JSON。因为 nginx 没有 `/actuator` 的 location，
+    请求掉进了 `location /` 的 `try_files`。
+
+    ```
+      真泄露      200 + application/vnd.spring-boot.actuator.v3+json
+      没到应用    200 + text/html          ← ★ 同一个状态码
+    ```
+
+    ★ 同 `docs/10` 坑 24（`jsonPath(...).exists()` 分不清「键不存在」和
+    「键是 null」）—— 一个分不开两件事的判据，比没有判据更坏：
+    **它会在报告里印一个看起来很确定的值。**
+    """
+    req = urllib.request.Request(BASE + path, method=method)
+    if AUTH:
+        req.add_header("Authorization", "Basic " + AUTH)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers.get("Content-Type")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Content-Type")
+    except Exception:
+        return None, None
+
+
 def preflight():
     """
     ★★★ 先确认「你打的是本应用」—— 不通过就**直接退出**，不往下跑。
@@ -183,26 +215,57 @@ def probe_debug_surface():
           else "★ 生产 profile 下这些控制器根本没注册（不是「注册了但拦住了」）")
 
     # actuator 白名单
+    #
+    # ★★★ 判据【不能只看状态码】—— 这一条第一次真跑时就误报了。
+    #
+    #   原来的写法是「200 就算泄露」，而实测（2026-09-26，打 nginx）：
+    #
+    #     /actuator/env    → 200  Content-Type: text/html  858 字节
+    #                        响应体是 <!DOCTYPE html>… 前端那个 index.html
+    #
+    #   nginx 没有 /actuator 的 location，请求掉进 location / 的
+    #   try_files ⇒ **SPA fallback 也回 200**。于是「真泄露」和
+    #   「根本没到应用」在状态码上一模一样 —— 又一个**看起来合法的 200**。
+    #
+    #   ⇒ 判据改成看 Content-Type：actuator 回的是
+    #     `application/vnd.spring-boot.actuator.v3+json`（或 json），
+    #     而 SPA fallback 回 `text/html`。
     allow = {"health", "info", "circuitbreakers", "circuitbreakerevents"}
-    leaked = []
+    leaked, html_fallback = [], []
     for name in ("env", "beans", "configprops", "mappings", "heapdump"):
-        st = code_of(call("GET", f"/actuator/{name}"))
-        if st == 200:
+        st, ctype = call_ctype("GET", f"/actuator/{name}")
+        if st == 200 and "html" in (ctype or "").lower():
+            html_fallback.append(name)
+        elif st == 200:
             leaked.append(name)
     check("actuator 没有泄露配置类端点（env/beans/configprops/mappings/heapdump）",
-          not leaked, f"★ 泄露了：{leaked}" if leaked
+          not leaked,
+          f"★ 真泄露了（回的是 JSON）：{leaked}" if leaked
           else f"白名单内的是 {sorted(allow)}")
-    # ★ 白名单内的那几个【从隧道到不了】：nginx 只配了 /api/ /docs/ /assets/ /
-    #   所以 /actuator/** 会掉进 SPA fallback。这里顺带确认一下它没被代理出去
-    st = code_of(call("GET", "/actuator/health"))
-    if st == 200:
-        note("actuator/health 在这里是 200 —— 说明你打的【不是 nginx 那一侧】",
-             ["★ 本机直连 8080 时 actuator 是可达的（开发实例本来就这样）。",
-              "  走隧道（nginx:80）时它到不了：nginx 没有 /actuator 的 location，",
-              "  会掉进 location / 的 try_files 返回 index.html。"])
+
+    if html_fallback:
+        note("这些 /actuator 路径回的是【前端 index.html】，不是 actuator",
+             [f"{html_fallback}",
+              "★ 说明 nginx 没有 /actuator 的 location，请求掉进了 SPA fallback。",
+              "  ⇒ 它们【到不了应用】。这是好事 —— 但别把那个 200 读成「泄露了」。",
+              "⚠️ 本探针第一次真跑时就在这里误报过一次（判据只看了状态码）。"])
+    # ★ 白名单内的那几个（health/info/circuitbreakers）【从 nginx 到不了】：
+    #   nginx 只配了 /api/ /docs/ /assets/ /，所以 /actuator/** 会掉进 SPA fallback。
+    #
+    #   ⚠️ 判据同样【不能只看状态码】—— 见上面那段：SPA fallback 也回 200。
+    #      ★ 这一条原来写的是「health 是 200 ⇒ 你打的不是 nginx」，
+    #        而实测在 nginx 上它【也是 200】（index.html）。
+    #        同一个错误在这个函数里犯了两次 —— 都是「拿状态码当判据」。
+    st, ctype = call_ctype("GET", "/actuator/health")
+    if st == 200 and "html" in (ctype or "").lower():
+        check("★ actuator 从 nginx 这一侧【到不了】（掉进 SPA fallback）", True,
+              "★ 它回的是 index.html，不是 actuator 的 JSON")
+    elif st == 200:
+        note("actuator 在这一侧是【真的可达】—— 说明你打的是开发实例（:8080）",
+             ["★ 本机直连 8080 时 actuator 本来就在（开发实例的原样）。",
+              "  走 nginx / 隧道时它到不了：没有对应的 location，会掉进 try_files。"])
     else:
-        check("★ actuator 从这一侧【到不了】（nginx 没有它的 location）",
-              st is not None, f"实际 {st}")
+        check("★ actuator 从这一侧【到不了】", st is not None, f"实际 {st}")
 
 
 # ============================================================
@@ -313,9 +376,28 @@ def probe_ports():
     #     5432/6379 绑的是 127.0.0.1 ⇒ 从本机当然连得上，那是它们【该】有的样子。
     #     ⚠️ 让它红是个坏主意：**假失败会训练人忽略失败**，
     #     而这一节的全部价值就是「真失败时你会当场停下来」。
+    # ★★★ 隧道域名也要跳过 —— 理由和本机不同，但结果一样：**判据是真空的**。
+    #
+    #     对 `xxx.trycloudflare.com:5432` 发起 connect，连的是
+    #     **Cloudflare 的边缘**，不是你这台机器。
+    #     它「连不上」只证明「Cloudflare 不代理 5432」—— 一句废话。
+    #
+    #     ⚠️ 而那个 ✅ 看起来和真的一样。**一个真空通过的判据比没有判据更坏**：
+    #        它会让人以为「数据库端口已经验过了」。
+    #
+    #     ★ 这一节只对【直连的公网 IP / 域名】有判据（比如自己有台 VPS）。
+    TUNNEL_SUFFIXES = (".trycloudflare.com", ".cpolar.cn", ".cpolar.io",
+                       ".ngrok.io", ".ngrok-free.app", ".localtunnel.me")
+
     if host in ("localhost", "127.0.0.1", "::1"):
         print("  ⏭  目标是本机 —— 5432/6379 绑的正是 127.0.0.1，从本机当然连得上。")
-        print("      这一节只在打【公网地址】时有判据。")
+        print("      这一节只在打【公网直连地址】时有判据。")
+    elif host.endswith(TUNNEL_SUFFIXES):
+        print(f"  ⏭  目标是【隧道域名】（{host}）—— 这一节在这里是【真空】的。")
+        print("      对它发起的 connect 连的是隧道的【边缘服务器】，不是你这台机器；")
+        print("      「连不上」只证明隧道不代理那个端口，是一句废话。")
+        print("      ⚠️ 那个 ✅ 看起来和真的一样 —— 所以这里【不产出】它。")
+        print("      ★ 要真验数据库端口，请打【直连的公网 IP】（比如自己有台 VPS）。")
     else:
         for port, name in ((5432, "PostgreSQL"), (6379, "Redis"), (5050, "pgAdmin")):
             s = socket.socket()
@@ -327,12 +409,16 @@ def probe_ports():
                 open_ = False
             finally:
                 s.close()
+            # ★ detail 只在【失败】时才带上那句解释 ——
+            #   在 ✅ 旁边写「★ 连上了」会让读的人以为连上了（实测踩过）
             check(f"{name} ({port}) 连不上", not open_,
-                  "★ 连上了 —— 如果这一侧是公网，它已经暴露了")
+                  "★ 连上了 —— 如果这一侧是公网，它已经暴露了" if open_ else "")
 
     note("应用容器【没有】映射到宿主机",
-         ["cpolar 只转发 80，所以隧道能碰到的只有 Nginx 那一层。",
-          "★ 这让「不小心把应用直接暴露出去」变成一个连不上，而不是一个静默的泄露。"])
+         ["隧道只转发 80，所以它能碰到的只有 Nginx 那一层。",
+          "★ 这让「不小心把应用直接暴露出去」变成一个连不上，而不是一个静默的泄露。",
+          "★ 顺带：这条也解释了为什么本机测 nginx（http://localhost）"
+          "与隧道那一侧几乎等价 —— 差的只有第一跳。"])
 
 
 # ============================================================
