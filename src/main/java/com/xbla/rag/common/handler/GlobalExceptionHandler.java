@@ -10,6 +10,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -317,6 +319,67 @@ public class GlobalExceptionHandler {
         log.debug("请求了不存在的路径（正常事件）: {}", e.getMessage());
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.fail(HttpStatus.NOT_FOUND.value(), "接口不存在"));
+    }
+
+    /**
+     * <b>请求体读不出来</b> —— 畸形 JSON、字段类型对不上、body 是空的
+     * 而 {@code @RequestBody} 没标 {@code required = false}。
+     *
+     * <h3>★★★ 它和上面那条是【同一个洞的另一半】，而且发现得晚得多</h3>
+     *
+     * <p>{@link #handleNoResource} 的注释里写着「任何想要特定状态码的异常
+     * 都必须显式注册」。那次修的是 <b>404</b>，而这条是 <b>400</b> ——
+     * <b>同一句话当时只兑现了一半。</b>
+     *
+     * <pre>
+     *   不注册它 → HttpMessageNotReadableException 落到兜底 → 500「服务内部错误」
+     *   ✗ 客户端分不清「我发的 JSON 是坏的」和「服务炸了」
+     *   ✗ ★ 监控按 500 计数时，一次【客户端错误】被报成【服务故障】
+     *   ✗ 写一行 ERROR + 堆栈，而这类请求每天都有（扫描器、手打的 curl、
+     *     前端某个分支发了个半截对象）
+     * </pre>
+     *
+     * <p>★★ <b>发现它的方式值得记下来</b>：它不是在读代码时看出来的，
+     * 是给<b>一个新端点</b>补 HTTP 层用例时<b>顺手撞出来的</b> ——
+     * 而那条用例的本意只是「空请求体不该 500」。
+     * ⇒ <b>给新端点补 HTTP 层用例，会顺带体检整个 handler 链</b>：
+     * 那些用例会走「请求根本进不到方法里」那几条路，而它们以前没有人走过。
+     *
+     * <h3>★ 为什么是 400，为什么记 DEBUG</h3>
+     *
+     * <p>400 而不是 500：<b>这是调用方的问题，不是我们的</b>；
+     * 而 DEBUG 而不是 ERROR：同 {@link #handleNoResource} 那条 ——
+     * 「有人发了一段读不出来的 JSON」是完全正常的事，<b>不该告警</b>。
+     *
+     * <p>⚠️ 消息里<b>不回</b> {@code e.getMessage()}：Jackson 的解析异常
+     * 会带上出错位置的原文片段，那可能包含客户端发来的任何东西。
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleUnreadableBody(HttpMessageNotReadableException e) {
+        log.debug("请求体读不出来（正常事件）: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.fail(HttpStatus.BAD_REQUEST.value(), "请求体不是合法的 JSON"));
+    }
+
+    /**
+     * <b>请求体的媒体类型不支持</b> —— 比如 {@code Content-Type: text/plain}。
+     *
+     * <p>⚠️ 不修的话这条路上是 <b>500</b>：客户端写错了一个头，
+     * 而服务端报「内部错误」—— 那会让排查从「检查请求头」开始，
+     * 而不是从「检查服务」开始。
+     *
+     * <p>★ 判据：{@code RequestBindingErrorMappingTest} 对着
+     * <b>早就存在的</b> {@code /api/chat} 发一个 {@code text/plain}，断言 415。
+     * 刻意<b>不</b>用任何新端点 —— 这个 bug 是跨端点的，
+     * 用老端点验出来的结论才与「某个新端点」无关。
+     */
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleUnsupportedMediaType(
+            HttpMediaTypeNotSupportedException e) {
+        log.debug("请求体的媒体类型不支持（正常事件）: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+                .body(ApiResponse.fail(HttpStatus.UNSUPPORTED_MEDIA_TYPE.value(),
+                        "请求体的 Content-Type 不支持，本接口要 application/json"));
     }
 
     /**
