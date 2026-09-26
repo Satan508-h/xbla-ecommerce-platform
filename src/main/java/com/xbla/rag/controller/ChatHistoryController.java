@@ -3,8 +3,10 @@ package com.xbla.rag.controller;
 import com.xbla.rag.common.ApiResponse;
 import com.xbla.rag.dto.ChatMessageView;
 import com.xbla.rag.dto.ChatSessionSummary;
+import com.xbla.rag.dto.ReferenceDetail;
 import com.xbla.rag.dto.TraceDetail;
 import com.xbla.rag.service.ChatHistoryQueryService;
+import com.xbla.rag.service.ChatReferenceQueryService;
 import com.xbla.rag.service.ChatTraceQueryService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -30,6 +32,11 @@ import java.util.List;
  * <p>分开的实际收益是<b>边界看得见</b>：
  * 「这个类里不会有任何一次模型调用」是一个光看类名就能成立的判断，
  * 而不是需要读完整个文件才知道的事。
+ *
+ * <p>★ 类名里的「History」宽了半格：除了会话和消息，这里还有两个
+ * <b>回看一次已发生的问答</b>的接口（{@code /trace/{traceId}} 和
+ * {@code /refs/{traceId}/{chunkId}}）。它们和会话历史的共同点正是那条边界 ——
+ * <b>都只读、都按精确键查、都不花钱</b>。真正的判据是那条边界，不是类名。
  */
 @Slf4j
 @RestController
@@ -38,11 +45,14 @@ public class ChatHistoryController {
 
     private final ChatHistoryQueryService chatHistoryService;
     private final ChatTraceQueryService chatTraceQueryService;
+    private final ChatReferenceQueryService chatReferenceQueryService;
 
     public ChatHistoryController(ChatHistoryQueryService chatHistoryService,
-                                 ChatTraceQueryService chatTraceQueryService) {
+                                 ChatTraceQueryService chatTraceQueryService,
+                                 ChatReferenceQueryService chatReferenceQueryService) {
         this.chatHistoryService = chatHistoryService;
         this.chatTraceQueryService = chatTraceQueryService;
+        this.chatReferenceQueryService = chatReferenceQueryService;
     }
 
     /**
@@ -104,5 +114,49 @@ public class ChatHistoryController {
     @GetMapping("/trace/{traceId}")
     public ApiResponse<TraceDetail> trace(@PathVariable("traceId") String traceId) {
         return ApiResponse.ok(chatTraceQueryService.traceDetail(traceId));
+    }
+
+    /**
+     * 一条引用的<b>原文</b> —— 前端「点开引用看原文」的数据源（9.6b 前置）。
+     *
+     * <pre>
+     * curl -s localhost:8080/api/chat/refs/&lt;traceId&gt;/15 | python -m json.tool
+     * </pre>
+     *
+     * <h3>★★ 路径里为什么必须有 {@code traceId}</h3>
+     *
+     * <p>只有 {@code chunkId} 的话，这就是一个<b>知道 id 就能读任意切片</b>的接口
+     * —— 而 {@code kb_chunk.id} 是 {@code BIGSERIAL}，连续自增，枚举成本约等于零。
+     * 带上 {@code traceId} 之后，服务端会先确认<b>这一片真的被这条回答引用过</b>
+     * 才去取正文，而 {@code traceId} 是一次性、不可猜的。
+     *
+     * <p>⇒ <b>能读到的切片只剩「已经随某次回答给出去过的那些」。</b>
+     * 这不是把口子关小，是把它关到只剩一条缝 —— 见
+     * {@link com.xbla.rag.service.ChatReferenceNotFoundException} 的类注释。
+     *
+     * <h3>★ 它为什么在这个类里（而不是新的控制器）</h3>
+     *
+     * <p>因为它和上面的 {@code /trace/{traceId}} 是同一类东西：
+     * <b>读 {@code qa_log}、按精确键查、零成本</b>。这个类的边界判据
+     * 「这里不会有任何一次模型调用」在它身上同样成立。
+     *
+     * <h3>⚠️ 历史消息里的引用【点不开】—— 这是已批准的边界</h3>
+     *
+     * <p>{@code chat_message} 里没有 {@code trace_id}（阶段 8 拍板「技术面板
+     * 只服务当前回答」的直接后果），所以历史消息<b>构造不出这个请求</b>。
+     * 前端对此的表达是「历史消息取不到原文」，而不是让用户点了没反应。
+     *
+     * @throws com.xbla.rag.service.ChatTraceNotFoundException      没有这个 traceId → 404
+     * @throws com.xbla.rag.service.ChatReferenceNotFoundException   有这条记录，
+     *         但它的引用里没有这个切片 → 404。★ 正常情况下不该发生：
+     *         前端手上的 chunkId 就是从同一条 {@code references} 里来的
+     * @throws com.xbla.rag.service.KbChunkNotFoundException         引用有效，
+     *         但切片正文已经查不到了 → 404
+     */
+    @GetMapping("/refs/{traceId}/{chunkId}")
+    public ApiResponse<ReferenceDetail> reference(
+            @PathVariable("traceId") String traceId,
+            @PathVariable("chunkId") Long chunkId) {
+        return ApiResponse.ok(chatReferenceQueryService.referenceDetail(traceId, chunkId));
     }
 }

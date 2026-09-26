@@ -20,7 +20,10 @@
 
 ★★ **阶段 9（Agentic RAG）进行中 —— 9.1 ~ 9.5 已完成并实测 ✅ 2026-09-25，
 9.6a（离线指标）已完成 ✅ 2026-09-26，只剩 9.6b（在线）** 见 `docs/10`。
-测试数 860 → 870 → 915 → 999 → 1049 → 1087 → 1092 → 1106 → **1122**。
+测试数 860 → 870 → 915 → 999 → 1049 → 1087 → 1092 → 1106 → 1122 → **1139**。
+★ **9.6b 的前置已完成**（2026-09-26）：引用卡片可点看原文 + 反馈 UI + 埋点出口
+  `frontend/src/track.js`（★ 它**真的往 console 打**，所以「有事件可埋」当场可验）。
+  ⚠️ **反馈现在只活在页面会话里**（不落库）—— `user_event` 表还没建。
 ★ 工具从 3 个扩到 **6 个**，并且**按意图裁剪**（白名单，见下 §九）。
 ★ 唯一一个**混合轮**叶子：`SCENARIO_PICK`（先检索、再给工具）。
 ★ 9.4 让澄清反问变成**多轮**：反问的槽位状态存一列、下一轮读出来拼进分类 prompt
@@ -541,6 +544,14 @@ SPRING_APPLICATION_JSON='{"xbla":{"chat":{"history":{"max-turns":4}}}}'   ./mvnw
   本项目**每一个 404 都曾被渲染成 500**（阶段 8 才发现，因为那之前没有「必须 404」的判据）。
   已加显式 handler → 404 + DEBUG 级日志。（坑 30）
   ★ 判据：**任何想要特定状态码的异常都必须显式注册** —— 兜底 handler 的代价。
+- ★★ **新的 not-found 场景必须继承 `ResourceNotFoundException`**（不要自己有样学样写
+  `@ResponseStatus`、也别新加 `@ExceptionHandler`）—— 父类那条 handler 是**唯一**的注册点。
+  ⚠️ **漏了不会报错，只会静默变 500**，而 **service 层的测试一条都不会红**（它们不经过 HTTP 层）。
+  ★ 判据只能写在 **HTTP 层测试**里（`@AutoConfigureMockMvc`，形如
+  `ChatReferenceNotFoundMappingTest` / `ChatHistoryNotFoundMappingTest`）。
+  ★★ **「新增一个子类就自动被覆盖」是一句【承诺】，而承诺不会自己成立** ——
+  实测：摘掉那一行 `@ExceptionHandler` → 3 条 HTTP 用例红（`404` 变 `500`）、
+  而 service 层 12 条**全绿**。（9.6b 前置，见 `docs/10`）
 - ★★★ **`SeedRunner` 是 `@Profile("seed")`，不是 local** —— 干净环境的库**全空**。
   部署后必须 `bash scripts/seed.sh` 再 `python scripts/ingest.py`，**顺序不能反**
   （知识库要从业务表同步出商品和售后政策文档）。（坑 31）

@@ -54,11 +54,32 @@ const activeSessionNo = ref(null)
  *
  * 每条的形状：
  * ```
- *   { role, content, intent, references, trace, traceState, traceError }
+ *   { role, content, intent, references, traceId, feedback, trace, traceState, traceError }
  * ```
  * ★ 故意用 `reactive` 数组 + 可变对象，而不是每次替换整个数组：
  *   流式期间我们要**按引用**改最后一条的 `content`，
  *   替换数组会让 Vue 重建那些节点，打字机效果会闪。
+ *
+ * ## ★★★ `traceId` 是「这次回答真的走完了」的唯一证据
+ *
+ * 它**只**在流式的 `done` 事件里出现。所以：
+ *
+ * ```
+ *   有 traceId  → 引用可点开看原文 + 反馈可投（MessageBubble.canReact）
+ *   没有        → 历史消息 / 失败的那次，两件事都做不了
+ * ```
+ *
+ * ⚠️ **历史消息拿不到它**：`chat_message` 表里没有 `trace_id` 那一列
+ * （阶段 8 拍板「技术面板只服务当前回答」的直接后果）。
+ * ⇒ 从历史里翻出来的引用**点不开原文**，这是**已批准的边界**，
+ * 界面上照实说，不是让用户点了没反应。
+ *
+ * ## ★ `feedback` 现在只活在这一个页面会话里
+ *
+ * 9.6b 的 `user_event` 表还没建，所以投票**没有落库** ——
+ * 刷新页面 / 切走再回来就没了。这是**如实的当前状态**，不是 bug。
+ * ⚠️ 所以刻意**不写**「感谢反馈，我们会改进」那种文案 ——
+ * 那会描述一个还不存在的行为（同「不知道的事不装作知道」）。
  */
 const messages = reactive([])
 
@@ -95,6 +116,10 @@ async function openSession(sessionNo) {
         trace: null,
         traceState: 'idle',
         traceError: '',
+        // ★★ 同一个原因 ⇒ 同一个 null：历史消息里的引用【点不开原文】、
+        //    也给不出反馈，两者判据都是它。见文件头那张形状表
+        traceId: null,
+        feedback: null,
       })
     }
   } catch (e) {
@@ -154,7 +179,7 @@ async function send() {
   streaming.value = true
 
   messages.push({ role: 'user', content: q, intent: null, references: null,
-    trace: null, traceState: 'idle', traceError: '' })
+    trace: null, traceState: 'idle', traceError: '', traceId: null, feedback: null })
 
   // ★ 助手气泡先建出来（内容是空的），流式的 delta 往里累加。
   //   用可变对象而不是每次 push 新的 —— 见上面 messages 的注释
@@ -166,6 +191,11 @@ async function send() {
     trace: null,
     traceState: 'idle',
     traceError: '',
+    // ★ traceId 要等 done 事件才有（delta 只带正文）——
+    //   在那之前是 null，所以「回答进行中」时引用和反馈都不可用。
+    //   这是对的：那时回答还没定型，没有东西可以评价。
+    traceId: null,
+    feedback: null,
   })
   messages.push(reply)
   scrollToBottom()
@@ -205,6 +235,14 @@ async function send() {
           //     （服务端落库用的 fullAnswer 也是同一个缓冲区拼出来的）。
           reply.intent = payload.intent
           reply.references = payload.references
+          // ★★ 记下 traceId —— 它是「这次回答真的走完了」的唯一证据，
+          //    引用能否点开原文、能否投反馈，都判它。
+          //    ⚠️ 不能放到 `if (payload.traceId)` 里面去：那样 traceId 为空的
+          //    那次，气泡会一直停在「没有 traceId」的形状上，
+          //    而它其实【是】答完了 —— 只是没有链路 id 可关联。
+          //    这两件事的界面表达不同（一个有反馈按钮、一个没有），
+          //    所以要如实记下「拿到了什么」，而不是只记「有没有拿到」。
+          reply.traceId = payload.traceId ?? null
           // ★ 回答结束才去取技术细节。qa_log 的落库在 done 之前，
           //   所以这一步不会落空 —— 但仍要能容忍它失败（见下面 catch）
           if (payload.traceId) loadTrace(reply, payload.traceId)
@@ -317,6 +355,9 @@ onMounted(refreshSessions)
             :trace="m.trace"
             :trace-state="m.traceState"
             :trace-error="m.traceError"
+            :trace-id="m.traceId"
+            :feedback="m.feedback"
+            @feedback="(kind) => (m.feedback = kind)"
           />
         </div>
       </el-scrollbar>

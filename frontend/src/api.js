@@ -76,6 +76,24 @@ export const listMessages = (sessionNo) =>
 export const getTrace = (traceId) =>
   getJson(`/api/chat/trace/${encodeURIComponent(traceId)}`)
 
+/**
+ * 一条引用的原文 —— 点开引用卡片时按需取（9.6b 前置）。★ 零成本
+ *
+ * ## ★★ 为什么路径里必须带 `traceId`
+ *
+ * 服务端会先确认**这一片真的被这条回答引用过**才去取正文。只有
+ * `chunkId` 的话，这就是「知道 id 就能读任意切片」—— 而 `kb_chunk.id`
+ * 是连续自增的，枚举成本约等于零。
+ *
+ * ## ⚠️ 历史消息【没有】 traceId，所以那里的引用点不开
+ *
+ * `chat_message` 表里没有 `trace_id` 那一列（阶段 8 拍板「技术面板只服务
+ * 当前回答」的直接后果）。⇒ **历史消息里的引用构造不出这个请求。**
+ * 界面上对此的表达是「历史消息取不到原文」，不是让用户点了没反应。
+ */
+export const getReferenceDetail = (traceId, chunkId) =>
+  getJson(`/api/chat/refs/${encodeURIComponent(traceId)}/${encodeURIComponent(chunkId)}`)
+
 /** 限流实况 */
 export const getRateLimitStatus = () => getJson('/api/status/ratelimit')
 

@@ -30,6 +30,7 @@
 import { computed } from 'vue'
 import ReferenceList from './ReferenceList.vue'
 import TracePanel from './TracePanel.vue'
+import { track } from '../track.js'
 
 const props = defineProps({
   /** `'user'` / `'assistant'` —— 见 `ChatMessageView.role` 的说明（服务端已翻好） */
@@ -45,10 +46,50 @@ const props = defineProps({
   trace: { type: Object, default: null },
   traceState: { type: String, default: 'idle' },
   traceError: { type: String, default: '' },
+  /**
+   * ★ 这次回答的链路 id。**它同时是两件事的判据**（见下面 `canReact`）。
+   * `null` = 历史消息（`chat_message` 里没有 trace_id 那一列）。
+   */
+  traceId: { type: String, default: null },
+  /** 已投的票：`null` / `'up'` / `'down'` —— ★ 状态在 ChatView 那边（见下） */
+  feedback: { type: String, default: null },
 })
+
+const emit = defineEmits(['feedback'])
 
 const isUser = computed(() => props.role === 'user')
 const isClarify = computed(() => props.intent === 'NEEDS_CLARIFICATION')
+
+/**
+ * ★★★ 引用可点 / 反馈可投 —— **这两个判据是同一个**
+ *
+ * ```
+ *   有 traceId  → 这次回答真的走完了（onDone 带回来的），
+ *                 所以：引用取得回原文、反馈有东西可关联
+ *   没有        → 历史消息（或失败的那次），两件事都做不了
+ * ```
+ *
+ * ★★ 为什么不写 `!isUser && !streaming` 之类的「看起来等价」的条件：
+ * 那个条件在**失败**的回答上也成立（`onFailed` 之后 `streaming` 也是 false），
+ * 于是会给一条「回答失败」的气泡配上两个反馈按钮 —— 而**没有回答可以评价**。
+ *
+ * ⇒ 判据只能是「这次回答是否真的产出了东西」，而 `traceId` 正是那个证据：
+ * 它**只**在 `done` 事件里出现。用一个已经在手边的、有明确来源的事实，
+ * 比拼一个看起来对的条件可靠。
+ *
+ * ⚠️ 而且这不是「顺手复用」：反馈要能关联回 `qa_log`，**本来就需要 traceId**。
+ * 所以 UI 判据和埋点的必要条件恰好重合 —— 这是好事，不是巧合。
+ */
+const canReact = computed(() => !isUser.value && !!props.traceId)
+
+function vote(kind) {
+  // ★ 投过就不能再改 —— 幂等由这里保证，不是等 9.6b 建表时靠 event_no 去重。
+  //   前端能挡住的不该留给后端兜。
+  if (props.feedback) return
+
+  emit('feedback', kind)
+  track('feedback', { traceId: props.traceId, vote: kind })
+}
 
 /**
  * ★ 处理中（正文还是空的）—— 给一个「正在思考」的占位。
@@ -80,7 +121,28 @@ const showTrace = computed(() => !isUser.value && props.traceState !== 'idle')
       -->
       <div v-else class="content">{{ content }}<span v-if="streaming" class="caret" /></div>
 
-      <ReferenceList v-if="!isUser" :references="references" />
+      <ReferenceList v-if="!isUser" :references="references" :trace-id="traceId" />
+
+      <!--
+        ★ 反馈放在【引用之后、技术面板之前】：它评的是这条回答，
+          而引用是这条回答的依据 —— 用户读完依据再表态，顺序是对的。
+      -->
+      <div v-if="canReact" class="feedback">
+        <template v-if="feedback">
+          <!-- ★ 投过之后只剩一句话，不再摆两个禁用的按钮：
+                 摆着会让人以为「还能改」，而它改不了。 -->
+          <span class="voted">
+            已反馈 {{ feedback === 'up' ? '👍' : '👎' }}
+          </span>
+        </template>
+        <template v-else>
+          <span class="fb-label">这条回答有帮助吗</span>
+          <button class="fb" type="button" title="有帮助" aria-label="有帮助"
+                  @click="vote('up')">👍</button>
+          <button class="fb" type="button" title="没帮助" aria-label="没帮助"
+                  @click="vote('down')">👎</button>
+        </template>
+      </div>
 
       <TracePanel
         v-if="showTrace"
@@ -167,6 +229,50 @@ const showTrace = computed(() => !isUser.value && props.traceState !== 'idle')
   gap: 8px;
   color: #909399;
   font-size: 13px;
+}
+
+/* ---- 反馈 ---- */
+
+.feedback {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed #dcdfe6;
+}
+
+.fb-label {
+  font-size: 12px;
+  color: #c0c4cc;
+  margin-right: 2px;
+}
+
+.fb {
+  /* ★ 复位浏览器默认按钮样式 —— 不复位的话这两个会是系统灰按钮，
+     和整站的 Element Plus 风格对不上 */
+  background: none;
+  border: 1px solid #e4e7ed;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 13px;
+  line-height: 20px;
+  cursor: pointer;
+}
+
+.fb:hover {
+  border-color: #409eff;
+  background: #f5f7fa;
+}
+
+.fb:focus-visible {
+  outline: 2px solid #409eff;
+  outline-offset: 1px;
+}
+
+.voted {
+  font-size: 12px;
+  color: #909399;
 }
 
 /* 一个呼吸的小圆点 —— 比转圈图标轻，也不需要引图标库 */
